@@ -182,6 +182,9 @@ publishes the GitHub release and updates the formula in
 [WilliamThogersen/homebrew-tap](https://github.com/WilliamThogersen/homebrew-tap).
 It stops if the tag doesn't match the version in `Cargo.toml`.
 
+After each release, and every Monday, [brew-check](.github/workflows/brew-check.yml) installs toolbox from the tap
+on a clean Mac and fails if it isn't the latest release. Run it by hand with `gh workflow run brew-check.yml`.
+
 <details>
 <summary>Project layout</summary>
 
