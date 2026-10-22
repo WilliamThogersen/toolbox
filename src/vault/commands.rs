@@ -1,4 +1,4 @@
-//! `tb vault add|list|rm`. Adding and removing need a human at a terminal.
+//! `tb self vault add|list|rm`. Adding and removing need a human at a terminal.
 
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};

@@ -93,7 +93,7 @@ fn authorize<'v>(
     );
     let entry = vault.get(name).ok_or_else(|| {
         anyhow!(
-            "no secret named {name:?} in the vault. Ask the user to run `tb vault add {name} --host <host>` in their own terminal"
+            "no secret named {name:?} in the vault. Ask the user to run `tb self vault add {name} --host <host>` in their own terminal"
         )
     })?;
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
@@ -237,7 +237,7 @@ mod tests {
         let headers = vec![("X".to_string(), placeholder("stripe"))];
         let declared = vec!["stripe".to_string()];
         let err = inject_headers(&headers, &url, &vault(), &declared).unwrap_err();
-        assert!(err.to_string().contains("tb vault add stripe"));
+        assert!(err.to_string().contains("tb self vault add stripe"));
     }
 
     #[test]

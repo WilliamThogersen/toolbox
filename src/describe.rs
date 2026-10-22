@@ -1,4 +1,4 @@
-//! `tb describe` (what exists) and `tb guide` (how to build more).
+//! `tb self describe` (what exists) and `tb self guide` (how to build more).
 
 use std::path::Path;
 
@@ -24,6 +24,6 @@ pub fn describe<'a>(registry: &'a Registry, commands_dir: &Path) -> Description<
         commands_dir: commands_dir.display().to_string(),
         commands: registry.commands.iter().map(|def| &def.manifest).collect(),
         broken: &registry.problems,
-        next: "Run `tb guide` to learn how to add a command. Run `tb vault list` to see which API keys exist.",
+        next: "Run `tb self guide` to learn how to add a command. Run `tb self vault list` to see which API keys exist.",
     }
 }

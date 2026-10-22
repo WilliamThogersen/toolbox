@@ -1,3 +1,4 @@
+mod builtin;
 mod check;
 mod cli;
 mod describe;

@@ -2,11 +2,11 @@
 
 A command is a folder `<commands_dir>/<name>/` with two files: `command.json`
 (what it is) and `run.lua` (what it does). toolbox picks it up on the next run. No
-rebuild. `tb describe` prints `commands_dir`.
+rebuild. `tb self describe` prints `commands_dir`.
 
-1. `tb new <name> --description "..."` creates both files from a template.
+1. `tb self new <name> --description "..."` creates both files from a template.
 2. Edit `command.json` and `run.lua`.
-3. `tb check` validates every command. Fix every problem it lists.
+3. `tb self check` validates every command. Fix every problem it lists.
 4. Run it: `tb <name> --some-arg value`.
 
 Output is JSON on stdout. On failure toolbox exits 1 and prints `{"error": "..."}`
@@ -36,7 +36,7 @@ on stderr.
 - `name` must match the folder name. Allowed: `a-z`, `0-9`, `-`, `_`.
 - Each arg becomes `--<arg>`. Types: `string`, `integer`, `number`, `boolean`.
   A boolean is a flag: never `required`, defaults to `false`.
-- Unknown fields are errors, so typos are caught by `tb check`.
+- Unknown fields are errors, so typos are caught by `tb self check`.
 - `permissions` lists everything the script may touch. Anything not listed fails at runtime.
   - `http`: hosts it may call. `"*"` allows any host.
   - `vault`: secret names it may use (see Vault below).
@@ -122,8 +122,8 @@ Rules:
 4. Requests that carry a secret never follow redirects.
 5. Any secret value that appears in a response is replaced with `[REDACTED:<name>]`.
 
-`tb vault list` shows which secrets exist and where they may be sent. If a
-secret is missing, ask the user to run `tb vault add <name> --host <host>` in
+`tb self vault list` shows which secrets exist and where they may be sent. If a
+secret is missing, ask the user to run `tb self vault add <name> --host <host>` in
 their own terminal. You cannot add, change or read secrets yourself.
 
 ## Full example

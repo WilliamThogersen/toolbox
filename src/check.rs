@@ -1,4 +1,4 @@
-//! `tb check`: manifest problems plus Lua syntax errors, in one report.
+//! `tb self check`: manifest problems plus Lua syntax errors, in one report.
 
 use serde::Serialize;
 

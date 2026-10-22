@@ -358,7 +358,7 @@ mod tests {
         let err = client(&["*"], &["github"])
             .send(spec("https://x.example/", RequestOptions { headers, ..RequestOptions::default() }))
             .unwrap_err();
-        assert!(err.to_string().contains("tb vault add github"));
+        assert!(err.to_string().contains("tb self vault add github"));
     }
 
     #[test]

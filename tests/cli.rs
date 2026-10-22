@@ -123,13 +123,13 @@ fn echo_manifest(name: &str) -> Value {
 #[test]
 fn new_then_run_a_command() {
     let tb = Toolbox::new();
-    let created = tb.json(&["new", "hello", "--description", "Says hello"]);
+    let created = tb.json(&["self", "new", "hello", "--description", "Says hello"]);
     assert!(created["dir"].as_str().unwrap().ends_with("hello"));
 
     let out = tb.json(&["hello", "--name", "bo"]);
     assert_eq!(out, json!({ "message": "hello bo" }));
 
-    let described = tb.json(&["describe"]);
+    let described = tb.json(&["self", "describe"]);
     assert_eq!(described["commands"][0]["name"], "hello");
     assert_eq!(described["commands"][0]["args"]["name"]["type"], "string");
 }
@@ -167,7 +167,7 @@ fn check_reports_broken_commands() {
     tb.add_command("syntax", json!({ "name": "syntax", "description": "x" }), "return function( end");
     tb.add_command("typo", json!({ "name": "typo", "descripton": "x" }), "return function() end");
 
-    let out = tb.run(&["check"]);
+    let out = tb.run(&["self", "check"]);
     assert!(!out.status.success());
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["ok"], false);
@@ -273,7 +273,7 @@ fn exfiltration_attempts_fail() {
 fn vault_list_shows_names_not_values() {
     let tb = Toolbox::new();
     tb.add_secret("test", SECRET, &["api.example.com"]);
-    let out = tb.run(&["vault", "list"]);
+    let out = tb.run(&["self", "vault", "list"]);
     assert!(out.status.success());
     assert!(!stdout(&out).contains(SECRET));
     let list: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -285,15 +285,15 @@ fn vault_add_and_rm_need_a_human_terminal() {
     let tb = Toolbox::new();
     tb.add_secret("test", SECRET, &["api.example.com"]);
 
-    let add = tb.run(&["vault", "add", "new", "--host", "api.example.com"]);
+    let add = tb.run(&["self", "vault", "add", "new", "--host", "api.example.com"]);
     assert!(!add.status.success());
     assert!(stderr(&add).contains("interactive terminal"));
 
-    let rm = tb.run(&["vault", "rm", "test"]);
+    let rm = tb.run(&["self", "vault", "rm", "test"]);
     assert!(!rm.status.success());
     assert!(stderr(&rm).contains("interactive terminal"));
     assert!(Path::new(&tb.vault_file()).exists());
-    assert!(stdout(&tb.run(&["vault", "list"])).contains("\"test\""));
+    assert!(stdout(&tb.run(&["self", "vault", "list"])).contains("\"test\""));
 }
 
 /// Records whether anything connected, and answers 502.
@@ -331,4 +331,44 @@ fn secret_requests_ignore_proxy_env_vars() {
     assert_eq!(stdout(&out).trim(), "200");
     assert!(received.recv().unwrap().contains(SECRET));
     assert!(!contacted.load(Ordering::SeqCst), "secret request went through the proxy");
+}
+
+#[test]
+fn bare_tb_lists_only_user_commands() {
+    let tb = Toolbox::new();
+    let empty = tb.run(&[]);
+    assert!(empty.status.success());
+    assert!(stdout(&empty).contains("No commands yet. Create one: tb self new <name>"));
+
+    tb.add_command("hello", json!({ "name": "hello", "description": "Says hello" }), "return function() end");
+    let out = tb.run(&[]);
+    assert!(out.status.success());
+    let help = stdout(&out);
+    assert!(help.contains("hello") && help.contains("Says hello"));
+    assert!(help.contains("tb self"));
+    for builtin in ["describe", "guide", "vault", "check", "--version"] {
+        assert!(!help.contains(builtin), "top level should not show {builtin}:\n{help}");
+    }
+}
+
+#[test]
+fn builtin_names_are_free_for_user_commands() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "check",
+        json!({ "name": "check", "description": "My own check" }),
+        r#"return function() return "mine" end"#,
+    );
+    assert_eq!(tb.json(&["check"]), json!("mine"));
+    assert_eq!(tb.json(&["self", "check"])["ok"], true);
+}
+
+#[test]
+fn self_shows_builtins_and_version_still_works() {
+    let tb = Toolbox::new();
+    let help = stdout(&tb.run(&["self", "--help"]));
+    for builtin in ["new", "check", "describe", "guide", "vault"] {
+        assert!(help.contains(builtin), "missing {builtin}");
+    }
+    assert!(stdout(&tb.run(&["--version"])).contains(env!("CARGO_PKG_VERSION")));
 }

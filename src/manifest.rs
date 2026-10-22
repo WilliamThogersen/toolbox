@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Subcommand names owned by toolbox itself.
-pub const RESERVED_NAMES: &[&str] = &["vault", "describe", "guide", "new", "check", "help"];
+/// Top-level names owned by toolbox itself (built-ins live under `self`).
+pub const RESERVED_NAMES: &[&str] = &["self", "help"];
 
 const MAX_NAME_LEN: usize = 64;
 
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn reports_name_problems() {
-        let manifest = Manifest::parse(r#"{"name":"vault","description":"x"}"#).unwrap();
+        let manifest = Manifest::parse(r#"{"name":"self","description":"x"}"#).unwrap();
         let problems = manifest.validate("other");
         assert!(problems.iter().any(|p| p.contains("reserved")));
         assert!(problems.iter().any(|p| p.contains("folder name")));

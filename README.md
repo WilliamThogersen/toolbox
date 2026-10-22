@@ -5,6 +5,8 @@ A toolbox CLI that an AI can keep extending. Every command is a folder with a
 folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 
 `tb` and `toolbox` are the same program: `tb` is a symlink for typing less.
+Plain `tb` lists only your own commands. Everything that manages the toolbox
+itself (new, check, describe, guide, vault) lives under `tb self`.
 
 ## Install
 
@@ -15,11 +17,12 @@ scripts/install.sh        # builds, installs ~/.cargo/bin/toolbox + tb, signs it
 ## Quick start
 
 ```bash
-tb new hello --description "Says hello"   # creates ~/.toolbox/commands/hello/
-tb hello --name you                        # {"message": "hello you"}
-tb describe                                # every command as JSON
-tb guide                                   # how to write commands (Lua API)
-tb check                                   # validates everything, exit 1 on problems
+tb self new hello --description "Says hello"   # creates ~/.toolbox/commands/hello/
+tb hello --name you                            # {"message": "hello you"}
+tb                                             # lists your commands
+tb self describe                               # every command as JSON
+tb self guide                                  # how to write commands (Lua API)
+tb self check                                  # validates everything, exit 1 on problems
 ```
 
 Output is always JSON on stdout. Errors are `{"error": "..."}` on stderr with exit code 1.
@@ -30,20 +33,20 @@ Add this to your `CLAUDE.md`:
 
 ```markdown
 ## toolbox (tb)
-`tb` is my toolbox CLI. Run `tb describe` to see the available commands.
-To add a command, read `tb guide`, then `tb new <name>`, edit the files, and run `tb check`.
+`tb` is my toolbox CLI. Run `tb` to list my commands and `tb self describe` for their args as JSON.
+To add a command, read `tb self guide`, then `tb self new <name>`, edit the files, and run `tb self check`.
 API keys live in the toolbox vault: use `vault("name")` in headers, never ask me for a key.
-If a key is missing, ask me to run `tb vault add <name> --host <host>`.
+If a key is missing, ask me to run `tb self vault add <name> --host <host>`.
 ```
 
 ## Vault: keys the AI can use but never see
 
-1. In your own terminal: `tb vault add github --host api.github.com`. Paste the key at the hidden prompt.
+1. In your own terminal: `tb self vault add github --host api.github.com`. Paste the key at the hidden prompt.
 2. In a command: list `"vault": ["github"]` under `permissions` and send
    `Authorization = "Bearer " .. vault("github")` as a header.
 3. The first time toolbox reads the vault, macOS asks if `toolbox` may use the keychain item `toolbox`. Click **Always Allow**.
 
-`tb vault list` shows names and hosts. `tb vault rm <name>` deletes a secret (asks for confirmation).
+`tb self vault list` shows names and hosts. `tb self vault rm <name>` deletes a secret (asks for confirmation).
 
 ### What it protects against
 
@@ -68,10 +71,11 @@ If a key is missing, ask me to run `tb vault add <name> --host <host>`.
 |------|------|
 | `src/manifest.rs` | `command.json` schema and validation |
 | `src/registry.rs` | Finds and loads command folders |
-| `src/cli.rs` | Builds subcommands from manifests, dispatches |
+| `src/cli.rs` | Top level: your commands, built from manifests |
+| `src/builtin.rs` | `tb self`: new, check, describe, guide, vault |
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
 | `src/vault/` | Keychain storage, placeholder injection, redaction, `vault` subcommands |
-| `src/guide.md` | Text printed by `tb guide` |
+| `src/guide.md` | Text printed by `tb self guide` |
 
 ## Development
 

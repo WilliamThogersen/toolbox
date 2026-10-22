@@ -1,4 +1,4 @@
-//! `tb new <name>`: writes a working starter command.
+//! `tb self new <name>`: writes a working starter command.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -11,7 +11,7 @@ use crate::manifest::{ArgSpec, ArgType, Manifest, Permissions, RESERVED_NAMES, i
 use crate::registry::{MANIFEST_FILE, SCRIPT_FILE};
 
 const SCRIPT_TEMPLATE: &str = r#"-- Receives the parsed args. Whatever you return is printed as JSON.
--- Run `tb guide` for the full API: http, json, exec, env, vault, log.
+-- Run `tb self guide` for the full API: http, json, exec, env, vault, log.
 return function(args)
   return { message = "hello " .. (args.name or "world") }
 end
@@ -56,7 +56,7 @@ pub fn create(commands_dir: &Path, name: &str, description: &str) -> Result<Crea
             manifest_path.display().to_string(),
             script_path.display().to_string(),
         ],
-        next: format!("Edit both files, run `tb check`, then `tb {name} --name you`"),
+        next: format!("Edit both files, run `tb self check`, then `tb {name} --name you`"),
     })
 }
 
@@ -78,7 +78,7 @@ mod tests {
     fn refuses_bad_reserved_or_existing_names() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(create(tmp.path(), "Bad", "x").is_err());
-        assert!(create(tmp.path(), "vault", "x").is_err());
+        assert!(create(tmp.path(), "self", "x").is_err());
         create(tmp.path(), "hello", "x").unwrap();
         assert!(create(tmp.path(), "hello", "x").is_err());
     }
