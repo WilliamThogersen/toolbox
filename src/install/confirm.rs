@@ -54,6 +54,8 @@ pub fn permissions(perms: &Permissions) -> String {
         ("vault", &perms.vault),
         ("exec", &perms.exec),
         ("env", &perms.env),
+        ("read", &perms.read),
+        ("write", &perms.write),
     ]
     .into_iter()
     .filter(|(_, values)| !values.is_empty())
@@ -87,6 +89,15 @@ pub fn warnings(perms: &Permissions) -> Vec<String> {
             perms.vault.join(", ")
         ));
     }
+    if !perms.read.is_empty() {
+        lines.push(format!("read sees every file in {}", perms.read.join(", ")));
+    }
+    if !perms.write.is_empty() {
+        lines.push(format!(
+            "write can change and delete files in {}",
+            perms.write.join(", ")
+        ));
+    }
     lines
 }
 
@@ -111,12 +122,16 @@ mod tests {
             vault: vec!["github".into()],
             exec: vec!["git".into()],
             env: vec!["AWS_SECRET_ACCESS_KEY".into()],
+            read: vec!["~/notes".into()],
+            write: vec![".".into()],
         };
         let text = warnings(&risky).join("\n");
         assert!(text.contains("exec runs git") && text.contains("full access"), "{text}");
         assert!(text.contains("any host"), "{text}");
         assert!(text.contains("env reads AWS_SECRET_ACCESS_KEY"), "{text}");
         assert!(text.contains("your github key"), "{text}");
+        assert!(text.contains("read sees every file in ~/notes"), "{text}");
+        assert!(text.contains("write can change and delete files in ."), "{text}");
     }
 
     #[test]

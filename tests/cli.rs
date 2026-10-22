@@ -35,12 +35,30 @@ impl Toolbox {
     }
 
     fn run_with_env(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
+        let mut cmd = self.command(args);
+        cmd.envs(vars.iter().copied()).stdin(Stdio::null());
+        cmd.output().unwrap()
+    }
+
+    /// Runs in `dir` with `input` piped to stdin, like `echo input | tb ...` there.
+    fn run_piped(&self, args: &[&str], dir: &Path, input: &str) -> Output {
+        let mut child = self
+            .command(args)
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_toolbox"));
         cmd.args(args)
-            .envs(vars.iter().copied())
             .env("TOOLBOX_HOME", self.home.path())
-            .env("TOOLBOX_INSECURE_TEST_VAULT", self.vault_file())
-            .stdin(Stdio::null());
+            .env("TOOLBOX_INSECURE_TEST_VAULT", self.vault_file());
         // Detach from any controlling terminal, like an AI agent's shell.
         unsafe {
             cmd.pre_exec(|| {
@@ -48,7 +66,7 @@ impl Toolbox {
                 Ok(())
             });
         }
-        cmd.output().unwrap()
+        cmd
     }
 
     fn json(&self, args: &[&str]) -> Value {
@@ -382,4 +400,56 @@ fn self_shows_builtins_and_version_still_works() {
         assert!(help.contains(builtin), "missing {builtin}");
     }
     assert!(stdout(&tb.run(&["--version"])).contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn files_and_stdin_work_in_the_current_folder() {
+    let tb = Toolbox::new();
+    let work = tempfile::tempdir().unwrap();
+    fs::write(work.path().join("in.txt"), "from a file").unwrap();
+    tb.add_command(
+        "notes",
+        json!({
+            "name": "notes",
+            "description": "Copies stdin and a file into out/",
+            "permissions": { "write": ["."] }
+        }),
+        r#"return function()
+            fs.mkdir("out")
+            fs.write("out/copy.txt", stdin.read() .. " + " .. fs.read("in.txt"))
+            local ok, err = pcall(fs.read, "/etc/hosts")
+            return { listed = #fs.list("out"), escaped = ok, err = tostring(err) }
+        end"#,
+    );
+    let out = tb.run_piped(&["notes"], work.path(), "from stdin");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["listed"], 1);
+    assert_eq!(result["escaped"], false);
+    assert!(result["err"].as_str().unwrap().contains("permissions.read"), "{result}");
+    assert_eq!(
+        fs::read_to_string(work.path().join("out/copy.txt")).unwrap(),
+        "from stdin + from a file"
+    );
+}
+
+#[test]
+fn http_query_reaches_the_server() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "search",
+        json!({
+            "name": "search",
+            "description": "Searches with a query table",
+            "args": { "url": { "type": "string", "required": true } },
+            "permissions": { "http": ["127.0.0.1"] }
+        }),
+        r#"return function(args)
+            return http.get(args.url .. "?lang=en", { query = { q = "a b", page = 2 }, timeout = 5 }).status
+        end"#,
+    );
+    let (url, received) = echo_server();
+    assert_eq!(tb.json(&["search", "--url", &url]), json!(200));
+    let request = received.recv().unwrap();
+    assert!(request.starts_with("GET /?lang=en&page=2&q=a+b HTTP/1.1"), "{request}");
 }

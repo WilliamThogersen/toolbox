@@ -28,7 +28,7 @@ Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 
 - **New command, new folder.** An AI can add a tool in seconds and use it right away.
 - **JSON out, always.** Results go to stdout as JSON. Errors are `{"error": "..."}` on stderr with exit code 1.
-- **Nothing it didn't ask for.** Each command lists the hosts, programs, env vars and keys it may touch. Everything else fails.
+- **Nothing it didn't ask for.** Each command lists the hosts, programs, env vars, folders and keys it may touch. Everything else fails.
 - **Keys the AI can use but never see.** Scripts get a placeholder. toolbox swaps in the real key only on the way out.
 - **Share through git.** Install commands from any GitHub or GitLab repo, or save whole marketplaces and search them.
 

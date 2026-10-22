@@ -1,8 +1,8 @@
-//! Globals for scripts: json, log/print, env, vault, exec.
+//! Globals for scripts: json, log/print, env, vault, stdin.
 
-use std::process::{Command, Stdio};
+use std::io::{self, IsTerminal, Read};
 
-use mlua::{Lua, LuaSerdeExt, Result, Table, Value, Variadic};
+use mlua::{Lua, LuaSerdeExt, Result, Value, Variadic};
 
 use super::ser_options;
 use crate::manifest::Permissions;
@@ -13,10 +13,10 @@ pub fn install(lua: &Lua, perms: &Permissions) -> Result<()> {
     install_log(lua)?;
     install_env(lua, perms.env.clone())?;
     install_vault(lua, perms.vault.clone())?;
-    install_exec(lua, perms.exec.clone())
+    install_stdin(lua)
 }
 
-fn denied(kind: &str, what: &str) -> mlua::Error {
+pub fn denied(kind: &str, what: &str) -> mlua::Error {
     mlua::Error::runtime(format!(
         "{what:?} is not listed in this command's permissions.{kind}"
     ))
@@ -82,24 +82,25 @@ fn install_vault(lua: &Lua, declared: Vec<String>) -> Result<()> {
     lua.globals().set("vault", vault)
 }
 
-fn install_exec(lua: &Lua, allowed: Vec<String>) -> Result<()> {
-    let exec = lua.create_function(move |lua, (program, args): (String, Option<Vec<String>>)| {
-        if !allowed.contains(&program) {
-            return Err(denied("exec", &program));
-        }
-        let output = Command::new(&program)
-            .args(args.unwrap_or_default())
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| mlua::Error::runtime(format!("could not run {program:?}: {e}")))?;
-        let result: Table = lua.create_table()?;
-        result.set("ok", output.status.success())?;
-        result.set("code", output.status.code())?;
-        result.set("stdout", String::from_utf8_lossy(&output.stdout).into_owned())?;
-        result.set("stderr", String::from_utf8_lossy(&output.stderr).into_owned())?;
-        Ok(result)
-    })?;
-    lua.globals().set("exec", exec)
+/// `stdin.read()` returns what was piped in, or `nil` when stdin is a terminal
+/// (reading would wait for typing that never comes).
+fn install_stdin(lua: &Lua) -> Result<()> {
+    let stdin = lua.create_table()?;
+    stdin.set(
+        "read",
+        lua.create_function(|lua, ()| {
+            let mut input = io::stdin().lock();
+            if input.is_terminal() {
+                return Ok(None);
+            }
+            let mut bytes = Vec::new();
+            input
+                .read_to_end(&mut bytes)
+                .map_err(|e| mlua::Error::runtime(format!("could not read stdin: {e}")))?;
+            lua.create_string(bytes).map(Some)
+        })?,
+    )?;
+    lua.globals().set("stdin", stdin)
 }
 
 #[cfg(test)]
@@ -157,18 +158,6 @@ mod tests {
         let home: Option<String> = lua.load(r#"return env.get("HOME")"#).eval().unwrap();
         assert!(home.is_some());
         assert!(eval_err(&lua, r#"env.get("PATH")"#).contains("permissions.env"));
-    }
-
-    #[test]
-    fn exec_runs_allowed_programs_only() {
-        let lua = lua_with(Permissions {
-            exec: vec!["echo".into()],
-            ..Permissions::default()
-        });
-        let out: Table = lua.load(r#"return exec("echo", {"hi"})"#).eval().unwrap();
-        assert_eq!(out.get::<String>("stdout").unwrap(), "hi\n");
-        assert!(out.get::<bool>("ok").unwrap());
-        assert!(eval_err(&lua, r#"exec("rm", {"-rf", "/tmp/x"})"#).contains("permissions.exec"));
     }
 
     #[test]

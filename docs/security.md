@@ -5,9 +5,9 @@ commands only touch what they declare.
 
 ## What every command gets
 
-Scripts run in a sandboxed Lua 5.5 with no `io`, `os`, `require`, `load` or `dofile`. They can't read or write files,
-open sockets, or load other code. Everything else goes through globals that are each gated by the command's
-`permissions`:
+Scripts run in a sandboxed Lua 5.5 with no `io`, `os`, `require`, `load` or `dofile`. They can't open sockets or
+load other code, and they only see files through `fs`. Everything that touches the outside goes through globals that
+are each gated by the command's `permissions`:
 
 | Permission | Lets the command |
 |------------|------------------|
@@ -15,8 +15,15 @@ open sockets, or load other code. Everything else goes through globals that are 
 | `exec` | Run these programs, with any arguments, without a shell. |
 | `env` | Read these environment variables. |
 | `vault` | Use these keys in HTTP headers, never read them. |
+| `read` | Read files in these folders and below. |
+| `write` | Create, change and delete files in these folders and below (and read them). |
 
-A command with no permissions can only compute and return JSON.
+`fs` checks every path after resolving symlinks, so a link inside an allowed folder can't lead outside it. `~` is your
+home folder and a relative entry like `"."` is the folder you run `tb` in, so the same command can reach different
+files depending on where it runs.
+
+A command with no permissions can only compute and return JSON. It can still read what you pipe into it
+(`stdin.read()`), and use the clock and pure helpers (`time`, `base64`, `url`, `hash`).
 
 ## Installing other people's commands
 
@@ -27,6 +34,10 @@ An installed command runs someone else's code with every permission it asks for.
   `ssh` options. Treat any `exec` as a shell.
 - **`http: ["*"]`** can send anything the command sees to any host.
 - **`env`** reads variables that often hold secrets, like `AWS_SECRET_ACCESS_KEY`.
+- **`read`** sees every file in those folders: `~` includes your SSH keys and shell history. Combined with `http`, it can
+  send them anywhere it may call.
+- **`write`** can change or delete files there. Write access to `~` lets a command edit your shell startup files, which
+  is as good as `exec`.
 - **`vault`** uses your keys. They still only go to the hosts you bound them to, but the command decides what to do
   there: a GitHub key can delete repos.
 

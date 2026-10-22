@@ -8,10 +8,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde::{Deserialize, Serialize};
-use ureq::{Agent, Proxy};
-use url::Url;
+use ureq::http::{Request, Response};
+use ureq::{Agent, AsSendBody, Body, Proxy};
+use url::{Url, form_urlencoded};
 
-use super::ser_options;
+use super::encoding::query_pairs;
+use super::{seconds, ser_options};
 use crate::manifest::Permissions;
 use crate::vault::inject::{Redactor, ensure_absent, inject_headers, mentions_vault};
 use crate::vault::{VaultData, VaultStore};
@@ -41,6 +43,12 @@ struct RawRequest {
     body: Option<String>,
     #[serde(default)]
     json: Option<serde_json::Value>,
+    #[serde(default)]
+    form: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    query: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    timeout: Option<f64>,
 }
 
 impl From<RawRequest> for RequestSpec {
@@ -52,6 +60,9 @@ impl From<RawRequest> for RequestSpec {
                 headers: raw.headers,
                 body: raw.body,
                 json: raw.json,
+                form: raw.form,
+                query: raw.query,
+                timeout: raw.timeout,
             },
         }
     }
@@ -66,6 +77,15 @@ pub struct RequestOptions {
     pub body: Option<String>,
     #[serde(default)]
     pub json: Option<serde_json::Value>,
+    /// Sent as `application/x-www-form-urlencoded`.
+    #[serde(default)]
+    pub form: Option<BTreeMap<String, serde_json::Value>>,
+    /// Appended to the URL's query string.
+    #[serde(default)]
+    pub query: BTreeMap<String, serde_json::Value>,
+    /// Seconds, instead of the default `TIMEOUT`.
+    #[serde(default)]
+    pub timeout: Option<f64>,
 }
 
 fn default_method() -> String {
@@ -131,9 +151,11 @@ impl HttpClient {
     }
 
     pub fn send(&self, spec: RequestSpec) -> Result<ResponseData> {
-        let url = Url::parse(&spec.url).with_context(|| format!("invalid url {:?}", spec.url))?;
+        let mut url = Url::parse(&spec.url).with_context(|| format!("invalid url {:?}", spec.url))?;
         self.check_host(&url)?;
         ensure_absent("url", &spec.url)?;
+        add_query(&mut url, &spec.options.query)?;
+        let timeout = spec.options.timeout.map(seconds).transpose()?;
         let (body, content_type) = encode_body(&spec.options)?;
         ensure_absent("body", &String::from_utf8_lossy(&body))?;
 
@@ -153,7 +175,7 @@ impl HttpClient {
         };
 
         let redactor = self.vault.redactor();
-        let response = execute(agent, &spec.method, &url, &headers, body)
+        let response = execute(agent, &spec.method, &url, &headers, body, timeout)
             .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))))?;
         Ok(redact_response(&redactor, response))
     }
@@ -180,12 +202,41 @@ fn agent(max_redirects: u32, proxy: Option<Proxy>) -> Agent {
 }
 
 fn encode_body(options: &RequestOptions) -> Result<(Vec<u8>, Option<&'static str>)> {
-    match (&options.body, &options.json) {
-        (Some(_), Some(_)) => Err(anyhow!("use either body or json, not both")),
-        (Some(body), None) => Ok((body.clone().into_bytes(), None)),
-        (None, Some(json)) => Ok((serde_json::to_vec(json)?, Some("application/json"))),
-        (None, None) => Ok((Vec::new(), None)),
+    match (&options.body, &options.json, &options.form) {
+        (Some(body), None, None) => Ok((body.clone().into_bytes(), None)),
+        (None, Some(json), None) => Ok((serde_json::to_vec(json)?, Some("application/json"))),
+        (None, None, Some(form)) => {
+            let encoded = encode_pairs("body", form)?;
+            Ok((encoded.into_bytes(), Some("application/x-www-form-urlencoded")))
+        }
+        (None, None, None) => Ok((Vec::new(), None)),
+        _ => Err(anyhow!("use only one of body, json or form")),
     }
+}
+
+/// Appends `query = {...}` to whatever query the URL already has.
+fn add_query(url: &mut Url, params: &BTreeMap<String, serde_json::Value>) -> Result<()> {
+    if !params.is_empty() {
+        let encoded = encode_pairs("url", params)?;
+        let query = match url.query() {
+            Some(existing) if !existing.is_empty() => format!("{existing}&{encoded}"),
+            _ => encoded,
+        };
+        url.set_query(Some(&query));
+    }
+    Ok(())
+}
+
+/// Placeholders are checked before encoding: once escaped they would no longer be recognised.
+fn encode_pairs(location: &str, params: &BTreeMap<String, serde_json::Value>) -> Result<String> {
+    let pairs = query_pairs(params)?;
+    for (key, value) in &pairs {
+        ensure_absent(location, key)?;
+        ensure_absent(location, value)?;
+    }
+    Ok(form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish())
 }
 
 fn execute(
@@ -194,6 +245,7 @@ fn execute(
     url: &Url,
     headers: &[(String, String)],
     body: Vec<u8>,
+    timeout: Option<Duration>,
 ) -> Result<ResponseData> {
     let builder = headers.iter().fold(
         ureq::http::Request::builder()
@@ -202,9 +254,9 @@ fn execute(
         |builder, (name, value)| builder.header(name.as_str(), value.as_str()),
     );
     let mut response = if body.is_empty() {
-        agent.run(builder.body(ureq::SendBody::none()).context("invalid request")?)
+        run(agent, builder.body(ureq::SendBody::none()).context("invalid request")?, timeout)
     } else {
-        agent.run(builder.body(body).context("invalid request")?)
+        run(agent, builder.body(body).context("invalid request")?, timeout)
     }
     .map_err(|e| anyhow!("request to {} failed: {e}", url.host_str().unwrap_or("?")))?;
 
@@ -230,6 +282,18 @@ fn execute(
         body: String::from_utf8_lossy(&bytes).into_owned(),
         json: None,
     })
+}
+
+fn run<S: AsSendBody>(
+    agent: &Agent,
+    request: Request<S>,
+    timeout: Option<Duration>,
+) -> Result<Response<Body>, ureq::Error> {
+    let request = match timeout {
+        Some(limit) => agent.configure_request(request).timeout_global(Some(limit)).build(),
+        None => request,
+    };
+    agent.run(request)
 }
 
 /// Scrubs secrets first, then parses JSON from the scrubbed text.
@@ -342,13 +406,66 @@ mod tests {
     }
 
     #[test]
-    fn refuses_body_and_json_together() {
+    fn refuses_more_than_one_body() {
         let options = RequestOptions {
             body: Some("x".into()),
             json: Some(serde_json::json!({})),
             ..RequestOptions::default()
         };
         assert!(encode_body(&options).is_err());
+        let options = RequestOptions {
+            json: Some(serde_json::json!({})),
+            form: Some(BTreeMap::new()),
+            ..RequestOptions::default()
+        };
+        assert!(encode_body(&options).unwrap_err().to_string().contains("only one of body, json or form"));
+    }
+
+    fn params(value: serde_json::Value) -> BTreeMap<String, serde_json::Value> {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn form_bodies_are_url_encoded() {
+        let options = RequestOptions {
+            form: Some(params(serde_json::json!({ "name": "a b", "n": 1 }))),
+            ..RequestOptions::default()
+        };
+        let (body, content_type) = encode_body(&options).unwrap();
+        assert_eq!(String::from_utf8(body).unwrap(), "n=1&name=a+b");
+        assert_eq!(content_type, Some("application/x-www-form-urlencoded"));
+    }
+
+    #[test]
+    fn query_is_added_to_the_url() {
+        let mut url = Url::parse("https://x.example/search?lang=en").unwrap();
+        add_query(&mut url, &params(serde_json::json!({ "q": "a&b", "page": 2 }))).unwrap();
+        assert_eq!(url.as_str(), "https://x.example/search?lang=en&page=2&q=a%26b");
+
+        let mut bare = Url::parse("https://x.example/").unwrap();
+        add_query(&mut bare, &BTreeMap::new()).unwrap();
+        assert_eq!(bare.as_str(), "https://x.example/");
+    }
+
+    #[test]
+    fn refuses_placeholders_in_query_and_form() {
+        let c = client(&["*"], &["github"]);
+        let in_query = c.send(spec(
+            "https://x.example/",
+            RequestOptions {
+                query: params(serde_json::json!({ "key": "{{vault:github}}" })),
+                ..RequestOptions::default()
+            },
+        ));
+        assert!(in_query.unwrap_err().to_string().contains("found one in the url"));
+        let in_form = c.send(spec(
+            "https://x.example/",
+            RequestOptions {
+                form: Some(params(serde_json::json!({ "key": "{{vault:github}}" }))),
+                ..RequestOptions::default()
+            },
+        ));
+        assert!(in_form.unwrap_err().to_string().contains("found one in the body"));
     }
 
     #[test]
@@ -359,6 +476,24 @@ mod tests {
             .send(spec("https://x.example/", RequestOptions { headers, ..RequestOptions::default() }))
             .unwrap_err();
         assert!(err.to_string().contains("tb self vault add github"));
+    }
+
+    #[test]
+    fn timeout_option_limits_the_wait() {
+        // Accepts connections into the backlog but never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", silent.local_addr().unwrap().port());
+        let started = std::time::Instant::now();
+        let err = client(&["127.0.0.1"], &[])
+            .send(spec(&url, RequestOptions { timeout: Some(0.3), ..RequestOptions::default() }))
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "{err}");
+        assert!(err.to_string().contains("timeout"), "{err}");
+
+        let huge = client(&["127.0.0.1"], &[])
+            .send(spec(&url, RequestOptions { timeout: Some(1e19), ..RequestOptions::default() }))
+            .unwrap_err();
+        assert!(huge.to_string().contains("not a valid number of seconds"), "{huge}");
     }
 
     #[test]

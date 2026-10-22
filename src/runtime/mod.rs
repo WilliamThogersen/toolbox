@@ -1,11 +1,15 @@
 //! Runs a command's `run.lua` in a sandbox with the toolbox API installed.
 
 mod api;
+mod encoding;
+mod exec;
+mod fs;
 mod http;
 mod sandbox;
+mod time;
 
-use std::fs;
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use mlua::serde::SerializeOptions;
@@ -21,17 +25,35 @@ pub fn ser_options() -> SerializeOptions {
         .serialize_unit_to_null(false)
 }
 
+/// Keeps the whole cause chain (`could not read x: permission denied`) in the Lua error.
+fn lua_error(err: anyhow::Error) -> mlua::Error {
+    mlua::Error::runtime(format!("{err:#}"))
+}
+
+/// The longest timeout or sleep a script can ask for. Also keeps `Instant + duration` from overflowing.
+const MAX_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+
+/// Seconds from a script (`timeout = 2.5`) as a `Duration`.
+fn seconds(secs: f64) -> Result<Duration> {
+    if !(0.0..=MAX_SECONDS).contains(&secs) {
+        bail!("{secs} is not a valid number of seconds (0 to {MAX_SECONDS})");
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
 pub fn run(
     def: &CommandDef,
     args: &serde_json::Value,
     store: Box<dyn VaultStore>,
 ) -> Result<serde_json::Value> {
     let lua = sandbox::new_lua()?;
-    api::install(&lua, &def.manifest.permissions)?;
-    http::install(
-        &lua,
-        Rc::new(http::HttpClient::new(&def.manifest.permissions, store)),
-    )?;
+    let perms = &def.manifest.permissions;
+    api::install(&lua, perms)?;
+    encoding::install(&lua)?;
+    time::install(&lua)?;
+    exec::install(&lua, perms.exec.clone())?;
+    fs::install(&lua, Rc::new(fs::FsGuard::new(perms)))?;
+    http::install(&lua, Rc::new(http::HttpClient::new(perms, store)))?;
     let entry = load_entry(&lua, def)?;
     let result: Value = entry.call(lua.to_value_with(args, ser_options())?)?;
     lua.from_value(result)
@@ -69,7 +91,7 @@ fn load_entry(lua: &Lua, def: &CommandDef) -> Result<Function> {
 
 fn read_script(def: &CommandDef) -> Result<String> {
     let path = def.script_path();
-    fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))
+    std::fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))
 }
 
 fn chunk_name(def: &CommandDef) -> String {
@@ -85,7 +107,7 @@ mod tests {
 
     fn command(script: &str) -> (tempfile::TempDir, CommandDef) {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("run.lua"), script).unwrap();
+        std::fs::write(tmp.path().join("run.lua"), script).unwrap();
         let manifest = Manifest::parse(r#"{"name":"t","description":"t"}"#).unwrap();
         let def = CommandDef {
             manifest,

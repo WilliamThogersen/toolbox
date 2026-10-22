@@ -13,7 +13,7 @@ use crate::registry::{MANIFEST_FILE, SCRIPT_FILE};
 const FIRST_VERSION: &str = "0.1.0";
 
 const SCRIPT_TEMPLATE: &str = r#"-- Receives the parsed args. Whatever you return is printed as JSON.
--- Run `tb self guide` for the full API: http, json, exec, env, vault, log.
+-- Run `tb self guide` for the full API: http, fs, exec, json, time, vault and more.
 return function(args)
   return { message = "hello " .. (args.name or "world") }
 end

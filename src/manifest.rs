@@ -64,6 +64,12 @@ pub struct Permissions {
     /// Environment variables the script may read.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Folders the script may read with `fs`. `~` is home, relative paths start at the current folder.
+    #[serde(default)]
+    pub read: Vec<String>,
+    /// Folders the script may write to (and read) with `fs`.
+    #[serde(default)]
+    pub write: Vec<String>,
 }
 
 impl Manifest {
@@ -113,8 +119,23 @@ impl Manifest {
         if self.permissions.http.iter().any(|h| h.trim().is_empty()) {
             problems.push("permissions.http must not contain empty hosts".to_string());
         }
+        for (kind, folders) in [("read", &self.permissions.read), ("write", &self.permissions.write)] {
+            problems.extend(folders.iter().filter_map(|folder| validate_folder(kind, folder)));
+        }
         problems
     }
+}
+
+fn validate_folder(kind: &str, folder: &str) -> Option<String> {
+    if folder.trim().is_empty() {
+        return Some(format!("permissions.{kind} must not contain empty paths"));
+    }
+    if folder.starts_with('~') && folder != "~" && !folder.starts_with("~/") {
+        return Some(format!(
+            "permissions.{kind} entry {folder:?}: only ~ and ~/... are supported, not ~user"
+        ));
+    }
+    None
 }
 
 fn validate_arg(name: &str, spec: &ArgSpec) -> Vec<String> {
@@ -221,6 +242,18 @@ mod tests {
         assert!(problems.contains("description must not be empty"));
         assert!(problems.contains("not a valid secret name"));
         assert!(problems.contains("empty hosts"));
+    }
+
+    #[test]
+    fn reports_bad_folders() {
+        let manifest = Manifest::parse(
+            r#"{"name":"a","description":"x","permissions":{"read":["~/notes", ".", ""],"write":["~bob/x"]}}"#,
+        )
+        .unwrap();
+        let problems = manifest.validate("a").join("\n");
+        assert!(problems.contains("permissions.read must not contain empty paths"), "{problems}");
+        assert!(problems.contains("not ~user"), "{problems}");
+        assert!(!problems.contains("~/notes"), "{problems}");
     }
 
     #[test]

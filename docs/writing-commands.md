@@ -29,7 +29,9 @@ on stderr.
     "http":  ["api.github.com"],
     "vault": ["github"],
     "exec":  ["git"],
-    "env":   ["HOME"]
+    "env":   ["HOME"],
+    "read":  ["~/notes"],
+    "write": ["."]
   }
 }
 ```
@@ -45,6 +47,10 @@ on stderr.
   - `vault`: secret names it may use (see Vault below).
   - `exec`: programs it may run.
   - `env`: environment variables it may read.
+  - `read`: folders it may read with `fs`, including everything below them.
+  - `write`: folders it may create, change and delete files in with `fs` (and read).
+    For both, `~` is the home folder and a relative path like `"."` is the folder
+    `tb` runs in. Ask for the narrowest folder that works.
 
 ## run.lua
 
@@ -59,7 +65,7 @@ end
 
 Lua 5.5. The standard `string`, `table`, `math`, `utf8` and `coroutine` libraries
 are available. `io`, `os`, `require`, `load`, `dofile` are not: use the toolbox
-globals below.
+globals below (`fs` for files, `time` instead of `os.time` and `os.date`).
 
 Lua 5.5 dropped some older functions: write `x ^ y` (not `math.pow`),
 `math.atan(y, x)` (not `math.atan2`) and `math.log(x, 10)` (not `math.log10`).
@@ -74,13 +80,20 @@ local res = http.get(url, opts)      -- also http.post, http.put, http.patch, ht
 local res = http.request{ method = "POST", url = url, headers = {...}, json = {...} }
 ```
 
-`opts` fields: `headers` (table), `body` (string) or `json` (table, sets
-`content-type: application/json`). Use `body` or `json`, not both.
+`opts` fields:
+
+- `headers`: table.
+- `query`: table added to the URL's query string. `{ q = "a b", page = 2 }` sends `?page=2&q=a+b`.
+- One body at most: `body` (string), `json` (table, sets `content-type: application/json`)
+  or `form` (table, sent as `application/x-www-form-urlencoded`).
+- `timeout`: seconds, default 30.
+
+`query` and `form` values are strings, numbers, booleans or lists of those
+(`tag = {"a", "b"}` sends `tag=a&tag=b`).
 
 The response is `{ status = 200, headers = {...}, body = "raw text", json = table or nil }`.
 Header names are lowercase. `json` is set when the body is JSON. A 4xx or 5xx
-status is not an error: check `res.status`. Network failures raise an error.
-Timeout is 30 seconds.
+status is not an error: check `res.status`. Network failures and timeouts raise an error.
 
 ### json
 
@@ -92,9 +105,71 @@ JSON `null` decodes to `nil`. Use `json.null` to output an explicit null.
 ```lua
 local out = exec("git", { "status", "--short" })
 -- out = { ok = true, code = 0, stdout = "...", stderr = "..." }
+
+local out = exec("jq", { ".name" }, {
+  stdin = json.encode(data),  -- text sent to the program's stdin
+  cwd = "/path/to/repo",      -- folder it runs in
+  env = { NO_COLOR = "1" },   -- extra environment variables
+  timeout = 10,               -- seconds; then it and all it started are killed, and exec raises an error
+})
 ```
 
-No shell: pass args as a list. The program must be in `permissions.exec`.
+No shell: pass args as a list. The program must be in `permissions.exec`. A
+non-zero exit is not an error: check `out.ok`.
+
+### fs
+
+```lua
+local text = fs.read("notes/today.md")         -- the whole file as a string
+fs.write("out/report.json", json.encode(r))    -- creates or replaces the file
+fs.append("out/log.txt", "one line\n")
+fs.mkdir("out/2026")                            -- parent folders too
+fs.exists("notes/today.md")                     -- true or false
+fs.list("notes")   -- { { name = "a.md", type = "file", size = 120 }, ... }, sorted by name
+fs.remove("out/old.json")                       -- a file, a symlink or an empty folder
+```
+
+Paths are absolute, `~/...`, or relative to the folder `tb` runs in. Reading needs
+the path inside a `permissions.read` or `permissions.write` folder. Writing,
+`mkdir` and `remove` need `permissions.write`. Symlinks are followed before the
+check, so a link can't lead outside. `fs.write` does not create folders: call
+`fs.mkdir` first. Files over 20 MB can't be read. `type` is `file`, `dir`,
+`symlink` or `other`.
+
+### stdin
+
+`stdin.read()` returns everything piped into the command (`cat data.csv | tb import`),
+or `nil` when stdin is a terminal. No permission needed.
+
+### time
+
+```lua
+local t = time.now()                       -- 1792654200.123: seconds since 1970, UTC
+time.format(t)                             -- "2026-10-22T07:30:00Z"
+time.format(t, "%d/%m/%Y %H:%M", "local")  -- strftime format, zone "utc" (default) or "local"
+time.format()                              -- now
+time.parse("2026-10-22T09:30:00+02:00")    -- also "2026-10-22" and HTTP dates
+time.parse("22.10.2026", "%d.%m.%Y")       -- with a format; no zone in it means UTC
+time.sleep(1.5)                            -- seconds
+```
+
+Times are numbers with milliseconds: use `math.floor(t)` for whole seconds.
+
+### base64, url, hash
+
+```lua
+base64.encode("text")             -- "dGV4dA=="
+base64.decode("dGV4dA==")         -- padding optional
+base64.encode(data, "url")        -- URL-safe alphabet, no padding (JWTs); decode takes "url" too
+url.encode("a b/c")               -- "a%20b%2Fc": safe as one path segment or value
+url.decode("a%20b")               -- "a b"
+url.query({ q = "a b", page = 2 }) -- "page=2&q=a+b"
+hash.sha256("text")               -- hex; pass "base64" or "raw" as 2nd arg for other output
+hash.hmac_sha256(key, message)    -- hex; "base64" or "raw" as 3rd arg
+```
+
+They refuse vault placeholders: a key only ever goes straight into an http header
+value, so a script can't encode, hash or sign with it.
 
 ### env
 
