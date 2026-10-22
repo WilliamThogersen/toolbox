@@ -1,0 +1,82 @@
+# Runs when a version tag is pushed: git tag v0.2.0 && git push origin v0.2.0
+# Tests, builds signed macOS binaries, publishes a GitHub release and updates the
+# Homebrew formula in WilliamThogersen/homebrew-tap.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [[ "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match version $version in Cargo.toml. Bump Cargo.toml, commit, then tag again."
+            exit 1
+          fi
+
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build, sign and package
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir build dist
+          # One universal binary, so the formula has a single url for Apple Silicon and Intel.
+          lipo -create -output build/toolbox target/{aarch64,x86_64}-apple-darwin/release/toolbox
+          # Hardened runtime: DYLD_* injection and debuggers can't get inside the process that reads the vault.
+          codesign --force --sign - --options runtime build/toolbox
+          for arch in arm64 x86_64; do
+            info=$(codesign --display --verbose --arch "$arch" build/toolbox 2>&1)
+            if [[ ! $info =~ flags=[^[:space:]]*runtime ]]; then
+              echo "::error::hardened runtime is not set on the $arch slice"
+              exit 1
+            fi
+          done
+          build/toolbox --version
+          tar -czf dist/toolbox-macos.tar.gz -C build toolbox
+          (cd dist && shasum -a 256 -- *.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+      - name: Check out the Homebrew tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: WilliamThogersen/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Update the Homebrew formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha256=$(shasum -a 256 dist/toolbox-macos.tar.gz | cut -d ' ' -f 1)
+          mkdir -p tap/Formula
+          sed -e "s/@VERSION@/$version/g" -e "s/@SHA256@/$sha256/" \
+              .github/homebrew/toolbox.rb > tap/Formula/toolbox.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/toolbox.rb
+          git commit -m "toolbox $version"
+          git push

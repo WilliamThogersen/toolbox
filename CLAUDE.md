@@ -15,7 +15,6 @@ cargo test --test cli                   # end-to-end tests only (tests/cli.rs)
 cargo test vault::inject                # one module's unit tests
 cargo test --test cli secret_requests   # one end-to-end test by name filter
 cargo clippy --all-targets              # keep at 0 warnings
-scripts/install.sh                      # release build to ~/.cargo/bin, tb symlink, hardened-runtime codesign on macOS
 ```
 
 Run the dev binary against a throwaway home and a plain-text test vault (never put real keys in it):
@@ -55,3 +54,5 @@ Known limits (documented in README): a rebuilt binary can read the vault after t
 ## Repo
 
 Pushes go to the `main` branch of `github.com/WilliamThogersen/toolbox` through a repo-local credential helper (`git config --local -l`). Don't change the global `gh` account to push.
+
+Releases: pushing a `v*` tag runs `.github/workflows/release.yml`. It requires the tag to equal `v` + the `Cargo.toml` version, runs the tests, builds one universal macOS binary signed with the hardened runtime (`codesign --sign - --options runtime`), publishes the GitHub release, then renders `.github/homebrew/toolbox.rb` into `Formula/toolbox.rb` of `WilliamThogersen/homebrew-tap`. The push to the tap uses the deploy key in the `HOMEBREW_TAP_DEPLOY_KEY` secret. Users install with `brew install WilliamThogersen/tap/toolbox`.

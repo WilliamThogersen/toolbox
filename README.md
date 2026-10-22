@@ -37,13 +37,10 @@ Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 ## Install
 
 ```bash
-git clone https://github.com/WilliamThogersen/toolbox.git
-cd toolbox
-scripts/install.sh
+brew install WilliamThogersen/tap/toolbox
 ```
 
-This builds a release binary, installs `toolbox` and `tb` to `~/.cargo/bin`, and on macOS signs it with the
-hardened runtime. Set `TOOLBOX_INSTALL_DIR` to install somewhere else.
+This installs `toolbox` and `tb` (macOS, Apple Silicon and Intel). Update with `brew upgrade toolbox`.
 
 ## Quick start
 
@@ -156,14 +153,15 @@ The first time toolbox reads the vault, macOS asks if `toolbox` may use the keyc
 - **No echoes.** A key that shows up in a response (raw, base64 or URL-encoded) is replaced with `[REDACTED:<name>]`.
 - **A human adds and removes keys.** That needs a real terminal (`/dev/tty`). An AI's shell has none.
 - **Other programs get asked.** The vault is one macOS Keychain item, so tools like the `security` CLI trigger a permission prompt.
-- **No injection.** `scripts/install.sh` signs toolbox with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and debuggers can't get inside it.
+- **No injection.** Release binaries are signed with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and debuggers can't get inside them.
 
 ### What it does not protect against
 
 - **A rebuilt toolbox.** If an AI edits the Rust source and rebuilds it, the new binary can do anything. macOS asks again
-  before a changed binary reads the keychain: only click Allow right after you ran `scripts/install.sh` yourself.
+  before a changed binary reads the keychain: only click Allow right after you installed or upgraded toolbox yourself.
 - **A host that echoes the key in a changed form** (part of it, hashed, re-encoded). Redaction only catches exact copies.
-- **Other platforms.** On Linux and Windows the keychain storage works, but the hardened-runtime signing is macOS only.
+- **Other platforms.** Releases are macOS only. Built from source on Linux or Windows the keychain storage works,
+  but there is no hardened-runtime signing.
 
 ## Development
 
@@ -173,6 +171,16 @@ cargo clippy --all-targets
 ```
 
 Tests use `TOOLBOX_HOME` (a temp folder) and `TOOLBOX_INSECURE_TEST_VAULT` (a plain JSON vault file). Never put real keys in that file.
+
+### Releasing
+
+1. Bump `version` in `Cargo.toml`, run `cargo build` (updates `Cargo.lock`) and commit.
+2. Tag and push: `git tag v0.2.0 && git push origin main v0.2.0`
+
+The [release workflow](.github/workflows/release.yml) runs the tests, builds a signed universal macOS binary,
+publishes the GitHub release and updates the formula in
+[WilliamThogersen/homebrew-tap](https://github.com/WilliamThogersen/homebrew-tap).
+It stops if the tag doesn't match the version in `Cargo.toml`.
 
 <details>
 <summary>Project layout</summary>
