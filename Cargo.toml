@@ -12,7 +12,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive", "string"] }
 dirs = "7"
 keyring = "4"
-mlua = { version = "0.12", features = ["lua54", "vendored", "serde", "anyhow"] }
+mlua = { version = "0.12", features = ["lua55", "vendored", "serde", "anyhow"] }
 rpassword = "7"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

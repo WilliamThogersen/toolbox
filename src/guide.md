@@ -57,9 +57,13 @@ return function(args)
 end
 ```
 
-Lua 5.4. The standard `string`, `table`, `math`, `utf8` and `coroutine` libraries
+Lua 5.5. The standard `string`, `table`, `math`, `utf8` and `coroutine` libraries
 are available. `io`, `os`, `require`, `load`, `dofile` are not: use the toolbox
 globals below.
+
+Lua 5.5 dropped some older functions: write `x ^ y` (not `math.pow`),
+`math.atan(y, x)` (not `math.atan2`) and `math.log(x, 10)` (not `math.log10`).
+A `for` loop variable can't be assigned to: copy it into a `local` first.
 
 ## Globals
 

@@ -13,7 +13,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-f97316"></a>
   <img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-1c1917?logo=rust">
-  <img alt="Lua 5.4" src="https://img.shields.io/badge/lua-5.4-1c1917?logo=lua">
+  <img alt="Lua 5.5" src="https://img.shields.io/badge/lua-5.5-1c1917?logo=lua">
 </p>
 
 <p align="center">
@@ -114,7 +114,7 @@ $ tb stars --repo rust-lang/rust
 }
 ```
 
-Scripts run in a sandboxed Lua 5.4 with no `io`, `os` or `require`. Instead they get these globals, each one gated by
+Scripts run in a sandboxed Lua 5.5 with no `io`, `os` or `require`. Instead they get these globals, each one gated by
 `permissions`:
 
 | Global | What it does | Permission |
@@ -243,6 +243,8 @@ The first time toolbox reads the vault, macOS asks if `toolbox` may use the keyc
 cargo test                  # unit + end-to-end tests
 cargo clippy --all-targets
 ```
+
+The Rust version is pinned in `rust-toolchain.toml`: rustup installs it on the first build.
 
 Tests use `TOOLBOX_HOME` (a temp folder) and `TOOLBOX_INSECURE_TEST_VAULT` (a plain JSON vault file). Never put real keys in that file.
 

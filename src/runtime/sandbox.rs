@@ -35,6 +35,19 @@ mod tests {
         assert!(missing);
     }
 
+    /// `tb self guide` promises Lua 5.5 and tells authors these replacements work.
+    #[test]
+    fn runs_lua_5_5_as_the_guide_says() {
+        let lua = new_lua().unwrap();
+        let result: String = lua
+            .load(r#"return _VERSION .. " " .. tostring(math.pow) .. " " .. 2 ^ 3 .. " " .. math.log(100, 10)"#)
+            .eval()
+            .unwrap();
+        assert_eq!(result, "Lua 5.5 nil 8.0 2.0");
+        let err = lua.load("for i = 1, 2 do i = 5 end").exec().unwrap_err();
+        assert!(err.to_string().contains("i"), "{err}");
+    }
+
     #[test]
     fn safe_libs_work() {
         let lua = new_lua().unwrap();

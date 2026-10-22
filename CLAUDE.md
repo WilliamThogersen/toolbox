@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`toolbox` is a Rust CLI (installed as `toolbox` with a `tb` symlink) whose commands are defined at runtime, not compiled in. Each command is a folder `$TOOLBOX_HOME/commands/<name>/` (default `~/.toolbox`) holding `command.json` (name, args, permissions) and `run.lua` (Lua 5.4, sandboxed). It also has a vault: API keys that commands can use in HTTP headers without the script (or the AI writing it) ever seeing the value.
+`toolbox` is a Rust CLI (installed as `toolbox` with a `tb` symlink) whose commands are defined at runtime, not compiled in. Each command is a folder `$TOOLBOX_HOME/commands/<name>/` (default `~/.toolbox`) holding `command.json` (name, args, permissions) and `run.lua` (Lua 5.5, sandboxed). It also has a vault: API keys that commands can use in HTTP headers without the script (or the AI writing it) ever seeing the value.
 
 ## Commands
 
@@ -16,6 +16,8 @@ cargo test vault::inject                # one module's unit tests
 cargo test --test cli secret_requests   # one end-to-end test by name filter
 cargo clippy --all-targets              # keep at 0 warnings
 ```
+
+The Rust version is pinned in `rust-toolchain.toml` (rustup installs it on first build, CI included).
 
 Run the dev binary against a throwaway home and a plain-text test vault (never put real keys in it):
 
