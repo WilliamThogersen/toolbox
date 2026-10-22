@@ -2,6 +2,9 @@
 name = "toolbox"
 version = "0.1.0"
 edition = "2024"
+description = "A CLI your AI can keep extending: Lua commands and a key vault"
+license = "MIT"
+repository = "https://github.com/WilliamThogersen/toolbox"
 
 [dependencies]
 anyhow = "1"

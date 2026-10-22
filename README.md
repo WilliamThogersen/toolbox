@@ -1,35 +1,131 @@
-# toolbox
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/toolbox-wordmark-dark.svg">
+    <img alt="toolbox" src="assets/toolbox-wordmark-light.svg" width="360">
+  </picture>
+</h1>
 
-A toolbox CLI that an AI can keep extending. Every command is a folder with a
-`command.json` (name, args, permissions) and a `run.lua` (the logic). Drop a
-folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
+<p align="center">
+  <strong>A CLI your AI can keep extending.</strong><br>
+  Commands are small Lua scripts. API keys stay in the keychain, out of the AI's reach.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-f97316"></a>
+  <img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-1c1917?logo=rust">
+  <img alt="Lua 5.4" src="https://img.shields.io/badge/lua-5.4-1c1917?logo=lua">
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#writing-a-command">Writing a command</a> ·
+  <a href="#let-your-ai-use-it">Let your AI use it</a> ·
+  <a href="#the-vault">The vault</a>
+</p>
+
+Every command is a folder with a `command.json` (name, args, permissions) and a `run.lua` (the logic).
+Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
+
+- **New command, new folder.** An AI can add a tool in seconds and use it right away.
+- **JSON out, always.** Results go to stdout as JSON. Errors are `{"error": "..."}` on stderr with exit code 1.
+- **Nothing it didn't ask for.** Each command lists the hosts, programs, env vars and keys it may touch. Everything else fails.
+- **Keys the AI can use but never see.** Scripts get a placeholder. toolbox swaps in the real key only on the way out.
 
 `tb` and `toolbox` are the same program: `tb` is a symlink for typing less.
-Plain `tb` lists only your own commands. Everything that manages the toolbox
-itself (new, check, describe, guide, vault) lives under `tb self`.
 
 ## Install
 
 ```bash
-scripts/install.sh        # builds, installs ~/.cargo/bin/toolbox + tb, signs it on macOS
+git clone https://github.com/WilliamThogersen/toolbox.git
+cd toolbox
+scripts/install.sh
 ```
+
+This builds a release binary, installs `toolbox` and `tb` to `~/.cargo/bin`, and on macOS signs it with the
+hardened runtime. Set `TOOLBOX_INSTALL_DIR` to install somewhere else.
 
 ## Quick start
 
-```bash
-tb self new hello --description "Says hello"   # creates ~/.toolbox/commands/hello/
-tb hello --name you                            # {"message": "hello you"}
-tb                                             # lists your commands
-tb self describe                               # every command as JSON
-tb self guide                                  # how to write commands (Lua API)
-tb self check                                  # validates everything, exit 1 on problems
+```console
+$ tb self new hello --description "Says hello"
+$ tb hello --name you
+{
+  "message": "hello you"
+}
+$ tb
+Usage: tb <command> [args]
+
+Commands:
+  hello  Says hello
+
+Manage commands and API keys: tb self
 ```
 
-Output is always JSON on stdout. Errors are `{"error": "..."}` on stderr with exit code 1.
+Plain `tb` lists only your own commands. Everything that manages the toolbox itself lives under `tb self`:
+
+| Command | What it does |
+|---------|--------------|
+| `tb self new <name>` | Create a command from a template |
+| `tb self check` | Validate every command, exit 1 on problems |
+| `tb self describe` | Every command, its args and permissions, as JSON |
+| `tb self guide` | How to write commands (manifest format and Lua API) |
+| `tb self vault` | Add, list and remove API keys |
+
+## Writing a command
+
+`~/.toolbox/commands/stars/command.json`:
+
+```json
+{
+  "name": "stars",
+  "description": "Star count for a GitHub repo",
+  "args": {
+    "repo": { "type": "string", "required": true, "description": "owner/repo" }
+  },
+  "permissions": {
+    "http": ["api.github.com"]
+  }
+}
+```
+
+`~/.toolbox/commands/stars/run.lua`:
+
+```lua
+return function(args)
+  local res = http.get("https://api.github.com/repos/" .. args.repo, {
+    headers = { ["User-Agent"] = "toolbox" },
+  })
+  if res.status ~= 200 then error("GitHub returned " .. res.status) end
+  return { repo = res.json.full_name, stars = res.json.stargazers_count }
+end
+```
+
+```console
+$ tb stars --repo rust-lang/rust
+{
+  "repo": "rust-lang/rust",
+  "stars": 120656
+}
+```
+
+Scripts run in a sandboxed Lua 5.4 with no `io`, `os` or `require`. Instead they get these globals, each one gated by
+`permissions`:
+
+| Global | What it does | Permission |
+|--------|--------------|------------|
+| `http` | `get`, `post`, `put`, `patch`, `delete`, `request` | `http`: allowed hosts |
+| `exec` | Run a program with a list of args, no shell | `exec`: allowed programs |
+| `env` | `env.get("NAME")` | `env`: allowed variables |
+| `vault` | `vault("name")` gives a placeholder for a key | `vault`: allowed keys |
+| `json` | `json.encode`, `json.decode`, `json.null` | none |
+| `log` | Write to stderr (`print` does too) | none |
+
+`tb self guide` prints the full reference (also in [`src/guide.md`](src/guide.md)).
 
 ## Let your AI use it
 
-Add this to your `CLAUDE.md`:
+Add this to your `CLAUDE.md` (or your agent's instructions file):
 
 ```markdown
 ## toolbox (tb)
@@ -39,24 +135,28 @@ API keys live in the toolbox vault: use `vault("name")` in headers, never ask me
 If a key is missing, ask me to run `tb self vault add <name> --host <host>`.
 ```
 
-## Vault: keys the AI can use but never see
+## The vault
 
-1. In your own terminal: `tb self vault add github --host api.github.com`. Paste the key at the hidden prompt.
-2. In a command: list `"vault": ["github"]` under `permissions` and send
-   `Authorization = "Bearer " .. vault("github")` as a header.
-3. The first time toolbox reads the vault, macOS asks if `toolbox` may use the keychain item `toolbox`. Click **Always Allow**.
+API keys your AI can use but never see.
 
-`tb self vault list` shows names and hosts. `tb self vault rm <name>` deletes a secret (asks for confirmation).
+1. In your own terminal, run `tb self vault add github --host api.github.com` and paste the key at the hidden prompt.
+2. In the command, add `"vault": ["github"]` under `permissions`.
+3. Send the key as a header: `Authorization = "Bearer " .. vault("github")`.
+
+The first time toolbox reads the vault, macOS asks if `toolbox` may use the keychain item `toolbox`. Click **Always Allow**.
+
+`tb self vault list` shows names and hosts, never values. `tb self vault rm <name>` deletes a key (asks for confirmation).
 
 ### What it protects against
 
-- Scripts never get the value. `vault("github")` returns the placeholder `{{vault:github}}`.
-- toolbox swaps in the real key only in **header values**, only for hosts you allowed, only over https (http for localhost only).
-- Requests that carry a key ignore redirects and `HTTP_PROXY`-style env vars.
-- Any key that shows up in a response (raw, base64 or URL-encoded) is replaced with `[REDACTED:<name>]`.
-- Adding and removing keys needs a human at a real terminal (`/dev/tty`). An AI's shell has none.
-- The vault is one macOS Keychain item. Other programs, like the `security` CLI, trigger a macOS permission prompt.
-- `scripts/install.sh` signs toolbox with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and debuggers can't get inside it.
+- **Scripts never get the value.** `vault("github")` returns the placeholder `{{vault:github}}`.
+- **Keys only go where you said.** toolbox swaps in the real key only in header values, only for hosts you allowed,
+  only over https (http for localhost only).
+- **No detours.** Requests that carry a key ignore redirects and `HTTP_PROXY`-style env vars.
+- **No echoes.** A key that shows up in a response (raw, base64 or URL-encoded) is replaced with `[REDACTED:<name>]`.
+- **A human adds and removes keys.** That needs a real terminal (`/dev/tty`). An AI's shell has none.
+- **Other programs get asked.** The vault is one macOS Keychain item, so tools like the `security` CLI trigger a permission prompt.
+- **No injection.** `scripts/install.sh` signs toolbox with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and debuggers can't get inside it.
 
 ### What it does not protect against
 
@@ -65,7 +165,17 @@ If a key is missing, ask me to run `tb self vault add <name> --host <host>`.
 - **A host that echoes the key in a changed form** (part of it, hashed, re-encoded). Redaction only catches exact copies.
 - **Other platforms.** On Linux and Windows the keychain storage works, but the hardened-runtime signing is macOS only.
 
-## Layout
+## Development
+
+```bash
+cargo test                  # unit + end-to-end tests
+cargo clippy --all-targets
+```
+
+Tests use `TOOLBOX_HOME` (a temp folder) and `TOOLBOX_INSECURE_TEST_VAULT` (a plain JSON vault file). Never put real keys in that file.
+
+<details>
+<summary>Project layout</summary>
 
 | Path | What |
 |------|------|
@@ -77,11 +187,8 @@ If a key is missing, ask me to run `tb self vault add <name> --host <host>`.
 | `src/vault/` | Keychain storage, placeholder injection, redaction, `vault` subcommands |
 | `src/guide.md` | Text printed by `tb self guide` |
 
-## Development
+</details>
 
-```bash
-cargo test                  # unit + end-to-end tests
-cargo clippy --all-targets
-```
+## License
 
-Tests use `TOOLBOX_HOME` (a temp folder) and `TOOLBOX_INSECURE_TEST_VAULT` (a plain JSON vault file). Never put real keys in that file.
+[MIT](LICENSE)
