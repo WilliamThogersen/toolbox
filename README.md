@@ -71,7 +71,9 @@ Plain `tb` lists only your own commands. Everything that manages the toolbox its
 | `tb self check` | Validate every command, exit 1 on problems |
 | `tb self describe` | Every command, its args and permissions, as JSON |
 | `tb self guide` | How to write commands (manifest format and Lua API) |
-| `tb self install <git-url>` | Install the commands in a git repo |
+| `tb self install <source>` | Install commands from a git repo or a saved marketplace |
+| `tb self search [<text>]` | Search the commands in every saved marketplace |
+| `tb self market` | Save, list and remove marketplaces |
 | `tb self update [<name>]` | Update installed commands to their newest version |
 | `tb self uninstall <name>` | Remove an installed command |
 | `tb self vault` | Add, list and remove API keys |
@@ -130,7 +132,8 @@ Scripts run in a sandboxed Lua 5.5 with no `io`, `os` or `require`. Instead they
 
 ## Share commands through git
 
-Any git repo can hold toolbox commands: GitHub, GitLab, a self-hosted server, public or private.
+Any git repo can hold toolbox commands: GitHub, GitLab, a self-hosted server, public or private. A repo can hold
+one command or a whole marketplace of them.
 
 ### Install
 
@@ -144,14 +147,41 @@ Install 2 commands? [y/N] y
 ```
 
 toolbox fetches the repo with your own `git`, so private repos work through your SSH keys or git credentials.
-It installs every command in the repo or none: a broken command, or a name you already use, stops the install.
+Without names it installs every working command and lists the broken ones it skipped. Name commands to pick them:
+a name that is missing, broken or already used by another command stops the install, and nothing is installed.
 
 | Command | What it does |
 |---------|--------------|
+| `tb self install <url> stars pr-status` | Install only these commands from the repo |
+| `tb self install <url> --list` | Show the repo's commands and permissions as JSON, install nothing |
 | `tb self install <url> --ref v1.2.0` | Install a branch, tag or commit instead of the default branch |
 | `tb self install <url> --yes` | Skip the question (scripts and agents have no terminal to answer on) |
 | `tb self update` | Update every installed command (asks first). `tb self update stars` updates one |
 | `tb self uninstall stars` | Remove an installed command. Commands you made yourself are never touched |
+
+### Marketplaces
+
+Save a repo once under a short name, then search it and install by name:
+
+```console
+$ tb self market add acme https://github.com/acme/tb-market.git
+$ tb self search github
+{
+  "results": [
+    { "market": "acme", "name": "stars", "version": "1.0.0", "description": "Star count for a GitHub repo", ... }
+  ],
+  "problems": []
+}
+$ tb self install acme/stars
+```
+
+- `tb self install acme stars pr-status` picks several commands from `acme`.
+- `tb self search` without words lists everything. It fetches each marketplace fresh, so results are never stale.
+- `tb self market list` shows saved marketplaces. `tb self market rm acme` forgets one: its installed commands stay
+  and keep updating from its URL.
+- `tb self market add acme <url> --ref stable` follows a branch or tag instead of the default branch.
+
+Marketplaces are saved in `~/.toolbox/markets.json`.
 
 ### Host your own
 
@@ -172,7 +202,11 @@ It installs every command in the repo or none: a broken command, or a name you a
 2. Give each command a `"version": "1.0.0"` in `command.json`.
 3. Commit, then try it: `tb self install ./tb-tools` works on a local repo too and checks every command.
    Then push.
-4. Share the clone URL. Others run `tb self install <url>`.
+4. Share the clone URL. Others run `tb self install <url>`, or save it as a marketplace with
+   `tb self market add <name> <url>`.
+
+A marketplace is just a repo with many command folders. `tb self search` matches names and descriptions, so give each
+command a clear `description`.
 
 To release a new version, bump `version` and push. `tb self update` only takes a version higher than the installed
 one, so commits without a bump never reach anyone. A command without a `version` updates on every new commit.
@@ -203,7 +237,8 @@ Add this to your `CLAUDE.md` (or your agent's instructions file):
 To add a command, read `tb self guide`, then `tb self new <name>`, edit the files, and run `tb self check`.
 API keys live in the toolbox vault: use `vault("name")` in headers, never ask me for a key.
 If a key is missing, ask me to run `tb self vault add <name> --host <host>`.
-Before `tb self install <url> --yes`, show me the permissions it lists and wait for my OK.
+Before writing a new command, check `tb self search <words>` for one in my marketplaces.
+Before `tb self install <source> --yes`, show me the permissions it lists and wait for my OK.
 ```
 
 ## The vault
@@ -270,7 +305,7 @@ on a clean Mac and fails if it isn't the latest release. Run it by hand with `gh
 | `src/registry.rs` | Finds and loads command folders |
 | `src/cli.rs` | Top level: your commands, built from manifests |
 | `src/builtin.rs` | `tb self`: new, check, describe, guide, install, update, uninstall, vault |
-| `src/install/` | Fetch commands from git repos, `.source.json`, version-aware updates |
+| `src/install/` | Fetch commands from git repos and marketplaces, `.source.json`, version-aware updates |
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
 | `src/vault/` | Keychain storage, placeholder injection, redaction, `vault` subcommands |
 | `src/guide.md` | Text printed by `tb self guide` |

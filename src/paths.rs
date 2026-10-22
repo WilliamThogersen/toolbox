@@ -15,3 +15,8 @@ pub fn toolbox_home() -> Result<PathBuf> {
 pub fn commands_dir() -> Result<PathBuf> {
     Ok(toolbox_home()?.join("commands"))
 }
+
+/// Saved marketplaces (`tb self market`).
+pub fn markets_file() -> Result<PathBuf> {
+    Ok(toolbox_home()?.join("markets.json"))
+}

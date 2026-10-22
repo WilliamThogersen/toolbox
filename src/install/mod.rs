@@ -1,11 +1,14 @@
-//! `tb self install|update|uninstall`: commands shared through git repos.
+//! `tb self install|update|uninstall|market|search`: commands shared through git repos.
 //!
 //! An installed command is a normal command folder plus `.source.json`, which records the
 //! repo it came from. Only `command.json` and `run.lua` are copied: scripts can't read
-//! other files, so nothing else in the repo matters.
+//! other files, so nothing else in the repo matters. A repo can hold one command or a
+//! whole marketplace of them; `market` saves such repos by name so commands can be
+//! searched and installed as `<market>/<command>`.
 
 mod confirm;
 mod git;
+pub mod market;
 mod repo;
 mod source;
 mod update;
@@ -18,11 +21,26 @@ use serde::Serialize;
 use tempfile::TempDir;
 
 use crate::manifest::{Permissions, is_valid_name};
-use crate::registry::{CommandDef, MANIFEST_FILE, SCRIPT_FILE};
+use crate::registry::{CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
 
 pub use confirm::{Confirm, Prompt, Yes};
 pub use source::Source;
 pub use update::update;
+
+/// Which repo to install from, and which of its commands (all of them when `names` is empty).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Request {
+    pub url: String,
+    pub git_ref: Option<String>,
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InstallReport {
+    pub installed: Vec<Installed>,
+    /// Broken commands left out when installing everything in a repo.
+    pub skipped: Vec<Problem>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct Installed {
@@ -34,19 +52,36 @@ pub struct Installed {
     pub source: Source,
 }
 
-/// Installs every command in the repo, or none of them.
-pub fn install(
-    commands_dir: &Path,
-    url: &str,
-    git_ref: Option<&str>,
-    confirm: &dyn Confirm,
-) -> Result<Vec<Installed>> {
-    let url = &git::resolve_url(url)?;
+/// One command as a repo offers it, for `--list` and `search`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Listing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market: Option<String>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub description: String,
+    pub permissions: Permissions,
+    /// Already installed from this repo.
+    pub installed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepoListing {
+    pub url: String,
+    pub commit: String,
+    pub commands: Vec<Listing>,
+    pub broken: Vec<Problem>,
+}
+
+/// Installs the requested commands, or none of them.
+pub fn install(commands_dir: &Path, request: &Request, confirm: &dyn Confirm) -> Result<InstallReport> {
+    let url = &git::resolve_url(&request.url)?;
     let staging = Staging::new(commands_dir)?;
-    let checkout = staging.path().join("checkout");
-    let commit = git::fetch(url, git_ref, &checkout)?;
-    let defs = repo::find_commands(&checkout)?;
-    let conflicts: Vec<String> = defs
+    let (commit, scan) = staging.fetch(url, request.git_ref.as_deref())?;
+    let selection = repo::select(scan, &request.names)?;
+    let conflicts: Vec<String> = selection
+        .chosen
         .iter()
         .map(|def| conflict(commands_dir, url, &def.manifest.name))
         .collect::<Result<Vec<_>>>()?
@@ -59,17 +94,19 @@ pub fn install(
 
     let source = Source {
         url: url.to_string(),
-        git_ref: git_ref.map(str::to_string),
+        git_ref: request.git_ref.clone(),
         commit,
     };
-    let question = match defs.len() {
+    let question = match selection.chosen.len() {
         1 => "Install 1 command?".to_string(),
         n => format!("Install {n} commands?"),
     };
-    if !confirm.confirm(&install_summary(&source, &defs), &question)? {
+    if !confirm.confirm(&install_summary(&source, &selection), &question)? {
         bail!("cancelled: nothing was installed");
     }
-    defs.iter()
+    let installed = selection
+        .chosen
+        .iter()
         .map(|def| {
             let dir = staging.put(commands_dir, def, &source)?;
             Ok(Installed {
@@ -80,7 +117,43 @@ pub fn install(
                 source: source.clone(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(InstallReport {
+        installed,
+        skipped: selection.skipped,
+    })
+}
+
+/// What a repo offers, without installing anything.
+pub fn list(commands_dir: &Path, url: &str, git_ref: Option<&str>) -> Result<RepoListing> {
+    let url = git::resolve_url(url)?;
+    let staging = Staging::new(commands_dir)?;
+    let (commit, scan) = staging.fetch(&url, git_ref)?;
+    let commands = scan
+        .commands
+        .iter()
+        .map(|def| Listing {
+            market: None,
+            name: def.manifest.name.clone(),
+            version: def.manifest.version.clone(),
+            description: def.manifest.description.clone(),
+            permissions: def.manifest.permissions.clone(),
+            installed: installed_from(commands_dir, &def.manifest.name, &url),
+        })
+        .collect();
+    Ok(RepoListing {
+        url,
+        commit,
+        commands,
+        broken: scan.broken,
+    })
+}
+
+fn installed_from(commands_dir: &Path, name: &str, url: &str) -> bool {
+    source::read(&commands_dir.join(name))
+        .ok()
+        .flatten()
+        .is_some_and(|existing| existing.same_repo(url))
 }
 
 /// Removes a command that `install` put there. Local commands are left alone.
@@ -115,7 +188,8 @@ fn conflict(commands_dir: &Path, url: &str, name: &str) -> Result<Option<String>
     })
 }
 
-fn install_summary(source: &Source, defs: &[CommandDef]) -> String {
+fn install_summary(source: &Source, selection: &repo::Selection) -> String {
+    let defs = &selection.chosen;
     let labels: Vec<String> = defs.iter().map(|def| confirm::label(&def.manifest)).collect();
     let width = labels.iter().map(String::len).max().unwrap_or(0);
     let lines: Vec<String> = defs
@@ -126,7 +200,12 @@ fn install_summary(source: &Source, defs: &[CommandDef]) -> String {
             format!("  {label:<width$}  {}{}", confirm::permissions(perms), confirm::warning_lines(perms))
         })
         .collect();
-    format!("From {} at {}:\n{}", source.url, short(&source.commit), lines.join("\n"))
+    let skipped = if selection.skipped.is_empty() {
+        String::new()
+    } else {
+        format!("\nSkipped, broken:\n{}", repo::problem_lines(&selection.skipped))
+    };
+    format!("From {} at {}:\n{}{skipped}", source.url, short(&source.commit), lines.join("\n"))
 }
 
 pub fn short(commit: &str) -> &str {
@@ -152,6 +231,13 @@ impl Staging {
 
     fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// Fetches the repo into this staging folder and checks every command in it.
+    fn fetch(&self, url: &str, git_ref: Option<&str>) -> Result<(String, repo::Scan)> {
+        let checkout = self.path().join("checkout");
+        let commit = git::fetch(url, git_ref, &checkout)?;
+        Ok((commit, repo::scan(&checkout)?))
     }
 
     /// Copies the command's two files plus `.source.json` into `commands_dir`, replacing an older copy.
@@ -202,6 +288,14 @@ mod tests {
         }
     }
 
+    fn request(url: &str) -> Request {
+        Request {
+            url: url.to_string(),
+            git_ref: None,
+            names: Vec::new(),
+        }
+    }
+
     fn answer(yes: bool) -> Answer {
         Answer { yes, shown: RefCell::new(String::new()) }
     }
@@ -234,15 +328,15 @@ mod tests {
         let commands = home.path().join("commands");
 
         let no = answer(false);
-        let err = install(&commands, url, None, &no).unwrap_err();
+        let err = install(&commands, &request(url), &no).unwrap_err();
         assert!(err.to_string().contains("cancelled"), "{err}");
         assert!(!commands.join("pr").exists());
         let shown = no.shown.borrow();
         assert!(shown.contains("pr 1.0.0  vault: github"), "{shown}");
         assert!(shown.ends_with("Install 1 command?"), "{shown}");
 
-        let installed = install(&commands, url, None, &answer(true)).unwrap();
-        assert_eq!(installed[0].name, "pr");
+        let report = install(&commands, &request(url), &answer(true)).unwrap();
+        assert_eq!(report.installed[0].name, "pr");
         assert!(source::read(&commands.join("pr")).unwrap().is_some());
     }
 }

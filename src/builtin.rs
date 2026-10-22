@@ -9,10 +9,10 @@ use anyhow::Result;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use crate::cli::{ignore_closed_pipe, print_json};
+use crate::install::{self, Confirm, Prompt, Yes, market};
 use crate::registry::Registry;
-use crate::install::{self, Confirm, Prompt, Yes};
 use crate::vault::commands::{self as vault_ops, Tty};
-use crate::{check, describe, scaffold, vault};
+use crate::{check, describe, paths, scaffold, vault};
 
 pub const NAMESPACE: &str = "self";
 
@@ -37,14 +37,30 @@ pub fn app() -> Command {
         .subcommand(Command::new("guide").about("How to write new commands (manifest format and Lua API)"))
         .subcommand(
             Command::new("install")
-                .about("Install the commands in a git repo (GitHub, GitLab or any git URL)")
-                .arg(Arg::new("url").required(true).help("Git URL, e.g. https://github.com/you/tb-tools.git"))
+                .about("Install commands from a git repo (GitHub, GitLab or any git URL) or a saved marketplace")
                 .arg(
-                    Arg::new("ref")
-                        .long("ref")
-                        .help("Branch, tag or commit to install (default: the repo's default branch)"),
+                    Arg::new("source")
+                        .required(true)
+                        .help("Git URL, local repo path, or saved marketplace: acme or acme/stars"),
+                )
+                .arg(
+                    Arg::new("names")
+                        .num_args(0..)
+                        .help("Only install these commands (default: every working command in the repo)"),
+                )
+                .arg(ref_arg())
+                .arg(
+                    Arg::new("list")
+                        .long("list")
+                        .action(ArgAction::SetTrue)
+                        .help("Show the repo's commands and permissions as JSON, install nothing"),
                 )
                 .arg(yes_arg()),
+        )
+        .subcommand(
+            Command::new("search")
+                .about("Search the commands in every saved marketplace")
+                .arg(Arg::new("text").help("Words in the name or description (default: list everything)")),
         )
         .subcommand(
             Command::new("update")
@@ -57,7 +73,35 @@ pub fn app() -> Command {
                 .about("Remove a command that was added with `tb self install`")
                 .arg(Arg::new("name").required(true)),
         )
+        .subcommand(market_app())
         .subcommand(vault_app())
+}
+
+fn market_app() -> Command {
+    Command::new("market")
+        .about("Saved marketplaces: git repos of commands you can search and install by name")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .disable_help_subcommand(true)
+        .subcommand(
+            Command::new("add")
+                .about("Save a repo of commands under a short name")
+                .arg(Arg::new("name").required(true).help("Short name, used as <name>/<command>"))
+                .arg(Arg::new("url").required(true).help("Git URL or local repo path"))
+                .arg(ref_arg()),
+        )
+        .subcommand(Command::new("list").about("Saved marketplaces and their URLs"))
+        .subcommand(
+            Command::new("rm")
+                .about("Forget a marketplace. Commands installed from it stay")
+                .arg(Arg::new("name").required(true)),
+        )
+}
+
+fn ref_arg() -> Arg {
+    Arg::new("ref")
+        .long("ref")
+        .help("Branch, tag or commit to use (default: the repo's default branch)")
 }
 
 fn yes_arg() -> Arg {
@@ -108,11 +152,12 @@ pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Re
             ignore_closed_pipe(io::stdout().lock().write_all(describe::GUIDE.as_bytes()))?;
             Ok(ExitCode::SUCCESS)
         }
-        Some(("install", m)) => {
-            let url = m.get_one::<String>("url").expect("required");
-            let git_ref = m.get_one::<String>("ref").map(String::as_str);
-            print_json(&install::install(commands_dir, url, git_ref, confirmer(m))?)
+        Some(("install", m)) => install_command(commands_dir, m),
+        Some(("search", m)) => {
+            let text = m.get_one::<String>("text").map(String::as_str);
+            print_json(&market::search(&paths::markets_file()?, commands_dir, text)?)
         }
+        Some(("market", m)) => market_command(commands_dir, m),
         Some(("update", m)) => {
             let name = m.get_one::<String>("name").map(String::as_str);
             let report = install::update(commands_dir, name, confirmer(m))?;
@@ -126,6 +171,37 @@ pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Re
         }
         Some(("vault", m)) => vault_command(m),
         _ => unreachable!("clap requires a `self` subcommand"),
+    }
+}
+
+fn install_command(commands_dir: &Path, matches: &ArgMatches) -> Result<ExitCode> {
+    let source = matches.get_one::<String>("source").expect("required");
+    let names: Vec<String> = matches.get_many::<String>("names").into_iter().flatten().cloned().collect();
+    let git_ref = matches.get_one::<String>("ref").map(String::as_str);
+    let markets = market::load(&paths::markets_file()?)?;
+    let request = market::resolve(&markets, source, git_ref, &names)?;
+    if matches.get_flag("list") {
+        return print_json(&install::list(commands_dir, &request.url, request.git_ref.as_deref())?);
+    }
+    print_json(&install::install(commands_dir, &request, confirmer(matches))?)
+}
+
+fn market_command(commands_dir: &Path, matches: &ArgMatches) -> Result<ExitCode> {
+    let file = paths::markets_file()?;
+    match matches.subcommand() {
+        Some(("add", m)) => {
+            let name = m.get_one::<String>("name").expect("required");
+            let url = m.get_one::<String>("url").expect("required");
+            let git_ref = m.get_one::<String>("ref").map(String::as_str);
+            print_json(&market::add(&file, commands_dir, name, url, git_ref)?)
+        }
+        Some(("list", _)) => print_json(&market::entries(&file)?),
+        Some(("rm", m)) => {
+            let name = m.get_one::<String>("name").expect("required");
+            market::remove(&file, name)?;
+            print_json(&serde_json::json!({ "name": name, "removed": true }))
+        }
+        _ => unreachable!("clap requires a market subcommand"),
     }
 }
 

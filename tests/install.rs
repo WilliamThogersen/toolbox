@@ -142,8 +142,10 @@ fn installs_every_folder_in_a_repo_and_runs_them() {
     let commit = repo.commit("first");
 
     let tb = Toolbox::new();
-    let installed = tb.json(&["self", "install", &repo.url(), "--yes"]);
-    assert_eq!(names(&installed), vec!["hello", "stars"]);
+    let report = tb.json(&["self", "install", &repo.url(), "--yes"]);
+    assert_eq!(report["skipped"], json!([]));
+    let installed = &report["installed"];
+    assert_eq!(names(installed), vec!["hello", "stars"]);
     assert_eq!(installed[0]["version"], "1.0.0");
     assert_eq!(installed[1]["permissions"]["http"], json!(["api.github.com"]));
     assert_eq!(installed[0]["source"], json!({ "url": repo.url(), "commit": commit }));
@@ -168,7 +170,7 @@ fn a_repo_with_command_json_at_the_root_is_one_command() {
     repo.commit("first");
 
     let tb = Toolbox::new();
-    assert_eq!(names(&tb.json(&["self", "install", &repo.url(), "--yes"])), vec!["solo"]);
+    assert_eq!(names(&tb.json(&["self", "install", &repo.url(), "--yes"])["installed"]), vec!["solo"]);
     assert_eq!(tb.json(&["solo"]), json!("alone"));
 }
 
@@ -188,16 +190,21 @@ fn without_yes_or_a_terminal_it_shows_permissions_and_changes_nothing() {
 }
 
 #[test]
-fn broken_repos_and_taken_names_install_nothing() {
+fn a_broken_command_only_blocks_itself() {
     let tb = Toolbox::new();
 
     let broken = Repo::new();
     broken.write_command("good", manifest("good", None, json!({})), &says("ok"));
     broken.write_command("bad", manifest("bad", Some("one"), json!({})), "return function( end");
     broken.commit("first");
-    let err = tb.error(&["self", "install", &broken.url(), "--yes"]);
+    let err = tb.error(&["self", "install", &broken.url(), "bad", "--yes"]);
     assert!(err.contains("bad:") && err.contains("semver"), "{err}");
-    assert!(!tb.commands_dir().join("good").exists());
+    assert!(!tb.commands_dir().join("good").exists(), "a failed pick installs nothing");
+
+    let report = tb.json(&["self", "install", &broken.url(), "--yes"]);
+    assert_eq!(names(&report["installed"]), vec!["good"]);
+    assert_eq!(report["skipped"][0]["command"], "bad");
+    assert!(!tb.commands_dir().join("bad").exists());
 
     assert!(tb.error(&["self", "install", &Repo::new().url(), "--yes"]).contains("could not fetch"));
 
@@ -285,8 +292,8 @@ fn a_pinned_ref_stays_put_until_reinstalled() {
     assert_eq!(tb.json(&["pin"]), json!("tag"));
     assert_eq!(tb.json(&["self", "update"])["up_to_date"], json!(["pin"]));
 
-    let installed = tb.json(&["self", "install", &repo.url(), "--yes"]);
-    assert_eq!(installed[0]["version"], "2.0.0");
+    let report = tb.json(&["self", "install", &repo.url(), "--yes"]);
+    assert_eq!(report["installed"][0]["version"], "2.0.0");
     assert_eq!(tb.json(&["pin"]), json!("main"));
 }
 
@@ -337,4 +344,73 @@ fn install_help_lives_under_self_only() {
     for builtin in ["install", "update", "uninstall"] {
         assert!(help.contains(builtin), "missing {builtin}:\n{help}");
     }
+}
+
+#[test]
+fn picks_commands_by_name_and_lists_a_repo() {
+    let repo = Repo::new();
+    for name in ["alpha", "beta", "gamma"] {
+        repo.write_command(name, manifest(name, Some("1.0.0"), json!({})), &says(name));
+    }
+    repo.write_command("broken", manifest("broken", None, json!({})), "return function( end");
+    repo.commit("market");
+    let tb = Toolbox::new();
+
+    let report = tb.json(&["self", "install", &repo.url(), "beta", "gamma", "--yes"]);
+    assert_eq!(names(&report["installed"]), vec!["beta", "gamma"]);
+    assert_eq!(report["skipped"], json!([]), "broken commands nobody picked are not mentioned");
+    assert!(!tb.commands_dir().join("alpha").exists());
+
+    let listing = tb.json(&["self", "install", &repo.url(), "--list"]);
+    assert_eq!(names(&listing["commands"]), vec!["alpha", "beta", "gamma"]);
+    assert_eq!(listing["commands"][0]["installed"], false);
+    assert_eq!(listing["commands"][1]["installed"], true);
+    assert_eq!(listing["broken"][0]["command"], "broken");
+    assert!(!tb.commands_dir().join("alpha").exists(), "--list installs nothing");
+
+    let err = tb.error(&["self", "install", &repo.url(), "delta", "--yes"]);
+    assert!(err.contains("delta: not in the repo (it has: alpha, beta, broken, gamma)"), "{err}");
+}
+
+#[test]
+fn marketplaces_are_saved_searched_and_installed_by_name() {
+    let acme = Repo::new();
+    acme.write_command("stars", json!({ "name": "stars", "version": "1.0.0", "description": "Star count for a GitHub repo" }), &says("42"));
+    acme.write_command("pr-status", json!({ "name": "pr-status", "description": "Show a pull request" }), &says("open"));
+    acme.commit("acme");
+    let tools = Repo::new();
+    tools.write_command("weather", json!({ "name": "weather", "description": "Forecast" }), &says("sun"));
+    tools.commit("tools");
+    let tb = Toolbox::new();
+
+    let err = tb.error(&["self", "search"]);
+    assert!(err.contains("tb self market add"), "{err}");
+
+    let added = tb.json(&["self", "market", "add", "acme", &acme.url()]);
+    assert_eq!(added["commands"], json!(["pr-status", "stars"]));
+    tb.json(&["self", "market", "add", "tools", &tools.url()]);
+    assert!(tb.error(&["self", "market", "add", "acme", &tools.url()]).contains("already exists"));
+    assert!(tb.error(&["self", "market", "add", "empty", &Repo::new().url()]).contains("could not fetch"));
+    let saved = tb.json(&["self", "market", "list"]);
+    assert_eq!(saved.as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect::<Vec<_>>(), vec!["acme", "tools"]);
+
+    let found = tb.json(&["self", "search", "GITHUB"]);
+    assert_eq!(found["results"].as_array().unwrap().len(), 1);
+    assert_eq!(found["results"][0]["market"], "acme");
+    assert_eq!(found["results"][0]["name"], "stars");
+    assert_eq!(tb.json(&["self", "search"])["results"].as_array().unwrap().len(), 3);
+
+    let report = tb.json(&["self", "install", "acme/stars", "--yes"]);
+    assert_eq!(names(&report["installed"]), vec!["stars"]);
+    assert_eq!(report["installed"][0]["source"]["url"], acme.url());
+    assert_eq!(tb.json(&["stars"]), json!("42"));
+    assert_eq!(tb.json(&["self", "search", "star"])["results"][0]["installed"], true);
+    tb.json(&["self", "install", "tools", "weather", "--yes"]);
+    assert_eq!(tb.json(&["weather"]), json!("sun"));
+    assert!(tb.error(&["self", "install", "nope/stars", "--yes"]).contains("no marketplace named \"nope\""));
+
+    assert_eq!(tb.json(&["self", "market", "rm", "acme"]), json!({ "name": "acme", "removed": true }));
+    assert_eq!(tb.json(&["self", "market", "list"]).as_array().unwrap().len(), 1);
+    assert_eq!(tb.json(&["stars"]), json!("42"), "removing a marketplace keeps its commands");
+    assert_eq!(tb.json(&["self", "update"])["up_to_date"], json!(["stars", "weather"]));
 }

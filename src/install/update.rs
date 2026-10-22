@@ -12,7 +12,8 @@ use serde::Serialize;
 
 use super::confirm::{self, Confirm};
 use super::source::{self, Source};
-use super::{Staging, git, repo, short};
+use super::repo::{self, Scan};
+use super::{Staging, git, short};
 use crate::manifest::{Manifest, Permissions};
 use crate::registry::{CommandDef, MANIFEST_FILE, Problem};
 
@@ -93,15 +94,20 @@ pub fn update(commands_dir: &Path, only: Option<&str>, confirm: &dyn Confirm) ->
     Ok(report(outcomes))
 }
 
+/// Sorted by name, so the order doesn't depend on which repo was fetched first.
 fn report(outcomes: Vec<Outcome>) -> UpdateReport {
-    outcomes.into_iter().fold(UpdateReport::default(), |mut report, outcome| {
+    let mut report = outcomes.into_iter().fold(UpdateReport::default(), |mut report, outcome| {
         match outcome {
             Outcome::UpToDate(name) => report.up_to_date.push(name),
             Outcome::Update(plan) => report.updated.push(plan.change),
             Outcome::Failed(problem) => report.problems.push(problem),
         }
         report
-    })
+    });
+    report.up_to_date.sort();
+    report.updated.sort_by(|a, b| a.name.cmp(&b.name));
+    report.problems.sort_by(|a, b| a.command.cmp(&b.command));
+    report
 }
 
 /// Installed commands grouped by repo and ref, so each repo is fetched once.
@@ -118,23 +124,27 @@ fn plan_repo(checkout: &Path, group: Vec<Local>) -> Vec<Outcome> {
     let first = &group[0].source;
     let (url, git_ref) = (first.url.clone(), first.git_ref.clone());
     let fetched = git::fetch(&url, git_ref.as_deref(), checkout)
-        .and_then(|commit| Ok((commit, repo::find_commands(checkout)?)));
+        .and_then(|commit| Ok((commit, repo::scan(checkout)?)));
     match fetched {
         Err(err) => group
             .into_iter()
             .map(|local| Outcome::Failed(Problem { command: local.name, problem: format!("{err:#}") }))
             .collect(),
-        Ok((commit, defs)) => {
+        Ok((commit, scan)) => {
             let source = Source { url, git_ref, commit };
-            group.into_iter().map(|local| plan_one(local, &source, &defs)).collect()
+            group.into_iter().map(|local| plan_one(local, &source, &scan)).collect()
         }
     }
 }
 
-fn plan_one(local: Local, source: &Source, defs: &[CommandDef]) -> Outcome {
-    let Some(def) = defs.iter().find(|d| d.manifest.name == local.name) else {
+fn plan_one(local: Local, source: &Source, scan: &Scan) -> Outcome {
+    let Some(def) = scan.find(&local.name) else {
+        let problem = match scan.problem_of(&local.name) {
+            Some(problem) => format!("broken in {}, so the installed copy stays: {problem}", source.url),
+            None => format!("no longer in {}", source.url),
+        };
         return Outcome::Failed(Problem {
-            problem: format!("no longer in {}", source.url),
+            problem,
             command: local.name,
         });
     };

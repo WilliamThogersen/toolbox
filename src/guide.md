@@ -162,10 +162,17 @@ end
 
 Any git repo (GitHub, GitLab, self-hosted) can hold commands: one folder per
 command at the top level (`<repo>/<name>/command.json` and `run.lua`), or a
-single command with both files at the repo root. Other files are ignored.
+single command with both files at the repo root. Other files are ignored. A
+repo with many commands works as a marketplace.
 
-- `tb self install <git-url>` installs every command in the repo, or none if
-  any is broken or its name is taken. `--ref <branch|tag|commit>` picks a version.
+- `tb self search <words>` searches every marketplace the user saved. Check it
+  before writing a new command. Results are JSON with `market`, `name`,
+  `description`, `permissions` and `installed`.
+- `tb self install acme/stars` installs `stars` from the saved marketplace
+  `acme`. `tb self install <git-url> stars pr-status` picks commands from any
+  repo; without names it installs every working command and skips broken ones.
+  `--list` shows a repo's commands without installing. `--ref <branch|tag|commit>`
+  picks a version.
 - Without a terminal it stops and lists each command's permissions. Show that list
   to the user and wait for their OK before running it again with `--yes`.
 - `tb self update [<name>]` takes newer versions. With a `version`, only a higher
@@ -174,5 +181,7 @@ single command with both files at the repo root. Other files are ignored.
   wait for their OK before `--yes`.
 - `tb self uninstall <name>` removes an installed command. Commands made locally
   are never removed by it.
+- `tb self market add <name> <git-url>` saves a marketplace, `tb self market list`
+  shows them, `tb self market rm <name>` forgets one. Ask the user before adding one.
 
 To publish a new version: bump `version` in `command.json`, commit, push.

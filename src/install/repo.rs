@@ -5,36 +5,119 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, is_valid_name};
 use crate::registry::{self, CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
 use crate::runtime;
 
 const ROOT_LABEL: &str = "(repo root)";
 
-/// Every command in `checkout`, all valid, or an error listing every problem.
-pub fn find_commands(checkout: &Path) -> Result<Vec<CommandDef>> {
-    let found: Vec<std::result::Result<CommandDef, Vec<Problem>>> = if checkout.join(MANIFEST_FILE).symlink_metadata().is_ok() {
-        vec![load_checked(checkout, None)]
-    } else {
-        command_folders(checkout)?
+/// What a repo holds: the commands that passed every check, and the problems of the rest.
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub commands: Vec<CommandDef>,
+    pub broken: Vec<Problem>,
+}
+
+impl Scan {
+    pub fn find(&self, name: &str) -> Option<&CommandDef> {
+        self.commands.iter().find(|def| def.manifest.name == name)
+    }
+
+    /// Every problem of the broken command `name`, joined; `None` when it isn't broken.
+    pub fn problem_of(&self, name: &str) -> Option<String> {
+        let problems: Vec<&str> = self
+            .broken
             .iter()
-            .map(|(dir, folder)| load_checked(dir, Some(folder)))
-            .collect()
-    };
+            .filter(|p| p.command == name)
+            .map(|p| p.problem.as_str())
+            .collect();
+        (!problems.is_empty()).then(|| problems.join("; "))
+    }
+
+    fn all_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .commands
+            .iter()
+            .map(|def| def.manifest.name.as_str())
+            .chain(self.broken.iter().map(|p| p.command.as_str()))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+}
+
+/// Checks every command in `checkout`. Fails only when there are none at all.
+pub fn scan(checkout: &Path) -> Result<Scan> {
+    let found: Vec<std::result::Result<CommandDef, Vec<Problem>>> =
+        if checkout.join(MANIFEST_FILE).symlink_metadata().is_ok() {
+            vec![load_checked(checkout, None)]
+        } else {
+            command_folders(checkout)?
+                .iter()
+                .map(|(dir, folder)| load_checked(dir, Some(folder)))
+                .collect()
+        };
     ensure!(
         !found.is_empty(),
         "no commands found: put {MANIFEST_FILE} and {SCRIPT_FILE} at the repo root, or in one folder per command"
     );
-    let problems: Vec<String> = found
-        .iter()
-        .filter_map(|r| r.as_ref().err())
-        .flatten()
-        .map(|p| format!("  {}: {}", p.command, p.problem))
-        .collect();
-    if !problems.is_empty() {
-        bail!("the repo has broken commands, so nothing changed:\n{}", problems.join("\n"));
+    Ok(found.into_iter().fold(Scan::default(), |mut scan, result| {
+        match result {
+            Ok(def) => scan.commands.push(def),
+            Err(problems) => scan.broken.extend(problems),
+        }
+        scan
+    }))
+}
+
+/// What to install: the commands in `names`, or every valid one (skipping the broken) when empty.
+#[derive(Debug)]
+pub struct Selection {
+    pub chosen: Vec<CommandDef>,
+    pub skipped: Vec<Problem>,
+}
+
+/// A named command must exist and be valid. Broken commands nobody asked for never block.
+pub fn select(scan: Scan, names: &[String]) -> Result<Selection> {
+    if names.is_empty() {
+        if scan.commands.is_empty() {
+            bail!("every command in the repo is broken:\n{}", problem_lines(&scan.broken));
+        }
+        return Ok(Selection {
+            chosen: scan.commands,
+            skipped: scan.broken,
+        });
     }
-    Ok(found.into_iter().filter_map(Result::ok).collect())
+    let errors: Vec<String> = names
+        .iter()
+        .filter(|name| scan.find(name).is_none())
+        .map(|name| match scan.problem_of(name) {
+            Some(problem) => format!("  {name}: {problem}"),
+            None if is_valid_name(name) => format!("  {name}: not in the repo (it has: {})", scan.all_names().join(", ")),
+            None => format!("  {name:?}: not a valid command name"),
+        })
+        .collect();
+    if !errors.is_empty() {
+        bail!("nothing was installed:\n{}", errors.join("\n"));
+    }
+    let chosen = scan
+        .commands
+        .into_iter()
+        .filter(|def| names.contains(&def.manifest.name))
+        .collect();
+    Ok(Selection {
+        chosen,
+        skipped: Vec::new(),
+    })
+}
+
+pub fn problem_lines(problems: &[Problem]) -> String {
+    problems
+        .iter()
+        .map(|p| format!("  {}: {}", p.command, p.problem))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Top-level folders holding a `command.json`. Hidden folders and symlinks are skipped.
@@ -74,7 +157,8 @@ fn load_checked(dir: &Path, folder: Option<&str>) -> std::result::Result<Command
         None => root_name(dir).unwrap_or_else(|| ROOT_LABEL.to_string()),
     };
     let def = registry::load_command(dir, &name)?;
-    runtime::check_syntax(&def).map_err(|err| vec![problem(format!("{err:#}"))])?;
+    let script = folder.map_or(SCRIPT_FILE.to_string(), |f| format!("{f}/{SCRIPT_FILE}"));
+    runtime::check_syntax_as(&def, &script).map_err(|err| vec![problem(format!("{err:#}"))])?;
     Ok(def)
 }
 
@@ -98,6 +182,10 @@ mod tests {
         defs.iter().map(|d| d.manifest.name.as_str()).collect()
     }
 
+    fn picked(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
     const OK: &str = "return function() end";
 
     #[test]
@@ -105,7 +193,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_command(tmp.path(), "solo", OK);
         write_command(&tmp.path().join("other"), "other", OK);
-        assert_eq!(names(&find_commands(tmp.path()).unwrap()), vec!["solo"]);
+        assert_eq!(names(&scan(tmp.path()).unwrap().commands), vec!["solo"]);
     }
 
     #[test]
@@ -115,26 +203,58 @@ mod tests {
         write_command(&tmp.path().join("a-cmd"), "a-cmd", OK);
         write_command(&tmp.path().join(".github"), "github", OK);
         fs::create_dir_all(tmp.path().join("docs")).unwrap();
-        assert_eq!(names(&find_commands(tmp.path()).unwrap()), vec!["a-cmd", "b-cmd"]);
+        assert_eq!(names(&scan(tmp.path()).unwrap().commands), vec!["a-cmd", "b-cmd"]);
     }
 
     #[test]
     fn empty_repo_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = find_commands(tmp.path()).unwrap_err().to_string();
+        let err = scan(tmp.path()).unwrap_err().to_string();
         assert!(err.contains("no commands found"), "{err}");
     }
 
     #[test]
-    fn any_broken_command_fails_the_whole_repo() {
+    fn broken_commands_are_kept_apart_from_good_ones() {
         let tmp = tempfile::tempdir().unwrap();
         write_command(&tmp.path().join("good"), "good", OK);
         write_command(&tmp.path().join("syntax"), "syntax", "return function( end");
         write_command(&tmp.path().join("misnamed"), "other-name", OK);
-        let err = find_commands(tmp.path()).unwrap_err().to_string();
-        assert!(err.contains("syntax:"), "{err}");
-        assert!(err.contains("misnamed:"), "{err}");
-        assert!(!err.contains("good:"), "{err}");
+        let found = scan(tmp.path()).unwrap();
+        assert_eq!(names(&found.commands), vec!["good"]);
+        assert!(found.problem_of("syntax").unwrap().contains("syntax/run.lua:1:"));
+        assert!(found.problem_of("misnamed").unwrap().contains("folder name"));
+        assert_eq!(found.problem_of("good"), None);
+    }
+
+    #[test]
+    fn selecting_everything_skips_the_broken() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_command(&tmp.path().join("good"), "good", OK);
+        write_command(&tmp.path().join("bad"), "bad", "return function( end");
+        let selection = select(scan(tmp.path()).unwrap(), &[]).unwrap();
+        assert_eq!(names(&selection.chosen), vec!["good"]);
+        assert_eq!(selection.skipped[0].command, "bad");
+
+        fs::remove_dir_all(tmp.path().join("good")).unwrap();
+        let err = select(scan(tmp.path()).unwrap(), &[]).unwrap_err().to_string();
+        assert!(err.contains("every command in the repo is broken"), "{err}");
+    }
+
+    #[test]
+    fn selecting_by_name_needs_each_to_exist_and_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_command(&tmp.path().join("one"), "one", OK);
+        write_command(&tmp.path().join("two"), "two", OK);
+        write_command(&tmp.path().join("bad"), "bad", "return function( end");
+
+        let selection = select(scan(tmp.path()).unwrap(), &picked(&["two"])).unwrap();
+        assert_eq!(names(&selection.chosen), vec!["two"]);
+        assert!(selection.skipped.is_empty(), "broken commands nobody picked are not reported");
+
+        let err = select(scan(tmp.path()).unwrap(), &picked(&["one", "bad", "nope"])).unwrap_err().to_string();
+        assert!(err.contains("bad: "), "{err}");
+        assert!(err.contains("nope: not in the repo (it has: bad, one, two)"), "{err}");
+        assert!(!err.contains("one:"), "{err}");
     }
 
     #[test]
@@ -146,7 +266,8 @@ mod tests {
         write_command(&dir, "sneaky", OK);
         fs::remove_file(dir.join(SCRIPT_FILE)).unwrap();
         std::os::unix::fs::symlink(&secret, dir.join(SCRIPT_FILE)).unwrap();
-        let err = find_commands(&tmp.path().join("repo")).unwrap_err().to_string();
-        assert!(err.contains("not a symlink"), "{err}");
+        let found = scan(&tmp.path().join("repo")).unwrap();
+        assert!(found.commands.is_empty());
+        assert!(found.problem_of("sneaky").unwrap().contains("not a symlink"));
     }
 }

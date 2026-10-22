@@ -40,9 +40,18 @@ pub fn run(
 
 /// Compiles `run.lua` without running it.
 pub fn check_syntax(def: &CommandDef) -> Result<()> {
+    compile(def, chunk_name(def))
+}
+
+/// Like `check_syntax`, but errors call the script `label`, e.g. its path inside a repo.
+pub fn check_syntax_as(def: &CommandDef, label: &str) -> Result<()> {
+    compile(def, format!("@{label}"))
+}
+
+fn compile(def: &CommandDef, chunk: String) -> Result<()> {
     let lua = sandbox::new_lua()?;
     let source = read_script(def)?;
-    lua.load(&source).set_name(chunk_name(def)).into_function()?;
+    lua.load(&source).set_name(chunk).into_function()?;
     Ok(())
 }
 
