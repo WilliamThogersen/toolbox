@@ -42,6 +42,9 @@ brew install WilliamThogersen/tap/toolbox
 
 This installs `toolbox` and `tb` (macOS, Apple Silicon and Intel). Update with `brew upgrade toolbox`.
 
+When a new version is out, `tb` says so on your terminal. It asks GitHub at most once a day, and only when a
+person is at the terminal: agents and pipes never see the notice. Set `TOOLBOX_NO_UPDATE_CHECK=1` to turn it off.
+
 ## Quick start
 
 ```console
@@ -197,6 +200,7 @@ on a clean Mac and fails if it isn't the latest release. Run it by hand with `gh
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
 | `src/vault/` | Keychain storage, placeholder injection, redaction, `vault` subcommands |
 | `src/guide.md` | Text printed by `tb self guide` |
+| `src/update.rs` | Once-a-day new-version notice on the terminal |
 
 </details>
 

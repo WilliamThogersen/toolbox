@@ -31,7 +31,7 @@ Without `TOOLBOX_INSECURE_TEST_VAULT`, vault commands hit the real macOS Keychai
 
 **Top level vs `self`**: plain `tb` lists only the user's commands (custom help template in `cli.rs`, clap's help subcommand and `-h`/`-V` hidden). All built-ins (`new`, `check`, `describe`, `guide`, `vault`) live under the hidden `self` namespace in `builtin.rs`. New built-in features go under `tb self`, never the top level. Reserved top-level names are in `manifest::RESERVED_NAMES`.
 
-**Output contract**: stdout carries only the JSON result. Lua `print`/`log` go to stderr. Errors are `{"error": ...}` on stderr with exit 1 (plain text when stderr is a TTY). A closed stdout pipe is not an error (`cli::ignore_closed_pipe`).
+**Output contract**: stdout carries only the JSON result. Lua `print`/`log` go to stderr. Errors are `{"error": ...}` on stderr with exit 1 (plain text when stderr is a TTY). A closed stdout pipe is not an error (`cli::ignore_closed_pipe`). After every run, `update::notify` may print a new-version notice to stderr: only when stderr is a TTY and `TOOLBOX_NO_UPDATE_CHECK` is unset, asking the GitHub releases API at most once a day (cached in `$TOOLBOX_HOME/update-check.json`), so agents never see it.
 
 **Runtime** (`src/runtime/`): every run gets a fresh Lua state. `sandbox.rs` removes `io`, `os`, `load`, `dofile`, `loadfile`, `require`, `string.dump`. `api.rs` installs `json`, `log`/`print`, `env`, `vault`, `exec`, and `http.rs` installs `http`. Every global is gated by a field in `manifest::Permissions`. `run.lua` must return a function. Its return value is converted to JSON. Use `runtime::ser_options()` whenever converting JSON into Lua so JSON `null` becomes `nil`.
 

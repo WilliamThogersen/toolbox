@@ -196,6 +196,17 @@ fn errors_are_json_on_stderr() {
 }
 
 #[test]
+fn agents_never_trigger_the_update_check() {
+    let tb = Toolbox::new();
+    for args in [&[][..], &["self", "check"][..]] {
+        let out = tb.run(args);
+        assert!(out.status.success(), "tb {args:?} failed: {}", stderr(&out));
+        assert_eq!(stderr(&out), "", "tb {args:?}");
+    }
+    assert!(!tb.home.path().join("update-check.json").exists());
+}
+
+#[test]
 fn vault_injects_secret_but_output_is_redacted() {
     let tb = Toolbox::new();
     tb.add_secret("test", SECRET, &["127.0.0.1"]);

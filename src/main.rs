@@ -7,13 +7,14 @@ mod paths;
 mod registry;
 mod runtime;
 mod scaffold;
+mod update;
 mod vault;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match cli::run() {
+    let code = match cli::run() {
         Ok(code) => code,
         Err(err) => {
             let message = format!("{err:#}");
@@ -24,5 +25,7 @@ fn main() -> ExitCode {
             }
             ExitCode::FAILURE
         }
-    }
+    };
+    update::notify();
+    code
 }
