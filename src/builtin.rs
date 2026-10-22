@@ -233,3 +233,32 @@ fn vault_command(matches: &ArgMatches) -> Result<ExitCode> {
         _ => unreachable!("clap requires a vault subcommand"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Every `tb self` command needs a page in docs/commands/ that names its subcommands and flags.
+    #[test]
+    fn every_builtin_is_documented() {
+        let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs");
+        let index = fs::read_to_string(docs.join("README.md")).unwrap();
+        for cmd in app().get_subcommands() {
+            let name = cmd.get_name();
+            let page = format!("commands/{name}.md");
+            let text = fs::read_to_string(docs.join(&page)).unwrap_or_else(|_| panic!("missing docs/{page}"));
+            assert!(index.contains(&format!("({page})")), "docs/README.md does not link {page}");
+            for sub in cmd.get_subcommands() {
+                let usage = format!("tb self {name} {}", sub.get_name());
+                assert!(text.contains(&usage), "docs/{page} does not show `{usage}`");
+            }
+            let flags = cmd.get_subcommands().chain([cmd]).flat_map(|c| c.get_arguments());
+            for long in flags.filter_map(|arg| arg.get_long()) {
+                assert!(text.contains(&format!("--{long}")), "docs/{page} does not explain --{long}");
+            }
+        }
+    }
+}

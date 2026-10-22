@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::manifest::Manifest;
 use crate::registry::{Problem, Registry};
 
-pub const GUIDE: &str = include_str!("guide.md");
+pub const GUIDE: &str = include_str!("../docs/writing-commands.md");
 
 #[derive(Debug, Serialize)]
 pub struct Description<'a> {
