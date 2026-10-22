@@ -1,6 +1,7 @@
-# Runs when a version tag is pushed: git tag v0.2.0 && git push origin v0.2.0
+# Runs when a version tag is pushed: git tag -a v0.2.0 -F notes.md && git push origin v0.2.0
 # Tests, builds signed macOS binaries, publishes a GitHub release and updates the
-# Homebrew formula in WilliamThogersen/homebrew-tap.
+# Homebrew formula in WilliamThogersen/homebrew-tap. The annotated tag's message
+# becomes the release notes.
 name: release
 
 on:
@@ -58,7 +59,10 @@ jobs:
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        run: |
+          # checkout can leave a lightweight copy of the tag; fetch the annotated one for its message.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-from-tag --verify-tag
 
       - name: Check out the Homebrew tap
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -30,7 +30,11 @@ subcommand or flag is missing from its page. `docs/writing-commands.md` is built
 ## Releasing
 
 1. Bump `version` in `Cargo.toml`, run `cargo build` (updates `Cargo.lock`) and commit.
-2. Tag and push: `git tag v0.2.0 && git push origin main v0.2.0`
+2. Write the release notes in a file, then make an annotated tag and push:
+   `git tag -a v0.2.0 -F notes.md && git push origin main v0.2.0`
+
+The tag's message becomes the GitHub release notes. Git drops lines that start with `#`, so use `**bold**` lines
+instead of Markdown headings.
 
 The [release workflow](../.github/workflows/release.yml) runs the tests, builds a signed universal macOS binary,
 publishes the GitHub release and updates the formula in
