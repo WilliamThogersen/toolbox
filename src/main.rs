@@ -2,6 +2,7 @@ mod builtin;
 mod check;
 mod cli;
 mod describe;
+mod install;
 mod manifest;
 mod paths;
 mod registry;

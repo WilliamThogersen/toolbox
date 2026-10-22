@@ -17,6 +17,7 @@ on stderr.
 ```json
 {
   "name": "pr-status",
+  "version": "1.0.0",
   "description": "Show the state of a GitHub pull request",
   "args": {
     "repo":   { "type": "string",  "required": true, "description": "owner/repo" },
@@ -34,6 +35,8 @@ on stderr.
 ```
 
 - `name` must match the folder name. Allowed: `a-z`, `0-9`, `-`, `_`.
+- `version` is optional semver (`1.2.0`). `tb self update` only replaces an
+  installed copy when this goes up. `tb self new` starts at `0.1.0`.
 - Each arg becomes `--<arg>`. Types: `string`, `integer`, `number`, `boolean`.
   A boolean is a flag: never `required`, defaults to `false`.
 - Unknown fields are errors, so typos are caught by `tb self check`.
@@ -150,3 +153,22 @@ return function(args)
   return { state = pr.state, draft = pr.draft, mergeable = pr.mergeable }
 end
 ```
+
+## Sharing commands through git
+
+Any git repo (GitHub, GitLab, self-hosted) can hold commands: one folder per
+command at the top level (`<repo>/<name>/command.json` and `run.lua`), or a
+single command with both files at the repo root. Other files are ignored.
+
+- `tb self install <git-url>` installs every command in the repo, or none if
+  any is broken or its name is taken. `--ref <branch|tag|commit>` picks a version.
+- Without a terminal it stops and lists each command's permissions. Show that list
+  to the user and wait for their OK before running it again with `--yes`.
+- `tb self update [<name>]` takes newer versions. With a `version`, only a higher
+  one counts. Without one, any new commit counts. Every update asks first, so
+  without a terminal it stops and lists the changes: show them to the user and
+  wait for their OK before `--yes`.
+- `tb self uninstall <name>` removes an installed command. Commands made locally
+  are never removed by it.
+
+To publish a new version: bump `version` in `command.json`, commit, push.

@@ -71,8 +71,13 @@ fn load_one(dir: &Path) -> std::result::Result<CommandDef, Vec<Problem>> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    load_command(dir, &folder)
+}
+
+/// Loads one command folder whose manifest `name` must equal `folder`.
+pub fn load_command(dir: &Path, folder: &str) -> std::result::Result<CommandDef, Vec<Problem>> {
     let problem = |message: String| Problem {
-        command: folder.clone(),
+        command: folder.to_string(),
         problem: message,
     };
 
@@ -80,7 +85,7 @@ fn load_one(dir: &Path) -> std::result::Result<CommandDef, Vec<Problem>> {
         .map_err(|e| vec![problem(format!("cannot read {MANIFEST_FILE}: {e}"))])?;
     let manifest = Manifest::parse(&raw).map_err(|e| vec![problem(format!("{e:#}"))])?;
 
-    let mut problems: Vec<Problem> = manifest.validate(&folder).into_iter().map(problem).collect();
+    let mut problems: Vec<Problem> = manifest.validate(folder).into_iter().map(problem).collect();
     if !dir.join(SCRIPT_FILE).is_file() {
         problems.push(problem(format!("missing {SCRIPT_FILE}")));
     }

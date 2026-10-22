@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -15,6 +16,9 @@ const MAX_NAME_LEN: usize = 64;
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub name: String,
+    /// Semver like `1.2.0`. `tb self update` only replaces an installed copy with a higher one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub description: String,
     #[serde(default)]
     pub args: BTreeMap<String, ArgSpec>,
@@ -67,6 +71,11 @@ impl Manifest {
         serde_json::from_str(json).context("invalid command.json")
     }
 
+    /// `None` when there is no version or it is not valid semver.
+    pub fn semver(&self) -> Option<Version> {
+        self.version.as_deref().and_then(|v| Version::parse(v).ok())
+    }
+
     /// Returns every problem found; an empty list means the manifest is usable.
     pub fn validate(&self, dir_name: &str) -> Vec<String> {
         let mut problems = Vec::new();
@@ -84,6 +93,11 @@ impl Manifest {
         }
         if RESERVED_NAMES.contains(&self.name.as_str()) {
             problems.push(format!("name {:?} is reserved by toolbox", self.name));
+        }
+        if let Some(version) = &self.version
+            && Version::parse(version).is_err()
+        {
+            problems.push(format!("version {version:?} must be semver like 1.2.0"));
         }
         if self.description.trim().is_empty() {
             problems.push("description must not be empty".to_string());
@@ -207,6 +221,17 @@ mod tests {
         assert!(problems.contains("description must not be empty"));
         assert!(problems.contains("not a valid secret name"));
         assert!(problems.contains("empty hosts"));
+    }
+
+    #[test]
+    fn version_must_be_semver() {
+        let good = Manifest::parse(r#"{"name":"a","version":"1.2.0","description":"x"}"#).unwrap();
+        assert!(good.validate("a").is_empty());
+        assert_eq!(good.semver(), Some(Version::new(1, 2, 0)));
+
+        let bad = Manifest::parse(r#"{"name":"a","version":"v1.2","description":"x"}"#).unwrap();
+        assert!(bad.validate("a").join("\n").contains("must be semver"));
+        assert_eq!(bad.semver(), None);
     }
 
     #[test]

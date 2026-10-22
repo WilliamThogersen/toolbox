@@ -10,6 +10,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 
 use crate::cli::{ignore_closed_pipe, print_json};
 use crate::registry::Registry;
+use crate::install::{self, Confirm, Prompt, Yes};
 use crate::vault::commands::{self as vault_ops, Tty};
 use crate::{check, describe, scaffold, vault};
 
@@ -17,7 +18,7 @@ pub const NAMESPACE: &str = "self";
 
 pub fn app() -> Command {
     Command::new(NAMESPACE)
-        .about("Manage toolbox: create and check commands, store API keys")
+        .about("Manage toolbox: create, install and check commands, store API keys")
         .subcommand_required(true)
         .arg_required_else_help(true)
         .disable_help_subcommand(true)
@@ -34,7 +35,37 @@ pub fn app() -> Command {
         .subcommand(Command::new("check").about("Validate every command; exits 1 if anything is broken"))
         .subcommand(Command::new("describe").about("List every command, its args and permissions, as JSON"))
         .subcommand(Command::new("guide").about("How to write new commands (manifest format and Lua API)"))
+        .subcommand(
+            Command::new("install")
+                .about("Install the commands in a git repo (GitHub, GitLab or any git URL)")
+                .arg(Arg::new("url").required(true).help("Git URL, e.g. https://github.com/you/tb-tools.git"))
+                .arg(
+                    Arg::new("ref")
+                        .long("ref")
+                        .help("Branch, tag or commit to install (default: the repo's default branch)"),
+                )
+                .arg(yes_arg()),
+        )
+        .subcommand(
+            Command::new("update")
+                .about("Update installed commands to the newest version in their repo")
+                .arg(Arg::new("name").help("Only update this command (default: every installed command)"))
+                .arg(yes_arg()),
+        )
+        .subcommand(
+            Command::new("uninstall")
+                .about("Remove a command that was added with `tb self install`")
+                .arg(Arg::new("name").required(true)),
+        )
         .subcommand(vault_app())
+}
+
+fn yes_arg() -> Arg {
+    Arg::new("yes")
+        .long("yes")
+        .short('y')
+        .action(ArgAction::SetTrue)
+        .help("Don't ask before installing code from the repo (for scripts and agents)")
 }
 
 fn vault_app() -> Command {
@@ -77,9 +108,29 @@ pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Re
             ignore_closed_pipe(io::stdout().lock().write_all(describe::GUIDE.as_bytes()))?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(("install", m)) => {
+            let url = m.get_one::<String>("url").expect("required");
+            let git_ref = m.get_one::<String>("ref").map(String::as_str);
+            print_json(&install::install(commands_dir, url, git_ref, confirmer(m))?)
+        }
+        Some(("update", m)) => {
+            let name = m.get_one::<String>("name").map(String::as_str);
+            let report = install::update(commands_dir, name, confirmer(m))?;
+            print_json(&report)?;
+            Ok(if report.problems.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+        }
+        Some(("uninstall", m)) => {
+            let name = m.get_one::<String>("name").expect("required");
+            install::uninstall(commands_dir, name)?;
+            print_json(&serde_json::json!({ "name": name, "uninstalled": true }))
+        }
         Some(("vault", m)) => vault_command(m),
         _ => unreachable!("clap requires a `self` subcommand"),
     }
+}
+
+fn confirmer(matches: &ArgMatches) -> &'static dyn Confirm {
+    if matches.get_flag("yes") { &Yes } else { &Prompt }
 }
 
 fn new_command(commands_dir: &Path, matches: &ArgMatches) -> Result<ExitCode> {

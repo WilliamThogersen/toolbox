@@ -10,6 +10,8 @@ use serde::Serialize;
 use crate::manifest::{ArgSpec, ArgType, Manifest, Permissions, RESERVED_NAMES, is_valid_name};
 use crate::registry::{MANIFEST_FILE, SCRIPT_FILE};
 
+const FIRST_VERSION: &str = "0.1.0";
+
 const SCRIPT_TEMPLATE: &str = r#"-- Receives the parsed args. Whatever you return is printed as JSON.
 -- Run `tb self guide` for the full API: http, json, exec, env, vault, log.
 return function(args)
@@ -32,6 +34,7 @@ pub fn create(commands_dir: &Path, name: &str, description: &str) -> Result<Crea
 
     let manifest = Manifest {
         name: name.to_string(),
+        version: Some(FIRST_VERSION.to_string()),
         description: description.to_string(),
         args: BTreeMap::from([(
             "name".to_string(),

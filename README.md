@@ -20,6 +20,7 @@
   <a href="#install">Install</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#writing-a-command">Writing a command</a> ·
+  <a href="#share-commands-through-git">Share commands</a> ·
   <a href="#let-your-ai-use-it">Let your AI use it</a> ·
   <a href="#the-vault">The vault</a>
 </p>
@@ -70,6 +71,9 @@ Plain `tb` lists only your own commands. Everything that manages the toolbox its
 | `tb self check` | Validate every command, exit 1 on problems |
 | `tb self describe` | Every command, its args and permissions, as JSON |
 | `tb self guide` | How to write commands (manifest format and Lua API) |
+| `tb self install <git-url>` | Install the commands in a git repo |
+| `tb self update [<name>]` | Update installed commands to their newest version |
+| `tb self uninstall <name>` | Remove an installed command |
 | `tb self vault` | Add, list and remove API keys |
 
 ## Writing a command
@@ -79,6 +83,7 @@ Plain `tb` lists only your own commands. Everything that manages the toolbox its
 ```json
 {
   "name": "stars",
+  "version": "1.0.0",
   "description": "Star count for a GitHub repo",
   "args": {
     "repo": { "type": "string", "required": true, "description": "owner/repo" }
@@ -123,6 +128,71 @@ Scripts run in a sandboxed Lua 5.4 with no `io`, `os` or `require`. Instead they
 
 `tb self guide` prints the full reference (also in [`src/guide.md`](src/guide.md)).
 
+## Share commands through git
+
+Any git repo can hold toolbox commands: GitHub, GitLab, a self-hosted server, public or private.
+
+### Install
+
+```console
+$ tb self install https://gitlab.com/alice/tb-tools.git
+From https://gitlab.com/alice/tb-tools.git at a1b2c3d:
+  pr-status 0.3.0  http: api.github.com; vault: github
+    ! vault uses your github key(s) on the hosts you allowed for them
+  stars 1.0.0      http: api.github.com
+Install 2 commands? [y/N] y
+```
+
+toolbox fetches the repo with your own `git`, so private repos work through your SSH keys or git credentials.
+It installs every command in the repo or none: a broken command, or a name you already use, stops the install.
+
+| Command | What it does |
+|---------|--------------|
+| `tb self install <url> --ref v1.2.0` | Install a branch, tag or commit instead of the default branch |
+| `tb self install <url> --yes` | Skip the question (scripts and agents have no terminal to answer on) |
+| `tb self update` | Update every installed command (asks first). `tb self update stars` updates one |
+| `tb self uninstall stars` | Remove an installed command. Commands you made yourself are never touched |
+
+### Host your own
+
+1. Create a git repo with one folder per command:
+
+   ```
+   tb-tools/
+     README.md          anything else in the repo is ignored
+     stars/
+       command.json
+       run.lua
+     pr-status/
+       command.json
+       run.lua
+   ```
+
+   A repo with `command.json` and `run.lua` at the root is a single command.
+2. Give each command a `"version": "1.0.0"` in `command.json`.
+3. Commit, then try it: `tb self install ./tb-tools` works on a local repo too and checks every command.
+   Then push.
+4. Share the clone URL. Others run `tb self install <url>`.
+
+To release a new version, bump `version` and push. `tb self update` only takes a version higher than the installed
+one, so commits without a bump never reach anyone. A command without a `version` updates on every new commit.
+
+Only `command.json` and `run.lua` are copied, plus a `.source.json` that records the repo and commit.
+
+### Before you install
+
+An installed command runs someone else's code with every permission it asks for. The prompt marks the risky
+ones with `!`. Read the list first:
+
+- `exec` runs programs on your machine. `exec: ["sh"]` or `["bash"]` means a full shell.
+- `vault` uses your keys. They still only go to the hosts you bound them to, but the command decides what it does there.
+- `http: ["*"]` may call any host.
+
+Every update asks first: it lists the new version, the repo to review it in, and its permissions (before and
+after when they changed). Without a terminal it stops unless you pass `--yes`. A hacked repo can't slip new code in
+on a routine update. To stay on code you reviewed, install a tag or commit with `--ref`: updates then stay on it
+until you install another `--ref`.
+
 ## Let your AI use it
 
 Add this to your `CLAUDE.md` (or your agent's instructions file):
@@ -133,6 +203,7 @@ Add this to your `CLAUDE.md` (or your agent's instructions file):
 To add a command, read `tb self guide`, then `tb self new <name>`, edit the files, and run `tb self check`.
 API keys live in the toolbox vault: use `vault("name")` in headers, never ask me for a key.
 If a key is missing, ask me to run `tb self vault add <name> --host <host>`.
+Before `tb self install <url> --yes`, show me the permissions it lists and wait for my OK.
 ```
 
 ## The vault
@@ -196,7 +267,8 @@ on a clean Mac and fails if it isn't the latest release. Run it by hand with `gh
 | `src/manifest.rs` | `command.json` schema and validation |
 | `src/registry.rs` | Finds and loads command folders |
 | `src/cli.rs` | Top level: your commands, built from manifests |
-| `src/builtin.rs` | `tb self`: new, check, describe, guide, vault |
+| `src/builtin.rs` | `tb self`: new, check, describe, guide, install, update, uninstall, vault |
+| `src/install/` | Fetch commands from git repos, `.source.json`, version-aware updates |
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
 | `src/vault/` | Keychain storage, placeholder injection, redaction, `vault` subcommands |
 | `src/guide.md` | Text printed by `tb self guide` |
