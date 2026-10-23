@@ -185,6 +185,9 @@ Basic auth, use `vault("name", "base64")` (see Vault below).
 ### Errors
 
 `error("message")` stops the command and toolbox exits 1. Use `pcall` to recover.
+The error shows without Lua's stack traceback, with the line it came from:
+`PR not found (at run.lua:12)`. Use `error("message", 0)` for a message without
+Lua's own `run.lua:12:` prefix.
 
 ## Vault: API keys you can use but never see
 

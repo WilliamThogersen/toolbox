@@ -11,12 +11,13 @@ mod time;
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use mlua::serde::SerializeOptions;
 use mlua::{Function, Lua, LuaSerdeExt, Value};
 
 use crate::registry::CommandDef;
 use crate::vault::VaultStore;
+use crate::vault::log::AuditLog;
 use crate::vault::approval::Caller;
 
 /// JSON `null` becomes Lua `nil`, so `if res.json.field then` behaves as expected.
@@ -46,6 +47,7 @@ pub fn run(
     def: &CommandDef,
     args: &serde_json::Value,
     store: Box<dyn VaultStore>,
+    log: Box<dyn AuditLog>,
 ) -> Result<serde_json::Value> {
     // Read once: the vault approves this exact source, so it must also be what runs.
     let script = def.read_script()?;
@@ -57,9 +59,11 @@ pub fn run(
     exec::install(&lua, perms.exec.clone())?;
     fs::install(&lua, Rc::new(fs::FsGuard::new(perms)))?;
     let caller = Caller::new(def, &script);
-    http::install(&lua, Rc::new(http::HttpClient::new(perms, caller, store)))?;
+    http::install(&lua, Rc::new(http::HttpClient::new(perms, caller, store, log)))?;
     let entry = load_entry(&lua, def, &script)?;
-    let result: Value = entry.call(lua.to_value_with(args, ser_options())?)?;
+    let result: Value = entry
+        .call(lua.to_value_with(args, ser_options())?)
+        .map_err(|err| tidy(&err))?;
     lua.from_value(result)
         .context("the command returned a value that cannot be turned into JSON")
 }
@@ -82,7 +86,9 @@ fn compile(def: &CommandDef, chunk: String) -> Result<()> {
 }
 
 fn load_entry(lua: &Lua, def: &CommandDef, script: &str) -> Result<Function> {
-    let returned: Value = sandbox::load_source(lua, script, chunk_name(def)).eval()?;
+    let returned: Value = sandbox::load_source(lua, script, chunk_name(def))
+        .eval()
+        .map_err(|err| tidy(&err))?;
     match returned {
         Value::Function(entry) => Ok(entry),
         other => bail!(
@@ -90,6 +96,35 @@ fn load_entry(lua: &Lua, def: &CommandDef, script: &str) -> Result<Function> {
             other.type_name()
         ),
     }
+}
+
+/// Lua errors end with a stack traceback, which buries the message. Keeps the
+/// message, calls the script `run.lua` instead of its whole path (the command's
+/// name is already in the error), and says where in it things failed when the
+/// message doesn't, like errors from `http` or `vault`.
+fn tidy(err: &mlua::Error) -> anyhow::Error {
+    let text = err.to_string();
+    let (message, trace) = text.split_once("\nstack traceback:").unwrap_or((&text, ""));
+    let message = short_paths(message.trim_start_matches("runtime error: ").trim_end());
+    let line = trace.lines().find_map(|frame| {
+        let (_, rest) = frame.split_once("run.lua:")?;
+        rest.split(':').next().filter(|n| n.parse::<u32>().is_ok())
+    });
+    match line {
+        Some(line) if !message.contains("run.lua:") => anyhow!("{message} (at run.lua:{line})"),
+        _ => anyhow!("{message}"),
+    }
+}
+
+/// `/Users/me/.toolbox/commands/x/run.lua:12:` (or Lua's `...ds/x/run.lua:12:`) becomes `run.lua:12:`.
+fn short_paths(text: &str) -> String {
+    text.split(' ')
+        .map(|word| match word.find("run.lua:") {
+            Some(at) if word[..at].contains('/') => &word[at..],
+            _ => word,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn chunk_name(def: &CommandDef) -> String {
@@ -117,7 +152,8 @@ mod tests {
 
     fn run_script(script: &str, args: serde_json::Value) -> Result<serde_json::Value> {
         let (_tmp, def) = command(script);
-        run(&def, &args, Box::new(MemoryStore::new(VaultData::default())))
+        let log = Box::new(crate::vault::log::MemoryLog::new());
+        run(&def, &args, Box::new(MemoryStore::new(VaultData::default())), log)
     }
 
     #[test]
@@ -144,6 +180,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("PR not found"));
+    }
+
+    #[test]
+    fn errors_skip_the_traceback_but_say_where() {
+        let thrown = run_script(r#"return function() error("PR not found", 0) end"#, serde_json::json!({}));
+        let text = format!("{:#}", thrown.unwrap_err());
+        assert!(!text.contains("stack traceback"), "{text}");
+        assert!(!text.contains("runtime error"), "{text}");
+        assert!(text.starts_with("PR not found (at run.lua:1)"), "{text}");
+
+        let bug = run_script("return function()\n  local x = nil\n  return x.y\nend", serde_json::json!({}));
+        let text = format!("{:#}", bug.unwrap_err());
+        assert!(text.starts_with("run.lua:3: attempt to index"), "{text}");
+        assert!(!text.contains('/') && !text.contains("stack traceback"), "{text}");
+
+        let api = run_script(r#"return function() return http.get("https://x.test/") end"#, serde_json::json!({}));
+        let text = format!("{:#}", api.unwrap_err());
+        assert!(text.contains("permissions.http") && text.ends_with("(at run.lua:1)"), "{text}");
     }
 
     #[test]
