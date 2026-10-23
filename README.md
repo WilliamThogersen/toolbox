@@ -5,39 +5,58 @@
   </picture>
 </h1>
 
+<h3 align="center">Give your AI new tools, not your API keys.</h3>
+
 <p align="center">
-  <strong>A CLI your AI can keep extending.</strong><br>
-  Commands are small Lua scripts. API keys stay in the keychain, out of the AI's reach.
+  A CLI your AI can keep extending. Commands are small Lua scripts.<br>
+  API keys stay in the keychain, out of the AI's reach.
 </p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-f97316"></a>
   <img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-1c1917?logo=rust">
   <img alt="Lua 5.5" src="https://img.shields.io/badge/lua-5.5-1c1917?logo=lua">
+  <img alt="MCP server" src="https://img.shields.io/badge/MCP-server-1c1917">
 </p>
 
 <p align="center">
-  <a href="#install">Install</a> ·
-  <a href="#quick-start">Quick start</a> ·
-  <a href="#commands">Commands</a> ·
-  <a href="docs/README.md">Docs</a>
+  <a href="#install"><b>Install</b></a> &nbsp;·&nbsp;
+  <a href="#quick-start"><b>Quick start</b></a> &nbsp;·&nbsp;
+  <a href="#why-toolbox"><b>Why</b></a> &nbsp;·&nbsp;
+  <a href="docs/README.md"><b>Docs</b></a> &nbsp;·&nbsp;
+  <a href="https://github.com/WilliamThogersen/toolbox-commands"><b>Marketplace</b></a>
 </p>
 
 <p align="center">
   <img alt="Demo: create a command, store an API key, allow one command to use it, and run it. The script only sees a placeholder." src="assets/demo.gif" width="800">
 </p>
 
+## Why toolbox?
+
 Every command is a folder with a `command.json` (name, args, permissions) and a `run.lua` (the logic).
 Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 
-- **New command, new folder.** An AI can add a tool in seconds and use it right away.
-- **JSON out, always.** Results go to stdout as JSON. Errors are `{"error": "..."}` on stderr with exit code 1.
-- **Nothing it didn't ask for.** Each command lists the hosts, programs, env vars, folders and keys it may touch. Everything else fails.
-- **Keys the AI can use but never see.** Scripts get a placeholder. toolbox swaps in the real key on the way out, only for commands you approved.
-- **A tool in any AI app.** `tb self mcp` serves every command as an MCP tool for Claude Code, Cursor and others.
-- **Share through git.** Install commands from any GitHub or GitLab repo, or save whole marketplaces and search them.
+<table>
+  <tr>
+    <td width="33%" valign="top"><img src="assets/icons/folder-plus.svg" width="20" height="20" alt=""> <b>New command, new folder</b><br>An AI can add a tool in seconds and use it right away.</td>
+    <td width="33%" valign="top"><img src="assets/icons/braces.svg" width="20" height="20" alt=""> <b>JSON out, always</b><br>Results on stdout as JSON. Errors are <code>{"error": "..."}</code> on stderr, exit 1.</td>
+    <td width="33%" valign="top"><img src="assets/icons/lock.svg" width="20" height="20" alt=""> <b>Nothing it didn't ask for</b><br>Each command lists the hosts, programs, env vars, folders and keys it may touch.</td>
+  </tr>
+  <tr>
+    <td valign="top"><img src="assets/icons/key-round.svg" width="20" height="20" alt=""> <b>Keys the AI can use but never see</b><br>Scripts get a placeholder; the real key is swapped in only for commands you approved.</td>
+    <td valign="top"><img src="assets/icons/plug.svg" width="20" height="20" alt=""> <b>A tool in any AI app</b><br><code>tb self mcp</code> serves every command as an MCP tool.</td>
+    <td valign="top"><img src="assets/icons/git-branch.svg" width="20" height="20" alt=""> <b>Share through git</b><br>Install from any GitHub or GitLab repo, or save whole marketplaces and search them.</td>
+  </tr>
+</table>
 
-`tb` and `toolbox` are the same program: `tb` is a symlink for typing less.
+|  | Without toolbox | With toolbox |
+|---|---|---|
+| Where the key lives | Pasted into the prompt or an env var | In the vault (macOS keychain) |
+| What the agent sees | The real key, `ghp_...` | Only `{{vault:github}}` |
+| Where the key can go | Anywhere the agent sends it | Only to hosts you approved, from commands you allowed |
+| Key echoed back in a response | Visible to the agent | Redacted as `[REDACTED:github]` |
+
+**Works with:** Claude Code · Cursor · any MCP client — via [`tb self mcp`](docs/commands/mcp.md).
 
 ## Install
 
@@ -45,12 +64,12 @@ Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 brew install WilliamThogersen/tap/toolbox
 ```
 
-This installs `toolbox` and `tb` (macOS on Apple Silicon and Intel, Linux on x86_64 and arm64). Update with
-`brew upgrade toolbox`. The key vault is macOS only for now: on Linux the system keyring gives keys to any program, so
-toolbox doesn't use it ([why](docs/security.md#what-it-does-not-protect-against)).
+Installs `toolbox` and `tb` (same program; `tb` is a symlink) on macOS (Apple Silicon and Intel) and Linux (x86_64 and arm64).
+Update with `brew upgrade toolbox`. The key vault is **macOS only for now**: on Linux the system keyring gives keys to any
+program, so toolbox doesn't use it ([why](docs/security.md#what-it-does-not-protect-against)).
 
-When a new version is out, `tb` says so on your terminal. It asks GitHub at most once a day, and only when a
-person is at the terminal: agents and pipes never see the notice. Set `TOOLBOX_NO_UPDATE_CHECK=1` to turn it off.
+<sub>When a new version is out, `tb` says so on your terminal (checked at most once a day, only when a person is at the
+terminal; agents and pipes never see it). Set `TOOLBOX_NO_UPDATE_CHECK=1` to turn it off.</sub>
 
 ## Quick start
 
@@ -69,7 +88,18 @@ Commands:
 Manage commands and API keys: tb self
 ```
 
-A real one, `~/.toolbox/commands/stars/`:
+Or start from ready-made commands in the [starter marketplace](https://github.com/WilliamThogersen/toolbox-commands)
+(`crate`, `npm`, `pypi`, `weather`, `hn`, `gh-repo`, `gh-prs`):
+
+```console
+$ tb self market add starter https://github.com/WilliamThogersen/toolbox-commands.git
+$ tb self install starter/weather
+```
+
+<details>
+<summary><b>A real example: <code>stars</code></b></summary>
+
+`~/.toolbox/commands/stars/command.json`:
 
 ```json
 {
@@ -80,6 +110,8 @@ A real one, `~/.toolbox/commands/stars/`:
   "permissions": { "http": ["api.github.com"] }
 }
 ```
+
+`run.lua`:
 
 ```lua
 return function(args)
@@ -99,21 +131,19 @@ $ tb stars --repo rust-lang/rust
 }
 ```
 
+</details>
+
 Next: [Writing commands](docs/writing-commands.md) has every `command.json` field and the full Lua API.
-
-Or start from ready-made ones: the [starter marketplace](https://github.com/WilliamThogersen/toolbox-commands) has
-`crate`, `npm`, `pypi`, `weather`, `hn`, `gh-repo` and `gh-prs`.
-
-```console
-$ tb self market add starter https://github.com/WilliamThogersen/toolbox-commands.git
-$ tb self install starter/weather
-```
 
 ## How the vault works
 
 You store a key once, at your own terminal, and say which hosts it may go to. A script asks for it by name and only
 ever gets the placeholder `{{vault:github}}`. toolbox swaps in the real key while sending, and only when every check
-passes. Any copy of the key in the response is redacted before the script sees it.
+passes. Any copy of the key in the response is redacted before the script sees it. Agents can't add, allow or read
+keys: every vault change needs a person at a real terminal.
+
+<details>
+<summary><b>Show the flow</b></summary>
 
 ```mermaid
 sequenceDiagram
@@ -137,13 +167,14 @@ sequenceDiagram
     tb-->>Agent: JSON on stdout
 ```
 
-Agents can't add, allow or read keys: every vault change needs a person at a real terminal. What this does and
-doesn't protect against: [Security](docs/security.md#the-vault).
+</details>
 
 ## Commands
 
-Plain `tb` lists only your own commands. Everything that manages toolbox lives under `tb self`, and each has its own
-page:
+Plain `tb` lists only your own commands. Everything that manages toolbox lives under `tb self`.
+
+<details>
+<summary><b>All <code>tb self</code> commands</b></summary>
 
 | Command | What it does |
 |---------|--------------|
@@ -159,14 +190,31 @@ page:
 | [`tb self vault`](docs/commands/vault.md) | Add API keys and choose which commands may use them |
 | [`tb self mcp`](docs/commands/mcp.md) | Serve your commands as MCP tools for Claude Code and other AI apps |
 
+</details>
+
 ## Docs
 
-- [Writing commands](docs/writing-commands.md): `command.json`, the Lua API, the vault
-- [Sharing commands](docs/sharing.md): host your own repo or marketplace, release versions
-- [Security](docs/security.md): what commands can touch, the risks of installing, what the vault protects
-- [AI agents](docs/ai-agents.md): the snippet for your `CLAUDE.md`, output rules
-- [Development](docs/development.md): build, test, release, project layout
+- <img src="assets/icons/file-code.svg" width="16" height="16" alt=""> [Writing commands](docs/writing-commands.md): `command.json`, the Lua API, the vault
+- <img src="assets/icons/package.svg" width="16" height="16" alt=""> [Sharing commands](docs/sharing.md): host your own repo or marketplace, release versions
+- <img src="assets/icons/shield.svg" width="16" height="16" alt=""> [Security](docs/security.md): what commands can touch, the risks of installing, what the vault protects
+- <img src="assets/icons/bot.svg" width="16" height="16" alt=""> [AI agents](docs/ai-agents.md): the snippet for your `CLAUDE.md`, output rules
+- <img src="assets/icons/wrench.svg" width="16" height="16" alt=""> [Development](docs/development.md): build, test, release, project layout
+
+## Security
+
+Commands can only touch what their `command.json` declares. Installing someone else's command still means running their
+code, so read it first. The vault is macOS only for now. Details, and what toolbox does **not** protect against:
+[docs/security.md](docs/security.md#the-vault).
 
 ## License
 
 [MIT](LICENSE)
+
+---
+
+<p align="center">
+  If toolbox is useful to you, <img src="assets/icons/star.svg" width="16" height="16" alt=""> <b>star the repo</b>, try the
+  <a href="https://github.com/WilliamThogersen/toolbox-commands">starter marketplace</a>,
+  and contributions are welcome (see <a href="docs/development.md">Development</a>).
+</p>
+
