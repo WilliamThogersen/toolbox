@@ -34,6 +34,7 @@ Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 - **JSON out, always.** Results go to stdout as JSON. Errors are `{"error": "..."}` on stderr with exit code 1.
 - **Nothing it didn't ask for.** Each command lists the hosts, programs, env vars, folders and keys it may touch. Everything else fails.
 - **Keys the AI can use but never see.** Scripts get a placeholder. toolbox swaps in the real key on the way out, only for commands you approved.
+- **A tool in any AI app.** `tb self mcp` serves every command as an MCP tool for Claude Code, Cursor and others.
 - **Share through git.** Install commands from any GitHub or GitLab repo, or save whole marketplaces and search them.
 
 `tb` and `toolbox` are the same program: `tb` is a symlink for typing less.
@@ -98,6 +99,37 @@ $ tb stars --repo rust-lang/rust
 
 Next: [Writing commands](docs/writing-commands.md) has every `command.json` field and the full Lua API.
 
+## How the vault works
+
+You store a key once, at your own terminal, and say which hosts it may go to. A script asks for it by name and only
+ever gets the placeholder `{{vault:github}}`. toolbox swaps in the real key while sending, and only when every check
+passes. Any copy of the key in the response is redacted before the script sees it.
+
+```mermaid
+sequenceDiagram
+    actor You
+    participant Agent as AI agent
+    participant Script as run.lua
+    participant tb as toolbox
+    participant API as api.github.com
+
+    You->>tb: tb self vault add github --host api.github.com
+    You->>tb: tb self vault allow github gh-prs (after reading the script)
+    Agent->>tb: tb gh-prs
+    tb->>Script: run
+    Script->>tb: http.get with header "Bearer {{vault:github}}"
+    Note over tb: Listed in permissions.vault?<br/>Host allowed? https?<br/>Script unchanged since you allowed it?
+    tb->>API: Authorization: Bearer ghp_real_key
+    API-->>tb: response
+    Note over tb: Copies of the key become [REDACTED:github]
+    tb-->>Script: response
+    Script-->>tb: result
+    tb-->>Agent: JSON on stdout
+```
+
+Agents can't add, allow or read keys: every vault change needs a person at a real terminal. What this does and
+doesn't protect against: [Security](docs/security.md#the-vault).
+
 ## Commands
 
 Plain `tb` lists only your own commands. Everything that manages toolbox lives under `tb self`, and each has its own
@@ -115,6 +147,7 @@ page:
 | [`tb self uninstall <name>`](docs/commands/uninstall.md) | Remove an installed command |
 | [`tb self market`](docs/commands/market.md) | Save, list and remove marketplaces |
 | [`tb self vault`](docs/commands/vault.md) | Add API keys and choose which commands may use them |
+| [`tb self mcp`](docs/commands/mcp.md) | Serve your commands as MCP tools for Claude Code and other AI apps |
 
 ## Docs
 
