@@ -15,7 +15,7 @@ Plain `tb` lists only your own commands. Everything that manages toolbox lives u
 | [`tb self update [<name>]`](commands/update.md) | Update installed commands to their newest version |
 | [`tb self uninstall <name>`](commands/uninstall.md) | Remove an installed command |
 | [`tb self market`](commands/market.md) | Save, list and remove marketplaces |
-| [`tb self vault`](commands/vault.md) | Add, list and remove API keys |
+| [`tb self vault`](commands/vault.md) | Add API keys and choose which commands may use them |
 
 Your own commands run as `tb <name> --<arg> <value>`. Add `--help` to see their args.
 

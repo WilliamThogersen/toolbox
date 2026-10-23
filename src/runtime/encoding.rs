@@ -37,12 +37,13 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     install_hash(lua)
 }
 
-/// The vault swaps placeholders in header values only. Anything computed from a
-/// placeholder here would hold the placeholder text, not the key, so it is refused.
+/// The vault swaps placeholders in http header values and `query` parameters only.
+/// Anything computed from a placeholder here would hold the placeholder text, not
+/// the key, so it is refused.
 fn refuse_placeholder(what: &str, data: &[u8]) -> Result<()> {
     if mentions_vault(&String::from_utf8_lossy(data)) {
         bail!(
-            "{what} got a vault placeholder. Scripts never see keys, so placeholders only work directly in http header values"
+            "{what} got a vault placeholder. Scripts never see keys, so placeholders only work directly in http header values and `query` parameters. For Basic auth, use vault(\"name\", \"base64\") on a key stored as user:password"
         );
     }
     Ok(())

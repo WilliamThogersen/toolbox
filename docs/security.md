@@ -14,7 +14,7 @@ are each gated by the command's `permissions`:
 | `http` | Call these hosts. `"*"` means any host. |
 | `exec` | Run these programs, with any arguments, without a shell. |
 | `env` | Read these environment variables. |
-| `vault` | Use these keys in HTTP headers, never read them. |
+| `vault` | Use these keys in HTTP requests once you allow the command, never read them. |
 | `read` | Read files in these folders and below. |
 | `write` | Create, change and delete files in these folders and below (and read them). |
 
@@ -38,8 +38,9 @@ An installed command runs someone else's code with every permission it asks for.
   send them anywhere it may call.
 - **`write`** can change or delete files there. Write access to `~` lets a command edit your shell startup files, which
   is as good as `exec`.
-- **`vault`** uses your keys. They still only go to the hosts you bound them to, but the command decides what to do
-  there: a GitHub key can delete repos.
+- **`vault`** uses your keys once you allow the command with [`tb self vault allow`](commands/vault.md#tb-self-vault-allow).
+  They still only go to the hosts you bound them to, but the command decides what to do there: a GitHub key can
+  delete repos.
 
 Two risks need care even with no permissions:
 
@@ -59,11 +60,21 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
 ### What it protects against
 
 - **Scripts never get the value.** `vault("github")` returns the placeholder `{{vault:github}}`.
-- **Keys only go where you said.** toolbox swaps in the real key only in header values, only for hosts you allowed,
-  only over https (http for localhost only).
+- **Only commands you allowed.** Listing a key in `permissions.vault` isn't enough: you approve each command at
+  your terminal after seeing its script. The approval is pinned to a SHA-256 of `command.json` and `run.lua`, so
+  an edit (by an AI, by you, or by an update) needs a new approval. A brand-new command an AI just wrote can't
+  touch your keys.
+- **Keys only go where you said.** toolbox swaps in the real key only in header values (and query parameters you
+  named), only for hosts you allowed, only over https (http for this computer only). Keys for this computer are
+  bound to one address and port, like `127.0.0.1:8080`, so a program can't open its own port, or the other address
+  family behind `localhost`, to catch a key.
+- **No downgrades.** Older versions of toolbox, which don't know about approvals, see an empty vault once this
+  version has saved it, even if the Keychain still trusts them.
 - **No detours.** Requests that carry a key ignore redirects and `HTTP_PROXY`-style env vars.
 - **No echoes.** A key that shows up in a response (raw, base64 or URL-encoded) is replaced with `[REDACTED:<name>]`.
-- **A human adds and removes keys.** That needs a real terminal (`/dev/tty`). An AI's shell has none.
+- **A human makes every change.** Adding, changing, allowing and removing need a real terminal (`/dev/tty`). An
+  AI's shell has none. The approval prompt escapes terminal control codes and bidi characters, so a script can't
+  hide lines from you.
 - **Other programs get asked.** The vault is one macOS Keychain item, so tools like the `security` CLI trigger a
   permission prompt.
 - **No injection.** Release binaries are signed with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and debuggers
@@ -76,6 +87,10 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
   yourself.
 - **A host that echoes the key in a changed form** (part of it, hashed, re-encoded). Redaction only catches exact
   copies.
-- **A command you allowed to use a key.** It can do anything the key allows on the hosts you bound it to.
+- **A command you allowed to use a key.** It can do anything the key allows on the hosts you bound it to. A command
+  that takes a URL or a request body as an argument lets whoever runs it, an AI included, decide what that is.
+- **A local port someone else takes.** A key bound to `127.0.0.1:8080` goes to whatever listens there. While your
+  server is stopped, any program can. If your server listens on all addresses (`0.0.0.0`), macOS lets another
+  program of yours listen on `127.0.0.1` with the same port and take its connections, even while it runs.
 - **Other platforms.** Releases are macOS only. Built from source on Linux or Windows the keychain storage works, but
   there is no hardened-runtime signing.

@@ -14,12 +14,19 @@ pub const SCRIPT_FILE: &str = "run.lua";
 #[derive(Debug, Clone)]
 pub struct CommandDef {
     pub manifest: Manifest,
+    /// The exact `command.json` text `manifest` was parsed from.
+    pub manifest_source: String,
     pub dir: PathBuf,
 }
 
 impl CommandDef {
     pub fn script_path(&self) -> PathBuf {
         self.dir.join(SCRIPT_FILE)
+    }
+
+    pub fn read_script(&self) -> Result<String> {
+        let path = self.script_path();
+        fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))
     }
 }
 
@@ -92,6 +99,7 @@ pub fn load_command(dir: &Path, folder: &str) -> std::result::Result<CommandDef,
     if problems.is_empty() {
         Ok(CommandDef {
             manifest,
+            manifest_source: raw,
             dir: dir.to_path_buf(),
         })
     } else {

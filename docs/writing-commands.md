@@ -169,7 +169,8 @@ hash.hmac_sha256(key, message)    -- hex; "base64" or "raw" as 3rd arg
 ```
 
 They refuse vault placeholders: a key only ever goes straight into an http header
-value, so a script can't encode, hash or sign with it.
+value or `query` parameter, so a script can't encode, hash or sign with it. For
+Basic auth, use `vault("name", "base64")` (see Vault below).
 
 ### env
 
@@ -195,18 +196,38 @@ local res = http.get("https://api.github.com/user", {
 })
 ```
 
+Two more forms, for APIs that don't take a bearer token:
+
+```lua
+-- Basic auth: the human stores "user:password" as one secret
+headers = { Authorization = "Basic " .. vault("jira", "base64") }
+
+-- A key in the query string: only in parameters the human named with --query-param
+http.get("https://maps.googleapis.com/maps/api/geocode/json", {
+  query = { key = vault("maps"), address = args.address }
+})
+```
+
 Rules:
 
 1. The secret must be listed in `permissions.vault`.
-2. Placeholders work only in header values. In the URL or body they raise an error.
-3. The request must go to a host the human allowed for that secret, over https
-   (plain http is allowed for localhost only).
-4. Requests that carry a secret never follow redirects.
-5. Any secret value that appears in a response is replaced with `[REDACTED:<name>]`.
+2. Placeholders work only in header values and in `query = {...}` values. In the
+   URL string or the body they raise an error.
+3. The request must go to a host the human allowed for that secret, over https.
+   Plain http is allowed only for this computer, at the exact address and port the
+   human set (like `http://127.0.0.1:8080`, never `localhost`).
+4. The human must allow your command with `tb self vault allow <secret> <command>`.
+   The approval covers the exact `command.json` and `run.lua` they saw: after any
+   edit, the human has to allow it again.
+5. Requests that carry a secret never follow redirects.
+6. Any secret value that appears in a response is replaced with `[REDACTED:<name>]`.
 
-`tb self vault list` shows which secrets exist and where they may be sent. If a
-secret is missing, ask the user to run `tb self vault add <name> --host <host>` in
-their own terminal. You cannot add, change or read secrets yourself.
+`tb self vault list` shows which secrets exist, where they may be sent and which
+commands may use them. The error message tells you what to ask the user, for
+example to run `tb self vault add <name> --host <host>` or
+`tb self vault allow <secret> <command>` in their own terminal. Finish and test the
+command's logic before you ask for approval, so they only review it once. You
+cannot add, change, allow or read secrets yourself.
 
 ## Full example
 

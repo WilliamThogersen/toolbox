@@ -15,7 +15,8 @@ use url::{Url, form_urlencoded};
 use super::encoding::query_pairs;
 use super::{seconds, ser_options};
 use crate::manifest::Permissions;
-use crate::vault::inject::{Redactor, ensure_absent, inject_headers, mentions_vault};
+use crate::vault::approval::Caller;
+use crate::vault::inject::{Injector, Redactor, ensure_absent, mentions_vault};
 use crate::vault::{VaultData, VaultStore};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -128,7 +129,7 @@ impl LazyVault {
 
 pub struct HttpClient {
     allowed_hosts: Vec<String>,
-    declared_secrets: Vec<String>,
+    caller: Caller,
     vault: LazyVault,
     following: Agent,
     /// Used whenever a secret is attached. No redirects (they could carry the
@@ -137,10 +138,10 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub fn new(perms: &Permissions, store: Box<dyn VaultStore>) -> Self {
+    pub fn new(perms: &Permissions, caller: Caller, store: Box<dyn VaultStore>) -> Self {
         Self {
             allowed_hosts: perms.http.iter().map(|h| h.to_ascii_lowercase()).collect(),
-            declared_secrets: perms.vault.clone(),
+            caller,
             vault: LazyVault {
                 store,
                 loaded: RefCell::new(None),
@@ -154,7 +155,7 @@ impl HttpClient {
         let mut url = Url::parse(&spec.url).with_context(|| format!("invalid url {:?}", spec.url))?;
         self.check_host(&url)?;
         ensure_absent("url", &spec.url)?;
-        add_query(&mut url, &spec.options.query)?;
+        let query = query_pairs(&spec.options.query)?;
         let timeout = spec.options.timeout.map(seconds).transpose()?;
         let (body, content_type) = encode_body(&spec.options)?;
         ensure_absent("body", &String::from_utf8_lossy(&body))?;
@@ -165,14 +166,22 @@ impl HttpClient {
         {
             headers.push(("content-type".to_string(), ct.to_string()));
         }
-        let uses_vault = headers.iter().any(|(k, v)| mentions_vault(k) || mentions_vault(v));
-        let (headers, agent) = if uses_vault {
+        let uses_vault = headers
+            .iter()
+            .chain(&query)
+            .any(|(k, v)| mentions_vault(k) || mentions_vault(v));
+        let (headers, query, agent) = if uses_vault {
             let vault = self.vault.get()?;
-            let injected = inject_headers(&headers, &url, &vault, &self.declared_secrets)?;
-            (injected, &self.secret_safe)
+            let injector = Injector {
+                vault: &vault,
+                caller: &self.caller,
+                url: &url,
+            };
+            (injector.headers(&headers)?, injector.query(&query)?, &self.secret_safe)
         } else {
-            (headers, &self.following)
+            (headers, query, &self.following)
         };
+        append_query(&mut url, &query);
 
         let redactor = self.vault.redactor();
         let response = execute(agent, &spec.method, &url, &headers, body, timeout)
@@ -214,17 +223,18 @@ fn encode_body(options: &RequestOptions) -> Result<(Vec<u8>, Option<&'static str
     }
 }
 
-/// Appends `query = {...}` to whatever query the URL already has.
-fn add_query(url: &mut Url, params: &BTreeMap<String, serde_json::Value>) -> Result<()> {
-    if !params.is_empty() {
-        let encoded = encode_pairs("url", params)?;
+/// Appends `query = {...}` pairs (secrets already filled in) to whatever query the URL has.
+fn append_query(url: &mut Url, pairs: &[(String, String)]) {
+    if !pairs.is_empty() {
+        let encoded = form_urlencoded::Serializer::new(String::new())
+            .extend_pairs(pairs)
+            .finish();
         let query = match url.query() {
             Some(existing) if !existing.is_empty() => format!("{existing}&{encoded}"),
             _ => encoded,
         };
         url.set_query(Some(&query));
     }
-    Ok(())
 }
 
 /// Placeholders are checked before encoding: once escaped they would no longer be recognised.
@@ -370,7 +380,12 @@ mod tests {
             vault: vault.iter().map(|s| s.to_string()).collect(),
             ..Permissions::default()
         };
-        HttpClient::new(&perms, Box::new(MemoryStore::new(VaultData::default())))
+        let caller = Caller {
+            name: "t".into(),
+            declared: perms.vault.clone(),
+            fingerprint: "t".into(),
+        };
+        HttpClient::new(&perms, caller, Box::new(MemoryStore::new(VaultData::default())))
     }
 
     fn spec(url: &str, options: RequestOptions) -> RequestSpec {
@@ -439,16 +454,17 @@ mod tests {
     #[test]
     fn query_is_added_to_the_url() {
         let mut url = Url::parse("https://x.example/search?lang=en").unwrap();
-        add_query(&mut url, &params(serde_json::json!({ "q": "a&b", "page": 2 }))).unwrap();
+        let pairs = query_pairs(&params(serde_json::json!({ "q": "a&b", "page": 2 }))).unwrap();
+        append_query(&mut url, &pairs);
         assert_eq!(url.as_str(), "https://x.example/search?lang=en&page=2&q=a%26b");
 
         let mut bare = Url::parse("https://x.example/").unwrap();
-        add_query(&mut bare, &BTreeMap::new()).unwrap();
+        append_query(&mut bare, &[]);
         assert_eq!(bare.as_str(), "https://x.example/");
     }
 
     #[test]
-    fn refuses_placeholders_in_query_and_form() {
+    fn query_placeholders_need_the_secret_and_form_ones_are_refused() {
         let c = client(&["*"], &["github"]);
         let in_query = c.send(spec(
             "https://x.example/",
@@ -457,7 +473,7 @@ mod tests {
                 ..RequestOptions::default()
             },
         ));
-        assert!(in_query.unwrap_err().to_string().contains("found one in the url"));
+        assert!(in_query.unwrap_err().to_string().contains("tb self vault add github"));
         let in_form = c.send(spec(
             "https://x.example/",
             RequestOptions {

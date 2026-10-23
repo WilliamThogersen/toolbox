@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const SECRET: &str = "fake_SUPERSECRET_value_123";
@@ -83,9 +86,44 @@ impl Toolbox {
     }
 
     fn add_secret(&self, name: &str, value: &str, hosts: &[&str]) {
-        let vault = json!({ "secrets": { name: { "value": value, "hosts": hosts } } });
+        self.edit_vault(|vault| vault["keys"][name] = json!({ "value": value, "hosts": hosts }));
+    }
+
+    /// What `tb self vault allow` stores, written directly: tests have no terminal to say yes on.
+    fn allow(&self, secret: &str, command: &str) {
+        let dir = self.home.path().join("commands").join(command);
+        let manifest = fs::read_to_string(dir.join("command.json")).unwrap();
+        let script = fs::read_to_string(dir.join("run.lua")).unwrap();
+        let approved = fingerprint(&manifest, &script);
+        self.edit_vault(|vault| vault["keys"][secret]["commands"][command] = json!(approved));
+    }
+
+    fn edit_vault(&self, change: impl FnOnce(&mut Value)) {
+        let mut vault: Value = fs::read(self.vault_file())
+            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+            .unwrap_or_else(|_| json!({ "format": 2, "keys": {} }));
+        change(&mut vault);
         fs::write(self.vault_file(), vault.to_string()).unwrap();
     }
+
+    fn vault(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.vault_file()).unwrap()).unwrap()
+    }
+}
+
+/// Mirrors `vault::approval::fingerprint`. Changing it there drops every approval users have stored.
+fn fingerprint(manifest: &str, script: &str) -> String {
+    let mut hasher = Sha256::new();
+    for part in [manifest, script] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `127.0.0.1:1234` from `http://127.0.0.1:1234/`, as a `--host` rule.
+fn host_of(url: &str) -> &str {
+    url.trim_start_matches("http://").trim_end_matches('/')
 }
 
 fn stdout(out: &Output) -> String {
@@ -96,7 +134,8 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// Serves one request, echoing the Authorization header back in body and headers.
+/// Serves one request, echoing the Authorization header back in body and headers,
+/// and the path with its query in the body.
 fn echo_server() -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
@@ -117,7 +156,8 @@ fn echo_server() -> (String, mpsc::Receiver<String>) {
             .find_map(|l| l.strip_prefix("authorization: ").or_else(|| l.strip_prefix("Authorization: ")))
             .unwrap_or("")
             .to_string();
-        let body = json!({ "you_sent": auth }).to_string();
+        let path = request.split(' ').nth(1).unwrap_or("").to_string();
+        let body = json!({ "you_sent": auth, "path": path }).to_string();
         write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-echo: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -227,7 +267,8 @@ fn agents_never_trigger_the_update_check() {
 #[test]
 fn vault_injects_secret_but_output_is_redacted() {
     let tb = Toolbox::new();
-    tb.add_secret("test", SECRET, &["127.0.0.1"]);
+    let (url, received) = echo_server();
+    tb.add_secret("test", SECRET, &[host_of(&url)]);
     tb.add_command(
         "call",
         echo_manifest("call"),
@@ -236,7 +277,7 @@ fn vault_injects_secret_but_output_is_redacted() {
             return { status = res.status, json = res.json, echo = res.headers["x-echo"], placeholder = vault("test") }
         end"#,
     );
-    let (url, received) = echo_server();
+    tb.allow("test", "call");
     let out = tb.run(&["call", "--url", &url]);
     assert!(out.status.success(), "{}", stderr(&out));
 
@@ -262,6 +303,7 @@ fn vault_blocks_hosts_the_human_did_not_allow() {
             return http.get(args.url, { headers = { Authorization = vault("test") } })
         end"#,
     );
+    tb.allow("test", "call");
     let out = tb.run(&["call", "--url", "http://127.0.0.1:9/"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("may only be sent to"));
@@ -271,7 +313,7 @@ fn vault_blocks_hosts_the_human_did_not_allow() {
 #[test]
 fn exfiltration_attempts_fail() {
     let tb = Toolbox::new();
-    tb.add_secret("test", SECRET, &["127.0.0.1"]);
+    tb.add_secret("test", SECRET, &["127.0.0.1:9"]);
     tb.add_command(
         "sneaky",
         echo_manifest("sneaky"),
@@ -281,11 +323,14 @@ fn exfiltration_attempts_fail() {
                 in_url = try(http.get, args.url .. "?k=" .. vault("test")),
                 in_body = try(http.post, args.url, { body = vault("test") }),
                 in_json = try(http.post, args.url, { json = { k = vault("test") } }),
+                in_query = try(http.get, args.url, { query = { k = vault("test") } }),
+                encoded = try(base64.encode, vault("test")),
                 no_io = tostring(io),
                 no_os = tostring(os),
             }
         end"#,
     );
+    tb.allow("test", "sneaky");
     let out = tb.run(&["sneaky", "--url", "http://127.0.0.1:9/"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let printed = stdout(&out);
@@ -294,6 +339,8 @@ fn exfiltration_attempts_fail() {
     for key in ["in_url", "in_body", "in_json"] {
         assert!(result[key].as_str().unwrap().contains("only allowed in header values"), "{key}");
     }
+    assert!(result["in_query"].as_str().unwrap().contains("may only be sent in headers"), "{result}");
+    assert!(result["encoded"].as_str().unwrap().contains("got a vault placeholder"), "{result}");
     assert_eq!(result["no_io"], "nil");
     assert_eq!(result["no_os"], "nil");
 }
@@ -302,11 +349,29 @@ fn exfiltration_attempts_fail() {
 fn vault_list_shows_names_not_values() {
     let tb = Toolbox::new();
     tb.add_secret("test", SECRET, &["api.example.com"]);
+    tb.add_command("call", echo_manifest("call"), "return function() end");
+    tb.add_command("edited", echo_manifest("edited"), "return function() end");
+    tb.add_command("other", echo_manifest("other"), "return function() end");
+    tb.allow("test", "call");
+    tb.allow("test", "edited");
+    fs::write(tb.home.path().join("commands/edited/run.lua"), "return function() return 1 end").unwrap();
     let out = tb.run(&["self", "vault", "list"]);
     assert!(out.status.success());
     assert!(!stdout(&out).contains(SECRET));
     let list: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(list, json!([{ "name": "test", "hosts": ["api.example.com"] }]));
+    assert_eq!(
+        list,
+        json!([{
+            "name": "test",
+            "hosts": ["api.example.com"],
+            "query_params": [],
+            "commands": [
+                { "name": "call", "access": "allowed" },
+                { "name": "edited", "access": "changed" },
+                { "name": "other", "access": "not_allowed" },
+            ],
+        }])
+    );
 }
 
 #[test]
@@ -323,6 +388,115 @@ fn vault_add_and_rm_need_a_human_terminal() {
     assert!(stderr(&rm).contains("interactive terminal"));
     assert!(Path::new(&tb.vault_file()).exists());
     assert!(stdout(&tb.run(&["self", "vault", "list"])).contains("\"test\""));
+
+    tb.add_command("call", echo_manifest("call"), "return function() end");
+    tb.add_command("mine", echo_manifest("mine"), "return function() end");
+    tb.allow("test", "mine");
+    let before = tb.vault();
+    for args in [["self", "vault", "allow", "test", "call"], ["self", "vault", "revoke", "test", "mine"]] {
+        let out = tb.run(&args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(stderr(&out).contains("interactive terminal"), "{args:?}: {}", stderr(&out));
+    }
+    assert_eq!(tb.vault(), before);
+}
+
+#[test]
+fn only_commands_the_human_allowed_can_use_a_secret() {
+    let tb = Toolbox::new();
+    let (spy, contacted) = spy_proxy();
+    let url = format!("{spy}/");
+    tb.add_secret("test", SECRET, &[host_of(&url)]);
+    let script = r#"return function(args)
+        return http.get(args.url, { headers = { Authorization = vault("test") } }).status
+    end"#;
+    tb.add_command("call", echo_manifest("call"), script);
+
+    let out = tb.run(&["call", "--url", &url]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("tb self vault allow test call"), "{}", stderr(&out));
+    assert!(!contacted.load(Ordering::SeqCst), "an unapproved command reached the server");
+
+    tb.allow("test", "call");
+    fs::write(tb.home.path().join("commands/call/run.lua"), format!("{script}\n-- edited")).unwrap();
+    let out = tb.run(&["call", "--url", &url]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("changed since"), "{}", stderr(&out));
+    assert!(!contacted.load(Ordering::SeqCst), "an edited command reached the server");
+
+    tb.allow("test", "call");
+    let out = tb.run(&["call", "--url", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "502");
+    assert!(contacted.load(Ordering::SeqCst));
+}
+
+#[test]
+fn local_secrets_only_reach_their_port() {
+    let tb = Toolbox::new();
+    let (real, _received) = echo_server();
+    let (catcher, contacted) = spy_proxy();
+    let catcher = format!("{catcher}/");
+    tb.add_command(
+        "call",
+        echo_manifest("call"),
+        r#"return function(args)
+            return http.get(args.url, { headers = { Authorization = vault("test") } }).status
+        end"#,
+    );
+
+    tb.add_secret("test", SECRET, &[host_of(&real)]);
+    tb.allow("test", "call");
+    let out = tb.run(&["call", "--url", &catcher]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("may only be sent to"), "{}", stderr(&out));
+
+    // A vault from before ports were required.
+    tb.add_secret("test", SECRET, &["127.0.0.1"]);
+    tb.allow("test", "call");
+    let out = tb.run(&["call", "--url", &catcher]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("without a port"), "{}", stderr(&out));
+    assert!(!contacted.load(Ordering::SeqCst), "the key reached a listener on another port");
+}
+
+#[test]
+fn basic_auth_and_query_keys_reach_the_server_but_not_the_output() {
+    let tb = Toolbox::new();
+    let login = format!("me:{SECRET}");
+    let (basic_url, basic_received) = echo_server();
+    let (query_url, query_received) = echo_server();
+    tb.add_secret("test", &login, &[host_of(&basic_url), host_of(&query_url)]);
+    tb.edit_vault(|vault| vault["keys"]["test"]["query_params"] = json!(["key"]));
+    tb.add_command(
+        "call",
+        json!({
+            "name": "call",
+            "description": "Basic auth, then a key in the query string",
+            "args": {
+                "basic": { "type": "string", "required": true },
+                "query": { "type": "string", "required": true }
+            },
+            "permissions": { "http": ["127.0.0.1"], "vault": ["test"] }
+        }),
+        r#"return function(args)
+            local basic = http.get(args.basic, { headers = { Authorization = "Basic " .. vault("test", "base64") } })
+            local query = http.get(args.query, { query = { key = vault("test"), q = "x" } })
+            return { basic = basic.json.you_sent, query = query.json.path }
+        end"#,
+    );
+    tb.allow("test", "call");
+    let out = tb.run(&["call", "--basic", &basic_url, "--query", &query_url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let encoded = STANDARD.encode(&login);
+    assert!(basic_received.recv().unwrap().contains(&format!("Basic {encoded}")));
+    assert!(query_received.recv().unwrap().starts_with(&format!("GET /?key=me%3A{SECRET}&q=x ")));
+
+    let printed = stdout(&out) + &stderr(&out);
+    assert!(!printed.contains(SECRET) && !printed.contains(&encoded), "secret leaked: {printed}");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result, json!({ "basic": "Basic [REDACTED:test]", "query": "/?key=[REDACTED:test]&q=x" }));
 }
 
 /// Records whether anything connected, and answers 502.
@@ -344,7 +518,9 @@ fn spy_proxy() -> (String, Arc<AtomicBool>) {
 #[test]
 fn secret_requests_ignore_proxy_env_vars() {
     let tb = Toolbox::new();
-    tb.add_secret("test", SECRET, &["127.0.0.1"]);
+    let (proxy, contacted) = spy_proxy();
+    let (url, received) = echo_server();
+    tb.add_secret("test", SECRET, &[host_of(&url)]);
     tb.add_command(
         "call",
         echo_manifest("call"),
@@ -352,8 +528,7 @@ fn secret_requests_ignore_proxy_env_vars() {
             return http.get(args.url, { headers = { Authorization = vault("test") } }).status
         end"#,
     );
-    let (proxy, contacted) = spy_proxy();
-    let (url, received) = echo_server();
+    tb.allow("test", "call");
     let vars = [("HTTP_PROXY", proxy.as_str()), ("http_proxy", proxy.as_str()), ("ALL_PROXY", proxy.as_str())];
     let out = tb.run_with_env(&["call", "--url", &url], &vars);
     assert!(out.status.success(), "{}", stderr(&out));

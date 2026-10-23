@@ -1,34 +1,82 @@
 //! The vault: API keys that commands can use without ever seeing them.
 //!
 //! Scripts only get placeholders like `{{vault:github}}`. The HTTP layer swaps
-//! in the real value while sending, and only to hosts the human allowed.
+//! in the real value while sending, only to hosts the human allowed, and only
+//! for commands the human approved.
 
+pub mod approval;
 pub mod commands;
+pub mod hosts;
 pub mod inject;
 pub mod store;
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 pub use store::{VaultStore, default_store};
 
-/// Shorter values would make response redaction mangle normal text.
-const MIN_SECRET_LEN: usize = 8;
+use crate::registry::Registry;
+use approval::CommandAccess;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Shorter values would make response redaction mangle normal text.
+pub(crate) const MIN_SECRET_LEN: usize = 8;
+
+/// The vault in memory. How it is stored is up to `store` (see `store::encode`).
+#[derive(Debug, Clone, Default)]
 pub struct VaultData {
-    #[serde(default)]
     pub secrets: BTreeMap<String, SecretEntry>,
 }
 
+/// Everything here is set by the human at a terminal, never by scripts. Unknown
+/// fields are refused, so a newer toolbox's rules are never silently ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretEntry {
     pub value: SecretValue,
-    /// Hosts this secret may be sent to. Set by the human, never by scripts.
+    /// Where it may be sent: `api.github.com` (any port) or `localhost:8080`.
     pub hosts: Vec<String>,
+    /// Query parameters it may be sent in, like `key` for `?key=...`. Empty means headers only.
+    #[serde(default)]
+    pub query_params: Vec<String>,
+    /// Commands allowed to use it, each with the fingerprint of the files the human approved.
+    #[serde(default)]
+    pub commands: BTreeMap<String, String>,
+}
+
+impl SecretEntry {
+    pub fn with_command(&self, name: &str, fingerprint: String) -> Self {
+        let mut commands = self.commands.clone();
+        commands.insert(name.to_string(), fingerprint);
+        Self {
+            commands,
+            ..self.clone()
+        }
+    }
+
+    pub fn without_command(&self, name: &str) -> Self {
+        let commands = self
+            .commands
+            .iter()
+            .filter(|(key, _)| key.as_str() != name)
+            .map(|(key, fingerprint)| (key.clone(), fingerprint.clone()))
+            .collect();
+        Self {
+            commands,
+            ..self.clone()
+        }
+    }
+
+    pub fn summary(&self, name: &str, registry: &Registry) -> SecretSummary {
+        SecretSummary {
+            name: name.to_string(),
+            hosts: self.hosts.clone(),
+            query_params: self.query_params.clone(),
+            commands: approval::access(name, self, registry),
+        }
+    }
 }
 
 /// A secret string whose `Debug` output never shows the value.
@@ -64,11 +112,13 @@ impl fmt::Debug for SecretValue {
     }
 }
 
-/// What may be shown about a secret: its name and allowed hosts.
+/// What may be shown about a secret: everything but its value.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SecretSummary {
     pub name: String,
     pub hosts: Vec<String>,
+    pub query_params: Vec<String>,
+    pub commands: Vec<CommandAccess>,
 }
 
 impl VaultData {
@@ -92,27 +142,12 @@ impl VaultData {
         Self { secrets }
     }
 
-    pub fn summaries(&self) -> Vec<SecretSummary> {
+    pub fn summaries(&self, registry: &Registry) -> Vec<SecretSummary> {
         self.secrets
             .iter()
-            .map(|(name, entry)| SecretSummary {
-                name: name.clone(),
-                hosts: entry.hosts.clone(),
-            })
+            .map(|(name, entry)| entry.summary(name, registry))
             .collect()
     }
-}
-
-/// Accepts a bare hostname like `api.github.com` and returns it lowercased.
-pub fn normalize_host(raw: &str) -> Result<String> {
-    let host = raw.trim().to_ascii_lowercase();
-    let valid_chars = host
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
-    if host.is_empty() || !valid_chars || host.starts_with('.') || host.ends_with('.') {
-        bail!("{raw:?} is not a valid host. Use a bare hostname like api.github.com (no scheme, port, path or wildcard)");
-    }
-    Ok(host)
 }
 
 #[cfg(test)]
@@ -123,6 +158,8 @@ mod tests {
         SecretEntry {
             value: SecretValue::new(value.to_string()).unwrap(),
             hosts: vec!["api.example.com".to_string()],
+            query_params: vec![],
+            commands: BTreeMap::new(),
         }
     }
 
@@ -149,8 +186,23 @@ mod tests {
     #[test]
     fn summaries_have_no_values() {
         let vault = VaultData::default().with_secret("gh", entry("super-secret-token"));
-        let json = serde_json::to_string(&vault.summaries()).unwrap();
-        assert_eq!(json, r#"[{"name":"gh","hosts":["api.example.com"]}]"#);
+        let json = serde_json::to_string(&vault.summaries(&Registry::default())).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"name":"gh","hosts":["api.example.com"],"query_params":[],"commands":[]}]"#
+        );
+    }
+
+    #[test]
+    fn command_grants_do_not_mutate() {
+        let base = entry("super-secret-token");
+        let granted = base.with_command("stars", "abc".into());
+        assert!(base.commands.is_empty());
+        assert_eq!(granted.commands.get("stars").map(String::as_str), Some("abc"));
+        let revoked = granted.without_command("stars");
+        assert!(granted.commands.contains_key("stars"));
+        assert!(revoked.commands.is_empty());
+        assert_eq!(revoked.hosts, base.hosts);
     }
 
     #[test]
@@ -159,14 +211,5 @@ mod tests {
         assert!(SecretValue::new("has\nnewline-inside".into()).is_err());
         assert!(SecretValue::new(" padded-value ".into()).is_err());
         assert!(SecretValue::new("fake_token_abcdefgh".into()).is_ok());
-    }
-
-    #[test]
-    fn host_rules() {
-        assert_eq!(normalize_host(" API.GitHub.com ").unwrap(), "api.github.com");
-        assert_eq!(normalize_host("127.0.0.1").unwrap(), "127.0.0.1");
-        for bad in ["", "*", "*.github.com", "https://x.com", "x.com/path", "x.com:443", ".x.com"] {
-            assert!(normalize_host(bad).is_err(), "{bad} should be rejected");
-        }
     }
 }

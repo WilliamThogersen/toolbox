@@ -17,6 +17,7 @@ use mlua::{Function, Lua, LuaSerdeExt, Value};
 
 use crate::registry::CommandDef;
 use crate::vault::VaultStore;
+use crate::vault::approval::Caller;
 
 /// JSON `null` becomes Lua `nil`, so `if res.json.field then` behaves as expected.
 pub fn ser_options() -> SerializeOptions {
@@ -46,6 +47,8 @@ pub fn run(
     args: &serde_json::Value,
     store: Box<dyn VaultStore>,
 ) -> Result<serde_json::Value> {
+    // Read once: the vault approves this exact source, so it must also be what runs.
+    let script = def.read_script()?;
     let lua = sandbox::new_lua()?;
     let perms = &def.manifest.permissions;
     api::install(&lua, perms)?;
@@ -53,8 +56,9 @@ pub fn run(
     time::install(&lua)?;
     exec::install(&lua, perms.exec.clone())?;
     fs::install(&lua, Rc::new(fs::FsGuard::new(perms)))?;
-    http::install(&lua, Rc::new(http::HttpClient::new(perms, store)))?;
-    let entry = load_entry(&lua, def)?;
+    let caller = Caller::new(def, &script);
+    http::install(&lua, Rc::new(http::HttpClient::new(perms, caller, store)))?;
+    let entry = load_entry(&lua, def, &script)?;
     let result: Value = entry.call(lua.to_value_with(args, ser_options())?)?;
     lua.from_value(result)
         .context("the command returned a value that cannot be turned into JSON")
@@ -72,14 +76,13 @@ pub fn check_syntax_as(def: &CommandDef, label: &str) -> Result<()> {
 
 fn compile(def: &CommandDef, chunk: String) -> Result<()> {
     let lua = sandbox::new_lua()?;
-    let source = read_script(def)?;
+    let source = def.read_script()?;
     lua.load(&source).set_name(chunk).into_function()?;
     Ok(())
 }
 
-fn load_entry(lua: &Lua, def: &CommandDef) -> Result<Function> {
-    let source = read_script(def)?;
-    let returned: Value = lua.load(&source).set_name(chunk_name(def)).eval()?;
+fn load_entry(lua: &Lua, def: &CommandDef, script: &str) -> Result<Function> {
+    let returned: Value = lua.load(script).set_name(chunk_name(def)).eval()?;
     match returned {
         Value::Function(entry) => Ok(entry),
         other => bail!(
@@ -87,11 +90,6 @@ fn load_entry(lua: &Lua, def: &CommandDef) -> Result<Function> {
             other.type_name()
         ),
     }
-}
-
-fn read_script(def: &CommandDef) -> Result<String> {
-    let path = def.script_path();
-    std::fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))
 }
 
 fn chunk_name(def: &CommandDef) -> String {
@@ -108,9 +106,10 @@ mod tests {
     fn command(script: &str) -> (tempfile::TempDir, CommandDef) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("run.lua"), script).unwrap();
-        let manifest = Manifest::parse(r#"{"name":"t","description":"t"}"#).unwrap();
+        let source = r#"{"name":"t","description":"t"}"#;
         let def = CommandDef {
-            manifest,
+            manifest: Manifest::parse(source).unwrap(),
+            manifest_source: source.to_string(),
             dir: tmp.path().to_path_buf(),
         };
         (tmp, def)

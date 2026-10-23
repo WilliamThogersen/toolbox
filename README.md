@@ -29,7 +29,7 @@ Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 - **New command, new folder.** An AI can add a tool in seconds and use it right away.
 - **JSON out, always.** Results go to stdout as JSON. Errors are `{"error": "..."}` on stderr with exit code 1.
 - **Nothing it didn't ask for.** Each command lists the hosts, programs, env vars, folders and keys it may touch. Everything else fails.
-- **Keys the AI can use but never see.** Scripts get a placeholder. toolbox swaps in the real key only on the way out.
+- **Keys the AI can use but never see.** Scripts get a placeholder. toolbox swaps in the real key on the way out, only for commands you approved.
 - **Share through git.** Install commands from any GitHub or GitLab repo, or save whole marketplaces and search them.
 
 `tb` and `toolbox` are the same program: `tb` is a symlink for typing less.
@@ -110,7 +110,7 @@ page:
 | [`tb self update [<name>]`](docs/commands/update.md) | Update installed commands to their newest version |
 | [`tb self uninstall <name>`](docs/commands/uninstall.md) | Remove an installed command |
 | [`tb self market`](docs/commands/market.md) | Save, list and remove marketplaces |
-| [`tb self vault`](docs/commands/vault.md) | Add, list and remove API keys |
+| [`tb self vault`](docs/commands/vault.md) | Add API keys and choose which commands may use them |
 
 ## Docs
 

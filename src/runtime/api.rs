@@ -4,9 +4,9 @@ use std::io::{self, IsTerminal, Read};
 
 use mlua::{Lua, LuaSerdeExt, Result, Value, Variadic};
 
-use super::ser_options;
+use super::{lua_error, ser_options};
 use crate::manifest::Permissions;
-use crate::vault::inject::placeholder;
+use crate::vault::inject::{Encoding, placeholder};
 
 pub fn install(lua: &Lua, perms: &Permissions) -> Result<()> {
     install_json(lua)?;
@@ -71,13 +71,18 @@ fn install_env(lua: &Lua, allowed: Vec<String>) -> Result<()> {
     lua.globals().set("env", env)
 }
 
-/// `vault(name)` returns a placeholder, never the value.
+/// `vault(name)` returns a placeholder, never the value. `vault(name, "base64")`
+/// asks for the value base64-encoded, for Basic auth.
 fn install_vault(lua: &Lua, declared: Vec<String>) -> Result<()> {
-    let vault = lua.create_function(move |_, name: String| {
+    let vault = lua.create_function(move |_, (name, encoding): (String, Option<String>)| {
         if !declared.contains(&name) {
             return Err(denied("vault", &name));
         }
-        Ok(placeholder(&name))
+        let encoding = match encoding.as_deref() {
+            None => Encoding::Raw,
+            Some(label) => Encoding::parse(label).map_err(lua_error)?,
+        };
+        Ok(placeholder(&name, encoding))
     })?;
     lua.globals().set("vault", vault)
 }
@@ -146,7 +151,10 @@ mod tests {
         });
         let value: String = lua.load(r#"return vault("github")"#).eval().unwrap();
         assert_eq!(value, "{{vault:github}}");
+        let encoded: String = lua.load(r#"return vault("github", "base64")"#).eval().unwrap();
+        assert_eq!(encoded, "{{vault:github|base64}}");
         assert!(eval_err(&lua, r#"vault("stripe")"#).contains("permissions.vault"));
+        assert!(eval_err(&lua, r#"vault("github", "hex")"#).contains("unknown vault encoding"));
     }
 
     #[test]

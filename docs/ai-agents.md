@@ -11,7 +11,7 @@ Add this to your `CLAUDE.md` (or your agent's instructions file):
 `tb` is my toolbox CLI. Run `tb` to list my commands and `tb self describe` for their args as JSON.
 To add a command, read `tb self guide`, then `tb self new <name>`, edit the files, and run `tb self check`.
 API keys live in the toolbox vault: use `vault("name")` in headers, never ask me for a key.
-If a key is missing, ask me to run `tb self vault add <name> --host <host>`.
+If a key is missing or a command isn't allowed to use it, the error says what to ask me to run.
 Before writing a new command, check `tb self search <words>` for one in my marketplaces.
 Before `tb self install <source> --yes`, show me the permissions it lists and wait for my OK.
 ```
@@ -34,7 +34,7 @@ A closed stdout pipe (`tb ... | head`) is not an error.
 | Can | Can't |
 |-----|-------|
 | Write commands, run them, check them | Read a key's value |
-| Use keys in headers, for hosts the human allowed | Add, change or delete keys (needs a real terminal) |
+| Use keys in commands the human allowed, for hosts the human allowed | Add, change, allow or delete keys (needs a real terminal) |
 | Search marketplaces | Install or update without `--yes` (it gets the permission list instead) |
 | Uninstall installed commands | Delete commands the human made |
 

@@ -6,7 +6,7 @@
 //! whole marketplace of them; `market` saves such repos by name so commands can be
 //! searched and installed as `<market>/<command>`.
 
-mod confirm;
+pub mod confirm;
 mod git;
 pub mod market;
 mod repo;

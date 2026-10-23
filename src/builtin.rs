@@ -11,7 +11,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use crate::cli::{ignore_closed_pipe, print_json};
 use crate::install::{self, Confirm, Prompt, Yes, market};
 use crate::registry::Registry;
-use crate::vault::commands::{self as vault_ops, Tty};
+use crate::vault::commands::{self as vault_ops, Rules, Tty};
 use crate::{check, describe, paths, scaffold, vault};
 
 pub const NAMESPACE: &str = "self";
@@ -120,7 +120,7 @@ fn vault_app() -> Command {
         .disable_help_subcommand(true)
         .subcommand(
             Command::new("add")
-                .about("Add or replace a secret. Prompts for the value, so a human must run it in a terminal")
+                .about("Add a secret or change where it may go. Prompts for the value (empty keeps the current one), so a human must run it in a terminal")
                 .arg(Arg::new("name").required(true))
                 .arg(
                     Arg::new("host")
@@ -128,10 +128,29 @@ fn vault_app() -> Command {
                         .required(true)
                         .action(ArgAction::Append)
                         .value_delimiter(',')
-                        .help("Host the secret may be sent to, e.g. api.github.com (repeatable)"),
+                        .help("Host the secret may be sent to, e.g. api.github.com or 127.0.0.1:8080 (repeatable)"),
+                )
+                .arg(
+                    Arg::new("query-param")
+                        .long("query-param")
+                        .action(ArgAction::Append)
+                        .value_delimiter(',')
+                        .help("Query parameter it may also be sent in, e.g. key for ?key=... (repeatable)"),
                 ),
         )
-        .subcommand(Command::new("list").about("Secret names and allowed hosts (never values)"))
+        .subcommand(Command::new("list").about("Secrets, where they may go and which commands use them (never values)"))
+        .subcommand(
+            Command::new("allow")
+                .about("Let a command use a secret. Shows its script and asks in a terminal")
+                .arg(Arg::new("secret").required(true))
+                .arg(Arg::new("command").required(true)),
+        )
+        .subcommand(
+            Command::new("revoke")
+                .about("Stop a command from using a secret. Asks in a terminal")
+                .arg(Arg::new("secret").required(true))
+                .arg(Arg::new("command").required(true)),
+        )
         .subcommand(
             Command::new("rm")
                 .about("Delete a secret. Asks for confirmation in a terminal")
@@ -169,7 +188,7 @@ pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Re
             install::uninstall(commands_dir, name)?;
             print_json(&serde_json::json!({ "name": name, "uninstalled": true }))
         }
-        Some(("vault", m)) => vault_command(m),
+        Some(("vault", m)) => vault_command(m, registry),
         _ => unreachable!("clap requires a `self` subcommand"),
     }
 }
@@ -216,15 +235,35 @@ fn new_command(commands_dir: &Path, matches: &ArgMatches) -> Result<ExitCode> {
     print_json(&created)
 }
 
-fn vault_command(matches: &ArgMatches) -> Result<ExitCode> {
+fn vault_command(matches: &ArgMatches, registry: &Registry) -> Result<ExitCode> {
     let store = vault::default_store();
+    let pair = |m: &ArgMatches| {
+        let get = |id| m.get_one::<String>(id).expect("required").clone();
+        (get("secret"), get("command"))
+    };
     match matches.subcommand() {
         Some(("add", m)) => {
             let name = m.get_one::<String>("name").expect("required");
-            let hosts: Vec<String> = m.get_many::<String>("host").into_iter().flatten().cloned().collect();
-            print_json(&vault_ops::add(store.as_ref(), &Tty, name, &hosts)?)
+            let values = |id| m.get_many::<String>(id).into_iter().flatten().cloned().collect::<Vec<_>>();
+            let (hosts, query_params) = (values("host"), values("query-param"));
+            let rules = Rules { hosts: &hosts, query_params: &query_params };
+            let summary = vault_ops::add(store.as_ref(), &Tty, registry, name, rules)?;
+            if let Some(note) = vault::hosts::local_note(&summary.hosts) {
+                eprintln!("{note}");
+            }
+            print_json(&summary)
         }
-        Some(("list", _)) => print_json(&vault_ops::list(store.as_ref())?),
+        Some(("list", _)) => print_json(&vault_ops::list(store.as_ref(), registry)?),
+        Some(("allow", m)) => {
+            let (secret, command) = pair(m);
+            let allowed = vault_ops::allow(store.as_ref(), &Tty, registry, &secret, &command)?;
+            print_json(&serde_json::json!({ "secret": secret, "command": command, "allowed": allowed }))
+        }
+        Some(("revoke", m)) => {
+            let (secret, command) = pair(m);
+            let revoked = vault_ops::revoke(store.as_ref(), &Tty, &secret, &command)?;
+            print_json(&serde_json::json!({ "secret": secret, "command": command, "revoked": revoked }))
+        }
         Some(("rm", m)) => {
             let name = m.get_one::<String>("name").expect("required");
             let deleted = vault_ops::remove(store.as_ref(), &Tty, name)?;
