@@ -1,7 +1,9 @@
 //! End-to-end tests for `tb self mcp`: the real binary as an MCP server over stdio.
 
+use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -9,9 +11,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 const WAIT: Duration = Duration::from_secs(15);
+const SECRET: &str = "fake_SUPERSECRET_value_123";
 
 struct Server {
     home: TempDir,
@@ -21,10 +25,67 @@ struct Server {
     messages: Receiver<Value>,
     /// Messages read while waiting for a different one.
     unclaimed: Vec<Value>,
+    /// Kept open while the server runs, so its terminal stays alive.
+    _terminal: Option<Pty>,
+}
+
+enum Session {
+    Detached,
+    /// The way MCP clients start servers: in a session with a controlling terminal, with
+    /// stdin and stdout as pipes.
+    Terminal,
+}
+
+/// The controller side of a pseudo-terminal, and the path of its terminal side.
+struct Pty {
+    controller: libc::c_int,
+    path: CString,
+}
+
+impl Pty {
+    fn open() -> Self {
+        unsafe {
+            let controller = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            assert!(controller >= 0, "posix_openpt: {}", io::Error::last_os_error());
+            assert_eq!(libc::grantpt(controller), 0);
+            assert_eq!(libc::unlockpt(controller), 0);
+            let path = CStr::from_ptr(libc::ptsname(controller)).to_owned();
+            Self { controller, path }
+        }
+    }
+}
+
+impl Drop for Pty {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.controller) };
+    }
+}
+
+/// Runs in the child before exec: a new session whose controlling terminal is `path`, also
+/// used as stderr (clients let servers inherit theirs). Keeping it open keeps it the
+/// controlling terminal: macOS drops that when the last handle closes.
+fn take_terminal(path: &CStr) -> io::Result<()> {
+    unsafe {
+        if libc::setsid() < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = libc::open(path.as_ptr(), libc::O_RDWR);
+        if fd < 0 || libc::ioctl(fd, libc::TIOCSCTTY as _, 0) < 0 || libc::dup2(fd, 2) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if fd != 2 {
+            libc::close(fd);
+        }
+    }
+    Ok(())
 }
 
 impl Server {
     fn start() -> Self {
+        Self::spawn(Session::Detached)
+    }
+
+    fn spawn(session: Session) -> Self {
         let home = tempfile::tempdir().unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_toolbox"));
         cmd.args(["self", "mcp"])
@@ -33,13 +94,24 @@ impl Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        // Detach from any controlling terminal, like an MCP client's child process.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        let terminal = match session {
+            Session::Detached => {
+                // No controlling terminal, like an AI agent's shell.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::setsid();
+                        Ok(())
+                    });
+                }
+                None
+            }
+            Session::Terminal => {
+                let pty = Pty::open();
+                let path = pty.path.clone();
+                unsafe { cmd.pre_exec(move || take_terminal(&path)) };
+                Some(pty)
+            }
+        };
         let mut child = cmd.spawn().unwrap();
         let input = child.stdin.take();
         let output = BufReader::new(child.stdout.take().unwrap());
@@ -52,16 +124,34 @@ impl Server {
                 }
             }
         });
-        Self { home, child, input, messages, unclaimed: Vec::new() }
+        Self { home, child, input, messages, unclaimed: Vec::new(), _terminal: terminal }
     }
 
     /// Starts a server and completes the handshake.
     fn ready() -> Self {
         let mut server = Self::start();
-        let init = server.request(0, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }));
-        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
-        server.notify("notifications/initialized");
+        server.ready_up();
         server
+    }
+
+    fn ready_up(&mut self) {
+        let init = self.request(0, "initialize", json!({ "protocolVersion": "2025-06-18", "capabilities": {} }));
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+        self.notify("notifications/initialized");
+    }
+
+    fn vault_file(&self) -> std::path::PathBuf {
+        self.home.path().join("test-vault.json")
+    }
+
+    /// What `tb self vault allow` stores, written directly: tests have no terminal to say yes on.
+    fn allow(&self, secret: &str, command: &str) {
+        let dir = self.home.path().join("commands").join(command);
+        let manifest = fs::read_to_string(dir.join("command.json")).unwrap();
+        let script = fs::read_to_string(dir.join("run.lua")).unwrap();
+        let mut vault: Value = serde_json::from_slice(&fs::read(self.vault_file()).unwrap()).unwrap();
+        vault["keys"][secret]["commands"][command] = json!(fingerprint(&manifest, &script));
+        fs::write(self.vault_file(), vault.to_string()).unwrap();
     }
 
     fn add_command(&self, name: &str, args: Value, script: &str, permissions: Value) {
@@ -116,6 +206,44 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Mirrors `vault::approval::fingerprint`, like the copy in tests/cli.rs.
+fn fingerprint(manifest: &str, script: &str) -> String {
+    let mut hasher = Sha256::new();
+    for part in [manifest, script] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Serves one request and echoes its Authorization header back as JSON. Sends the whole
+/// request head on the channel.
+fn echo_server() -> (String, Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let head: Vec<String> = BufReader::new(&stream)
+            .lines()
+            .map_while(Result::ok)
+            .take_while(|line| !line.is_empty())
+            .collect();
+        let auth = head
+            .iter()
+            .find_map(|l| l.strip_prefix("authorization: ").or_else(|| l.strip_prefix("Authorization: ")))
+            .unwrap_or("");
+        let body = json!({ "you_sent": auth }).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        tx.send(head.join("\n")).unwrap();
+    });
+    (url, rx)
 }
 
 fn text(reply: &Value, block: usize) -> &str {
@@ -179,19 +307,44 @@ fn bad_calls_come_back_as_errors_the_model_can_read() {
 }
 
 #[test]
-fn vault_keys_still_need_the_users_approval() {
+fn vault_keys_need_approval_and_stay_redacted() {
     let mut server = Server::ready();
-    let vault = json!({ "format": 2, "keys": { "test": { "value": "fake_SUPERSECRET_value_123", "hosts": ["127.0.0.1:9"] } } });
-    fs::write(server.home.path().join("test-vault.json"), vault.to_string()).unwrap();
-    let script = r#"return function()
-        return http.get("http://127.0.0.1:9/", { headers = { Authorization = vault("test") } }).status
+    let (url, received) = echo_server();
+    let host = url.trim_start_matches("http://").trim_end_matches('/');
+    let vault = json!({ "format": 2, "keys": { "test": { "value": SECRET, "hosts": [host] } } });
+    fs::write(server.vault_file(), vault.to_string()).unwrap();
+    let script = r#"return function(args)
+        return http.get(args.url, { headers = { Authorization = "Bearer " .. vault("test") } }).json
     end"#;
-    server.add_command("call", json!({}), script, json!({ "http": ["127.0.0.1"], "vault": ["test"] }));
+    let args = json!({ "url": { "type": "string", "required": true } });
+    server.add_command("call", args, script, json!({ "http": ["127.0.0.1"], "vault": ["test"] }));
 
-    let reply = server.call(1, "call", json!({}));
-    assert_eq!(reply["result"]["isError"], true);
-    assert!(text(&reply, 0).contains("tb self vault allow test call"), "{reply}");
+    let refused = server.call(1, "call", json!({ "url": url }));
+    assert_eq!(refused["result"]["isError"], true);
+    assert!(text(&refused, 0).contains("tb self vault allow test call"), "{refused}");
+
+    server.allow("test", "call");
+    let reply = server.call(2, "call", json!({ "url": url }));
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert!(received.recv_timeout(WAIT).unwrap().contains(SECRET), "the server never got the key");
+    let echoed: Value = serde_json::from_str(text(&reply, 0)).unwrap();
+    assert_eq!(echoed["you_sent"], "Bearer [REDACTED:test]");
     assert!(!reply.to_string().contains("SUPERSECRET"));
+}
+
+#[test]
+fn tool_calls_never_get_the_clients_terminal() {
+    // Otherwise a command allowed to exec `tb` could open a vault prompt on the user's terminal.
+    let mut server = Server::spawn(Session::Terminal);
+    server.ready_up();
+    let script = r#"return function()
+        local out = exec("sh", { "-c", "( exec 3</dev/tty ) 2>/dev/null && echo terminal || echo none" })
+        return (out.stdout:gsub("%s+$", ""))
+    end"#;
+    server.add_command("tty", json!({}), script, json!({ "exec": ["sh"] }));
+
+    let reply = server.call(1, "tty", json!({}));
+    assert_eq!(text(&reply, 0), "\"none\"", "{reply}");
 }
 
 #[test]
@@ -228,17 +381,46 @@ fn new_commands_show_up_without_a_restart() {
     assert_eq!(tools["result"]["tools"][0]["name"], "fresh");
 }
 
+/// A command that sleeps, then leaves a file behind: proof it was not stopped in time.
+fn add_sleeper(server: &Server, name: &str) -> std::path::PathBuf {
+    let out = server.home.path().join(format!("{name}-ran"));
+    let script = format!(r#"return function() time.sleep(2) fs.write("{}", "ran") return "done" end"#, out.display());
+    server.add_command(name, json!({}), &script, json!({ "write": [server.home.path()] }));
+    out
+}
+
 #[test]
-fn closing_stdin_stops_the_server() {
+fn a_cancelled_call_is_stopped_and_gets_no_reply() {
     let mut server = Server::ready();
+    let ran = add_sleeper(&server, "nap");
+
+    server.send(1, "tools/call", json!({ "name": "nap" }));
+    thread::sleep(Duration::from_millis(500));
+    server.write(json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } }));
+    thread::sleep(Duration::from_secs(3));
+
+    assert!(!ran.exists(), "the cancelled call kept running");
+    assert_eq!(server.request(2, "ping", json!({}))["result"], json!({}));
+    assert!(server.unclaimed.iter().all(|m| m["id"] != 1), "a cancelled call was answered");
+}
+
+#[test]
+fn closing_stdin_stops_the_server_and_its_calls() {
+    let mut server = Server::ready();
+    let ran = add_sleeper(&server, "nap");
+    server.send(1, "tools/call", json!({ "name": "nap" }));
+    thread::sleep(Duration::from_millis(500));
+
     server.input = None;
-    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now() + Duration::from_secs(1);
     let status = loop {
         if let Some(status) = server.child.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "server kept running after stdin closed");
+        assert!(Instant::now() < deadline, "server waited for a running call after stdin closed");
         thread::sleep(Duration::from_millis(50));
     };
     assert!(status.success());
+    thread::sleep(Duration::from_secs(3));
+    assert!(!ran.exists(), "a call kept running after the server stopped");
 }

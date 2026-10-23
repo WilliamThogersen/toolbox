@@ -1,7 +1,9 @@
 //! `tb self mcp`: serves the user's commands as MCP tools over stdio
-//! (newline-delimited JSON-RPC 2.0). Built-ins under `tb self` are not exposed, so an MCP
-//! client gets no more than an agent's shell: it can run commands, never manage the vault.
+//! (newline-delimited JSON-RPC 2.0). Built-ins under `tb self` are not exposed, and calls run
+//! without a terminal, so an MCP client gets no more than an agent's shell: it can run
+//! commands, never manage the vault.
 
+mod running;
 mod tools;
 
 use std::io::{self, BufRead, Write};
@@ -13,8 +15,11 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use running::Running;
+
 /// Newest first. A client asking for one of these gets it, anything else gets the newest.
-const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+/// 2025-03-26 is left out: it requires JSON-RPC batches, which this server doesn't take.
+const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2024-11-05"];
 
 /// How often the commands folder is checked, to tell the client when its tools changed.
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
@@ -44,60 +49,98 @@ impl RpcError {
 
 enum Incoming {
     Request { id: Value, method: String, params: Value },
-    Notification { method: String },
+    Notification { method: String, params: Value },
     /// A response to a request we sent. We send none, so there is nothing to do.
     Response,
     Invalid { id: Value, error: RpcError },
 }
 
-/// Reads messages until the client closes stdin. Tool calls run on their own threads, so a slow
-/// command doesn't hold up pings or other calls; replies may come back in any order.
+#[derive(Clone)]
+struct Server {
+    commands_dir: PathBuf,
+    running: Running,
+}
+
+/// Reads messages until the client closes stdin, then stops every call still running: nobody
+/// is left to read the results.
 pub fn serve(commands_dir: &Path) -> Result<ExitCode> {
-    let mut calls: Vec<JoinHandle<()>> = Vec::new();
-    let mut watching = false;
-    for line in io::stdin().lock().lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                send(&reply(Value::Null, Err(RpcError::new(PARSE_ERROR, "message is not UTF-8"))))?;
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        match parse(&line) {
-            Incoming::Request { id, method, params } if method == "tools/call" => {
-                calls.retain(|call| !call.is_finished());
-                let dir = commands_dir.to_path_buf();
-                calls.push(thread::spawn(move || {
-                    // Stdout is gone only when the client is: nobody is left to tell.
-                    let _ = send(&reply(id, tools::call(&dir, &params)));
-                }));
-            }
-            Incoming::Request { id, method, params } => send(&reply(id, handle(commands_dir, &method, &params)))?,
-            Incoming::Notification { method } if method == "notifications/initialized" && !watching => {
-                watching = true;
-                watch(commands_dir.to_path_buf());
-            }
-            Incoming::Notification { .. } | Incoming::Response => {}
-            Incoming::Invalid { id, error } => send(&reply(id, Err(error)))?,
-        }
-    }
+    let server = Server { commands_dir: commands_dir.to_path_buf(), running: Running::default() };
+    let mut calls = Vec::new();
+    let read = server.read_messages(&mut calls);
+    server.running.stop_all();
     for call in calls {
         let _ = call.join();
     }
-    Ok(ExitCode::SUCCESS)
+    read.map(|()| ExitCode::SUCCESS)
 }
 
-fn handle(commands_dir: &Path, method: &str, params: &Value) -> Result<Value, RpcError> {
-    match method {
-        "initialize" => Ok(initialize(params)),
-        "ping" => Ok(json!({})),
-        "tools/list" => tools::list(commands_dir),
-        "tools/call" => tools::call(commands_dir, params),
-        _ => Err(RpcError::new(METHOD_NOT_FOUND, format!("unknown method {method:?}"))),
+impl Server {
+    /// Tool calls run on their own threads, so a slow command doesn't hold up pings or other
+    /// calls; replies may come back in any order.
+    fn read_messages(&self, calls: &mut Vec<JoinHandle<()>>) -> Result<()> {
+        let mut watching = false;
+        for line in io::stdin().lock().lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                    send(&reply(Value::Null, Err(RpcError::new(PARSE_ERROR, "message is not UTF-8"))))?;
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse(&line) {
+                Incoming::Request { id, method, params } if method == "tools/call" => {
+                    calls.retain(|call| !call.is_finished());
+                    calls.push(self.call_in_background(id, params));
+                }
+                Incoming::Request { id, method, params } => {
+                    let outcome = self.handle(&id, &method, &params);
+                    send(&reply(id, outcome))?;
+                }
+                Incoming::Notification { method, params } => match method.as_str() {
+                    "notifications/initialized" if !watching => {
+                        watching = true;
+                        watch(self.commands_dir.clone());
+                    }
+                    "notifications/cancelled" => {
+                        if let Some(id) = params.get("requestId") {
+                            self.running.cancel(&id.to_string());
+                        }
+                    }
+                    _ => {}
+                },
+                Incoming::Response => {}
+                Incoming::Invalid { id, error } => send(&reply(id, Err(error)))?,
+            }
+        }
+        Ok(())
+    }
+
+    fn handle(&self, id: &Value, method: &str, params: &Value) -> Result<Value, RpcError> {
+        match method {
+            "initialize" => Ok(initialize(params)),
+            "ping" => Ok(json!({})),
+            "tools/list" => tools::list(&self.commands_dir),
+            "tools/call" => tools::call(&self.commands_dir, params, &self.running, &id.to_string()),
+            _ => Err(RpcError::new(METHOD_NOT_FOUND, format!("unknown method {method:?}"))),
+        }
+    }
+
+    /// Replies when the call is done, unless the client cancelled it meanwhile.
+    fn call_in_background(&self, id: Value, params: Value) -> JoinHandle<()> {
+        let key = id.to_string();
+        self.running.begin(&key);
+        let server = self.clone();
+        thread::spawn(move || {
+            let outcome = server.handle(&id, "tools/call", &params);
+            if server.running.finish(&key) {
+                // Stdout is gone only when the client is: nobody is left to tell.
+                let _ = send(&reply(id, outcome));
+            }
+        })
     }
 }
 
@@ -115,23 +158,30 @@ fn initialize(params: &Value) -> Value {
 }
 
 fn parse(line: &str) -> Incoming {
-    let invalid = |id: Value, code, message: &str| Incoming::Invalid { id, error: RpcError::new(code, message) };
+    let invalid = |id: Value, message: &str| Incoming::Invalid { id, error: RpcError::new(INVALID_REQUEST, message) };
     let Ok(message) = serde_json::from_str::<Value>(line) else {
-        return invalid(Value::Null, PARSE_ERROR, "message is not valid JSON");
+        return Incoming::Invalid { id: Value::Null, error: RpcError::new(PARSE_ERROR, "message is not valid JSON") };
     };
     let Some(fields) = message.as_object() else {
-        return invalid(Value::Null, INVALID_REQUEST, "expected one JSON-RPC message object (batches are not supported)");
+        return invalid(Value::Null, "expected one JSON-RPC message object (batches are not supported)");
     };
     let method = fields.get("method").and_then(Value::as_str).map(str::to_string);
-    match (method, fields.get("id").cloned()) {
-        (Some(method), Some(id)) => Incoming::Request {
-            id,
-            method,
-            params: fields.get("params").cloned().unwrap_or_else(|| json!({})),
-        },
-        (Some(method), None) => Incoming::Notification { method },
-        (None, Some(_)) if fields.contains_key("result") || fields.contains_key("error") => Incoming::Response,
-        (None, id) => invalid(id.unwrap_or(Value::Null), INVALID_REQUEST, "message has no method"),
+    if method.is_none() && (fields.contains_key("result") || fields.contains_key("error")) {
+        return Incoming::Response;
+    }
+    let id = fields.get("id").cloned();
+    // JSON-RPC ids are strings or numbers, and MCP forbids null.
+    let usable_id = id.clone().filter(|id| id.is_string() || id.is_number());
+    let reply_to = usable_id.clone().unwrap_or(Value::Null);
+    if fields.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return invalid(reply_to, "jsonrpc must be \"2.0\"");
+    }
+    let params = fields.get("params").cloned().unwrap_or_else(|| json!({}));
+    match (method, id, usable_id) {
+        (None, _, _) => invalid(reply_to, "message has no method"),
+        (Some(method), None, _) => Incoming::Notification { method, params },
+        (Some(_), Some(_), None) => invalid(Value::Null, "id must be a string or a number"),
+        (Some(method), Some(_), Some(id)) => Incoming::Request { id, method, params },
     }
 }
 
@@ -176,8 +226,12 @@ mod tests {
     use super::*;
 
     fn request(line: &str) -> Value {
+        let server = Server { commands_dir: PathBuf::from("/definitely/not/here"), running: Running::default() };
         match parse(line) {
-            Incoming::Request { id, method, params } => reply(id, handle(Path::new("/definitely/not/here"), &method, &params)),
+            Incoming::Request { id, method, params } => {
+                let outcome = server.handle(&id, &method, &params);
+                reply(id, outcome)
+            }
             Incoming::Invalid { id, error } => reply(id, Err(error)),
             _ => panic!("not a request: {line}"),
         }
@@ -190,8 +244,10 @@ mod tests {
         assert_eq!(known["result"]["serverInfo"]["name"], "toolbox");
         assert_eq!(known["result"]["capabilities"]["tools"]["listChanged"], true);
 
-        let unknown = request(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#);
-        assert_eq!(unknown["result"]["protocolVersion"], PROTOCOL_VERSIONS[0]);
+        for unsupported in ["1999-01-01", "2025-03-26"] {
+            let line = json!({ "jsonrpc": "2.0", "id": 2, "method": "initialize", "params": { "protocolVersion": unsupported } });
+            assert_eq!(request(&line.to_string())["result"]["protocolVersion"], PROTOCOL_VERSIONS[0]);
+        }
     }
 
     #[test]
@@ -204,18 +260,32 @@ mod tests {
 
     #[test]
     fn protocol_errors_use_json_rpc_codes() {
-        assert_eq!(request(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#)["error"]["code"], METHOD_NOT_FOUND);
-        let unknown_tool = request(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope"}}"#);
-        assert_eq!(unknown_tool["error"]["code"], INVALID_PARAMS);
-        assert_eq!(request("{not json")["error"]["code"], PARSE_ERROR);
-        assert_eq!(request("[]")["error"]["code"], INVALID_REQUEST);
+        let code = |line: &str| request(line)["error"]["code"].clone();
+        assert_eq!(code(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#), METHOD_NOT_FOUND);
+        assert_eq!(code(r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"nope"}}"#), INVALID_PARAMS);
+        assert_eq!(code("{not json"), PARSE_ERROR);
+        assert_eq!(code("[]"), INVALID_REQUEST);
         let no_method = request(r#"{"jsonrpc":"2.0","id":6}"#);
         assert_eq!((no_method["id"].clone(), no_method["error"]["code"].clone()), (json!(6), json!(INVALID_REQUEST)));
     }
 
     #[test]
+    fn requests_need_json_rpc_2_and_a_string_or_number_id() {
+        let missing = request(r#"{"id":1,"method":"ping"}"#);
+        assert_eq!((missing["id"].clone(), missing["error"]["code"].clone()), (json!(1), json!(INVALID_REQUEST)));
+        assert_eq!(request(r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#)["error"]["code"], INVALID_REQUEST);
+        for id in ["null", r#"{"x":1}"#, "[1]", "true"] {
+            let reply = request(&format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#));
+            assert_eq!((reply["id"].clone(), reply["error"]["code"].clone()), (Value::Null, json!(INVALID_REQUEST)), "id {id}");
+        }
+    }
+
+    #[test]
     fn notifications_and_responses_get_no_reply() {
-        assert!(matches!(parse(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), Incoming::Notification { .. }));
+        let cancel = parse(r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}"#);
+        assert!(matches!(cancel, Incoming::Notification { params, .. } if params["requestId"] == 3));
         assert!(matches!(parse(r#"{"jsonrpc":"2.0","id":7,"result":{}}"#), Incoming::Response));
+        assert!(matches!(parse(r#"{"jsonrpc":"2.0","result":{}}"#), Incoming::Response));
+        assert!(matches!(parse(r#"{"error":{"code":1,"message":"x"}}"#), Incoming::Response));
     }
 }

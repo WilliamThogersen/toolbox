@@ -1,11 +1,14 @@
 //! Commands as MCP tools: an input schema from each manifest, and every call run as
 //! `tb <command> --<arg>=<value>` in a child process.
 
+use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use serde_json::{Map, Value, json};
 
+use super::running::Running;
 use super::{INTERNAL_ERROR, INVALID_PARAMS, RpcError};
 use crate::manifest::{ArgSpec, ArgType, Manifest};
 use crate::registry::{self, Registry};
@@ -18,7 +21,7 @@ pub fn list(commands_dir: &Path) -> Result<Value, RpcError> {
 
 /// Unknown tools are protocol errors. Bad arguments and failed runs are tool results with
 /// `isError`, so the model sees the message and can fix its call.
-pub fn call(commands_dir: &Path, params: &Value) -> Result<Value, RpcError> {
+pub fn call(commands_dir: &Path, params: &Value, running: &Running, id: &str) -> Result<Value, RpcError> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -34,7 +37,7 @@ pub fn call(commands_dir: &Path, params: &Value) -> Result<Value, RpcError> {
         Some(_) => return Ok(failure("arguments must be an object")),
     };
     Ok(match cli_args(&def.manifest, arguments) {
-        Ok(args) => run(name, &args),
+        Ok(args) => run(name, &args, running, id),
         Err(problem) => failure(&problem),
     })
 }
@@ -141,16 +144,41 @@ fn flag(name: &str, spec: &ArgSpec, value: &Value) -> Result<Option<String>, Str
     }
 }
 
-/// Runs the command exactly as the CLI would. Its stdin is empty, so a script that reads
-/// stdin can't consume the MCP messages.
-fn run(name: &str, args: &[String]) -> Value {
+/// Runs the command exactly as the CLI would, with two differences. Its stdin is empty, so a
+/// script that reads stdin can't consume the MCP messages. And it gets a session of its own,
+/// with no controlling terminal: MCP clients start servers on their terminal, and the vault
+/// only changes when a person answers on one, so nothing a script starts (like `tb self vault
+/// allow` through `exec`) may reach it.
+fn run(name: &str, args: &[String], running: &Running, id: &str) -> Value {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => return failure(&format!("could not find the toolbox binary: {err}")),
     };
-    match Command::new(exe).arg(name).args(args).stdin(Stdio::null()).output() {
+    let mut command = Command::new(exe);
+    command
+        .arg(name)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: setsid is async-signal-safe, as code between fork and exec must be.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => return failure(&format!("could not start {name}: {err}")),
+    };
+    // A session leader's process group id is its pid.
+    running.started(id, child.id() as libc::pid_t);
+    match child.wait_with_output() {
         Ok(output) => outcome(&output),
-        Err(err) => failure(&format!("could not start {name}: {err}")),
+        Err(err) => failure(&format!("could not run {name}: {err}")),
     }
 }
 
