@@ -45,7 +45,7 @@ on stderr.
 - Unknown fields are errors, so typos are caught by `tb self check`.
 - `permissions` lists everything the script may touch. Anything not listed fails at runtime.
   - `http`: hosts it may call, also when following a redirect. `"*"` allows any host.
-  - `vault`: secret names it may use (see Vault below).
+  - `vault`: secret names it may use, or patterns like `github/*` (see Vault below).
   - `exec`: programs it may run.
   - `env`: environment variables it may read.
   - `read`: folders it may read with `fs`, including everything below them.
@@ -228,9 +228,30 @@ http.get("https://maps.googleapis.com/maps/api/geocode/json", {
 })
 ```
 
+### Several accounts
+
+Keys can sit in folders, up to 3 parts deep: `github/work`, `github/personal`,
+`jira/acme/token`. To let one command work with any account, list a pattern
+in `permissions.vault`, take the account as an arg and build the name:
+
+```json
+"args": { "account": { "type": "string", "default": "personal", "description": "Key under github/" } },
+"permissions": { "http": ["api.github.com"], "vault": ["github/*"] }
+```
+
+```lua
+headers = { Authorization = "Bearer " .. vault("github/" .. args.account) }
+```
+
+`*` stands for exactly one part and never the first: `github/*` covers
+`github/work` but not `github` or `github/work/token` (use `github/*/token` for
+that). The human allows each key on its own: `tb self vault allow github/work <command>`
+does not let the command use `github/personal`. `tb self vault list` shows which
+accounts exist.
+
 Rules:
 
-1. The secret must be listed in `permissions.vault`.
+1. The secret must be listed in `permissions.vault`, or covered by a pattern there.
 2. Placeholders work only in header values and in `query = {...}` values. In the
    URL string or the body they raise an error.
 3. The request must go to a host the human allowed for that secret, over https.

@@ -7,6 +7,7 @@ use mlua::{Lua, LuaSerdeExt, Result, Value, Variadic};
 use super::{lua_error, ser_options};
 use crate::manifest::Permissions;
 use crate::vault::inject::{Encoding, placeholder};
+use crate::vault::names::{self, NAME_RULES};
 
 pub fn install(lua: &Lua, perms: &Permissions) -> Result<()> {
     install_json(lua)?;
@@ -72,10 +73,16 @@ fn install_env(lua: &Lua, allowed: Vec<String>) -> Result<()> {
 }
 
 /// `vault(name)` returns a placeholder, never the value. `vault(name, "base64")`
-/// asks for the value base64-encoded, for Basic auth.
+/// asks for the value base64-encoded, for Basic auth. `name` may be built at run
+/// time, like `"github/" .. args.account`, when a pattern in `declared` covers it.
 fn install_vault(lua: &Lua, declared: Vec<String>) -> Result<()> {
     let vault = lua.create_function(move |_, (name, encoding): (String, Option<String>)| {
-        if !declared.contains(&name) {
+        if !names::is_secret_name(&name) {
+            return Err(mlua::Error::runtime(format!(
+                "{name:?} is not a valid vault key name ({NAME_RULES})"
+            )));
+        }
+        if !names::declared(&declared, &name) {
             return Err(denied("vault", &name));
         }
         let encoding = match encoding.as_deref() {
@@ -155,6 +162,22 @@ mod tests {
         assert_eq!(encoded, "{{vault:github|base64}}");
         assert!(eval_err(&lua, r#"vault("stripe")"#).contains("permissions.vault"));
         assert!(eval_err(&lua, r#"vault("github", "hex")"#).contains("unknown vault encoding"));
+    }
+
+    #[test]
+    fn vault_patterns_cover_one_part() {
+        let lua = lua_with(Permissions {
+            vault: vec!["github/*".into()],
+            ..Permissions::default()
+        });
+        let value: String = lua.load(r#"return vault("github/" .. "work")"#).eval().unwrap();
+        assert_eq!(value, "{{vault:github/work}}");
+        assert!(eval_err(&lua, r#"vault("github")"#).contains("permissions.vault"));
+        assert!(eval_err(&lua, r#"vault("github/work/token")"#).contains("permissions.vault"));
+        for name in ["github/*", "github/Work", "github/../x"] {
+            let err = eval_err(&lua, &format!("vault({name:?})"));
+            assert!(err.contains("not a valid vault key name"), "{name}: {err}");
+        }
     }
 
     #[test]

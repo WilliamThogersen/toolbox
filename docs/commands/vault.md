@@ -32,7 +32,7 @@ have. Commands you allowed stay allowed.
 
 | Argument | Meaning |
 |----------|---------|
-| `<name>` | The name scripts use: `vault("<name>")`. `a-z`, `0-9`, `-`, `_`. |
+| `<name>` | The name scripts use: `vault("<name>")`. `a-z`, `0-9`, `-`, `_`, in up to 3 parts split by `/` for several accounts: `github/work`, `jira/acme/token`. |
 | `--host <host>` | A host the key may be sent to, like `api.github.com`. Repeat it or use commas for several. Add a port to allow only that port: `api.example.com:8443`. No `https://`, path or wildcard. |
 | `--query-param <param>` | A query parameter the key may also be sent in, for APIs that want `?key=...`. Repeat it or use commas for several. Without it, the key only goes in headers. |
 
@@ -43,6 +43,19 @@ $ tb self vault add github --host api.github.com
 Value for github (input is hidden):
 { "name": "github", "hosts": ["api.github.com"], "query_params": [], "commands": [] }
 ```
+
+### Several accounts
+
+Put each account's key in a folder named after the service:
+
+```console
+$ tb self vault add github/work --host api.github.com
+$ tb self vault add github/personal --host api.github.com
+```
+
+A command that lists `"vault": ["github/*"]` can pick one at run time, like `tb gh-stars --account work`. You still
+allow each key on its own: allowing `github/work` doesn't give the command `github/personal`. See
+[Writing commands](../writing-commands.md#several-accounts).
 
 The first time toolbox reads the vault, macOS asks if `toolbox` may use the keychain item `toolbox`. Click
 **Always Allow**. On Linux your keyring may ask for its password if it is locked.
@@ -125,7 +138,7 @@ Allow lighthouse to use pagespeed? [y/N, v = read the whole script]
 | Argument | Meaning |
 |----------|---------|
 | `<secret>` | The key. |
-| `<command>` | The command. It must list the key in `permissions.vault`. |
+| `<command>` | The command. It must list the key in `permissions.vault`, or a pattern covering it like `github/*`. |
 
 ```json
 { "secret": "github", "command": "gh-stars", "allowed": true }

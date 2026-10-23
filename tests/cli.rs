@@ -460,6 +460,75 @@ fn vault_blocks_hosts_the_human_did_not_allow() {
 }
 
 #[test]
+fn one_command_serves_every_account_in_a_folder() {
+    let tb = Toolbox::new();
+    let (url, received) = echo_server();
+    tb.add_secret("svc/work", SECRET, &[host_of(&url)]);
+    tb.add_secret("svc/personal", "fake_PERSONAL_value_456", &[host_of(&url)]);
+    tb.add_command(
+        "call",
+        json!({
+            "name": "call",
+            "description": "Calls a URL as one account",
+            "args": {
+                "url": { "type": "string", "required": true },
+                "account": { "type": "string", "required": true }
+            },
+            "permissions": { "http": ["127.0.0.1"], "vault": ["svc/*"] }
+        }),
+        r#"return function(args)
+            local key = vault("svc/" .. args.account)
+            return http.get(args.url, { headers = { Authorization = "Bearer " .. key } }).json
+        end"#,
+    );
+    tb.allow("svc/work", "call");
+
+    let out = tb.run(&["call", "--url", &url, "--account", "work"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(received.recv().unwrap().contains(&format!("Bearer {SECRET}")));
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["you_sent"], "Bearer [REDACTED:svc/work]");
+
+    let refused = [
+        ("personal", "tb self vault allow svc/personal call"),
+        ("work/token", "permissions.vault"),
+        ("*", "not a valid vault key name"),
+        ("../work", "not a valid vault key name"),
+    ];
+    for (account, why) in refused {
+        let out = tb.run(&["call", "--url", &url, "--account", account]);
+        assert!(!out.status.success(), "{account}");
+        assert!(stderr(&out).contains(why), "{account}: {}", stderr(&out));
+    }
+
+    tb.add_command(
+        "forge",
+        json!({
+            "name": "forge",
+            "description": "Writes the placeholder by hand instead of calling vault()",
+            "args": { "url": { "type": "string", "required": true } },
+            "permissions": { "http": ["127.0.0.1"], "vault": ["svc/*"] }
+        }),
+        r#"return function(args)
+            return http.get(args.url, { headers = { Authorization = "Bearer {{vault:svc/personal}}" } })
+        end"#,
+    );
+    tb.allow("svc/work", "forge");
+    let out = tb.run(&["forge", "--url", &url]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("tb self vault allow svc/personal forge"), "{}", stderr(&out));
+
+    let listed = tb.json(&["self", "vault", "list"]);
+    let access: Vec<(&str, &str)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| (key["name"].as_str().unwrap(), key["commands"][0]["access"].as_str().unwrap()))
+        .collect();
+    assert_eq!(access, [("svc/personal", "not_allowed"), ("svc/work", "allowed")]);
+}
+
+#[test]
 fn exfiltration_attempts_fail() {
     let tb = Toolbox::new();
     tb.add_secret("test", SECRET, &["127.0.0.1:9"]);

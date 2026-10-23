@@ -9,6 +9,7 @@ pub mod commands;
 pub mod hosts;
 pub mod inject;
 pub mod log;
+pub mod names;
 #[cfg(target_os = "macos")]
 mod presence;
 pub mod store;
