@@ -515,6 +515,9 @@ fn spy_proxy() -> (String, Arc<AtomicBool>) {
         for stream in listener.incoming().flatten() {
             flag.store(true, Ordering::SeqCst);
             let mut stream = stream;
+            // Closing with the request unread resets the connection, which macOS can report
+            // to the client as EINVAL before it reads the response.
+            read_head(&stream);
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         }
     });
