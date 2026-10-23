@@ -1,6 +1,9 @@
 # tb self vault
 
-API keys that commands can use but never see. The keys live in the macOS Keychain.
+API keys that commands can use but never see. The keys live in the macOS Keychain, or on Linux in the Secret
+Service (GNOME Keyring, KWallet). Without a Secret Service (a server, a container, SSH without a session bus) the
+vault commands fail and say so. On Linux any program running as you can read the vault while your keyring is
+unlocked: see [Security](../security.md#what-it-does-not-protect-against).
 
 ```
 tb self vault add <name> --host <host>... [--query-param <param>...]
@@ -39,7 +42,7 @@ Value for github (input is hidden):
 ```
 
 The first time toolbox reads the vault, macOS asks if `toolbox` may use the keychain item `toolbox`. Click
-**Always Allow**.
+**Always Allow**. On Linux your keyring may ask for its password if it is locked.
 
 ### Keys for a server on this computer
 

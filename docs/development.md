@@ -49,13 +49,40 @@ The tape uses a throwaway `TOOLBOX_HOME` in `/tmp/toolbox-demo`, the plain-text 
 The tag's message becomes the GitHub release notes. Git drops lines that start with `#`, so use `**bold**` lines
 instead of Markdown headings.
 
-The [release workflow](../.github/workflows/release.yml) runs the tests, builds a signed universal macOS binary,
-publishes the GitHub release and updates the formula in
-[WilliamThogersen/homebrew-tap](https://github.com/WilliamThogersen/homebrew-tap). It stops if the tag doesn't
-match the version in `Cargo.toml`.
+The [release workflow](../.github/workflows/release.yml) stops if the tag doesn't match the version in
+`Cargo.toml`. Then it runs the tests and builds on each platform:
+
+| Asset | Built on | What |
+|-------|----------|------|
+| `toolbox-macos.tar.gz` | `macos-latest` | One universal binary (Apple Silicon and Intel), signed with the hardened runtime |
+| `toolbox-linux-x86_64.tar.gz` | `ubuntu-24.04` | Static musl binary, runs on any distribution whatever its glibc |
+| `toolbox-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | The same for arm64 |
+
+Each Linux build runs on a native runner for its architecture, so the tests run there too, against the musl
+target that ships. When all three pass, it publishes the GitHub release with the archives and `SHA256SUMS`, and
+renders [`.github/homebrew/toolbox.rb`](../.github/homebrew/toolbox.rb) (one url and sha256 per platform) into the
+formula in [WilliamThogersen/homebrew-tap](https://github.com/WilliamThogersen/homebrew-tap).
 
 After each release, and every Monday, [brew-check](../.github/workflows/brew-check.yml) installs toolbox from the tap
-on a clean Mac and fails if it isn't the latest release. Run it by hand with `gh workflow run brew-check.yml`.
+on a clean Mac and on clean Linux runners (x86_64 and arm64), and fails if it isn't the latest release, or if
+`brew test` or `brew audit --strict` fail. On macOS it also checks the hardened runtime, on Linux that the binary is
+static and that the vault refuses to work without a Secret Service. Run it by hand with
+`gh workflow run brew-check.yml`.
+
+## CI
+
+[ci](../.github/workflows/ci.yml) runs `cargo test` and `cargo clippy --all-targets -- -D warnings` on macOS and
+Linux for every push to `main` and every pull request.
+
+To run the suite on Linux from a Mac, use a container with its own target folder (never share `target/` with the
+host):
+
+```bash
+docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1-bookworm \
+  bash -c 'cargo test && rustup component add clippy && cargo clippy --all-targets -- -D warnings'
+```
+
+The image's rustup installs the pinned toolchain without clippy, hence the `rustup component add`.
 
 ## Project layout
 
@@ -68,7 +95,7 @@ on a clean Mac and fails if it isn't the latest release. Run it by hand with `gh
 | `src/install/` | Install from git repos and marketplaces, version-aware updates, `.source.json` |
 | `src/mcp/` | `tb self mcp`: commands as MCP tools over stdio |
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
-| `src/vault/` | Keychain storage, placeholder injection, redaction, `vault` subcommands |
+| `src/vault/` | OS store (Keychain, Secret Service), placeholder injection, redaction, `vault` subcommands |
 | `src/update.rs` | Once-a-day new-version notice on the terminal |
 | `docs/` | These docs. `docs/writing-commands.md` is printed by `tb self guide` |
 | `assets/demo/` | The VHS tape and the command behind the README's demo GIF |

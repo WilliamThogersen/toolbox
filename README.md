@@ -45,7 +45,8 @@ Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 brew install WilliamThogersen/tap/toolbox
 ```
 
-This installs `toolbox` and `tb` (macOS, Apple Silicon and Intel). Update with `brew upgrade toolbox`.
+This installs `toolbox` and `tb` (macOS on Apple Silicon and Intel, Linux on x86_64 and arm64). Update with
+`brew upgrade toolbox`.
 
 When a new version is out, `tb` says so on your terminal. It asks GitHub at most once a day, and only when a
 person is at the terminal: agents and pipes never see the notice. Set `TOOLBOX_NO_UPDATE_CHECK=1` to turn it off.
