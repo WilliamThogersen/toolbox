@@ -32,7 +32,8 @@ on stderr.
     "env":   ["HOME"],
     "read":  ["~/notes"],
     "write": ["."]
-  }
+  },
+  "limits": { "cpu_seconds": 120, "memory_mb": 1024 }
 }
 ```
 
@@ -51,6 +52,11 @@ on stderr.
   - `write`: folders it may create, change and delete files in with `fs` (and read).
     For both, `~` is the home folder and a relative path like `"."` is the folder
     `tb` runs in. Ask for the narrowest folder that works.
+- `limits` is optional. Without it a run may use 60 seconds of CPU time and 512 MB
+  of memory for Lua values, so a runaway loop ends with an error instead of hanging.
+  Raise them only if the command needs it: `cpu_seconds` (up to 86400) and
+  `memory_mb` (up to 65536). Waiting for `http` or `exec` uses no CPU time. A script
+  that catches the CPU-time error with `pcall` and keeps going is stopped anyway.
 
 ## run.lua
 
@@ -111,13 +117,22 @@ local out = exec("git", { "status", "--short" })
 local out = exec("jq", { ".name" }, {
   stdin = json.encode(data),  -- text sent to the program's stdin
   cwd = "/path/to/repo",      -- folder it runs in
-  env = { NO_COLOR = "1" },   -- extra environment variables
+  env = { NO_COLOR = "1" },   -- extra environment variables (see below for what's refused)
   timeout = 10,               -- seconds; then it and all it started are killed, and exec raises an error
 })
 ```
 
 No shell: pass args as a list. The program must be in `permissions.exec`. A
-non-zero exit is not an error: check `out.ok`.
+non-zero exit is not an error: check `out.ok`. toolbox finds the program with its
+own `PATH` (a path like `./tool` means the folder `tb` runs in), so `cwd` and `env`
+can't swap in another one. `env` can't set `PATH`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`,
+`SHELLOPTS`, `BASHOPTS` or `PS4`, since they change which code runs, and names must
+not be empty or contain `=`.
+
+The program doesn't get toolbox's whole environment. It gets `PATH`, `HOME`, `USER`,
+`LOGNAME`, `LANG`, `LC_*`, `TMPDIR`, `TERM` and `TZ`, plus the variables listed in
+`permissions.env` and those you pass in `env`. Nothing else, so a token in your shell
+only reaches a program when the command declares it.
 
 ### fs
 

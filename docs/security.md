@@ -12,8 +12,8 @@ Everything that touches the outside goes through globals that are each gated by 
 | Permission | Lets the command |
 |------------|------------------|
 | `http` | Call these hosts. Redirects are only followed to them too. `"*"` means any host. |
-| `exec` | Run these programs, with any arguments, without a shell. |
-| `env` | Read these environment variables. |
+| `exec` | Run these programs, with any arguments, without a shell. They get only basic variables like `PATH` and `HOME`, plus those in `env`. |
+| `env` | Read these environment variables, and pass them to programs it runs. |
 | `vault` | Use these keys in HTTP requests once you allow the command, never read them. |
 | `read` | Read files in these folders and below. |
 | `write` | Create, change and delete files in these folders and below (and read them). |
@@ -21,6 +21,9 @@ Everything that touches the outside goes through globals that are each gated by 
 `fs` checks every path after resolving symlinks, so a link inside an allowed folder can't lead outside it. `~` is your
 home folder and a relative entry like `"."` is the folder you run `tb` in, so the same command can reach different
 files depending on where it runs.
+
+Every run is capped at 60 seconds of CPU time and 512 MB of memory for Lua values, unless its `command.json` asks
+for more under `limits`. A script that hits the CPU limit and catches the error is stopped anyway.
 
 A command with no permissions can only compute and return JSON. It can still read what you pipe into it
 (`stdin.read()`), and use the clock and pure helpers (`time`, `base64`, `url`, `hash`).
@@ -68,13 +71,17 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
   named), only for hosts you allowed, only over https (http for this computer only). Keys for this computer are
   bound to one address and port, like `127.0.0.1:8080`, so a program can't open its own port, or the other address
   family behind `localhost`, to catch a key.
-- **No downgrades.** Older versions of toolbox, which don't know about approvals, see an empty vault once this
-  version has saved it, even if the Keychain still trusts them.
+- **No downgrades.** Once this version has saved the vault, older versions can't use it, even if the Keychain
+  still trusts them: 0.3.0 and older, which don't know about approvals, see an empty vault, and 0.4.0 to 0.6.0,
+  which don't ask for Touch ID, refuse to open it.
 - **No detours.** Requests that carry a key ignore redirects and `HTTP_PROXY`-style env vars.
-- **No echoes.** A key that shows up in a response (raw, base64 or URL-encoded) is replaced with `[REDACTED:<name>]`.
-- **A human makes every change.** Adding, changing, allowing and removing need a real terminal (`/dev/tty`). An
-  AI's shell has none. The approval prompt escapes terminal control codes and bidi characters, so a script can't
-  hide lines from you.
+- **No echoes.** A key that shows up in a response (raw, base64, URL-encoded, or written with JSON escapes like
+  `\u0074`) is replaced with `[REDACTED:<name>]`, in `res.body`, `res.headers` and `res.json`.
+- **A human makes every change.** Adding, changing, allowing and removing ask at the terminal (`/dev/tty`), then
+  macOS asks for Touch ID or your login password in its own dialog, which names the change: "toolbox is trying to
+  let the command gh-prs use the API key github". An agent can fake a terminal (`script`, `expect`), but it can't
+  answer that dialog. The approval and install prompts escape terminal control codes and bidi characters, so a
+  manifest or script can't hide lines from you.
 - **Other programs get asked (macOS).** The vault is one macOS Keychain item, so tools like the `security` CLI
   trigger a permission prompt. Linux has no such prompt: see "Other programs on Linux" below.
 - **No injection.** macOS release binaries are signed with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and
@@ -91,6 +98,9 @@ shell, or an AI app like `claude`). An agent can edit that file, but not the cop
 - **A rebuilt toolbox.** If an AI edits the Rust source and rebuilds it, the new binary can do anything. macOS asks
   again before a changed binary reads the keychain: only click Allow right after you installed or upgraded toolbox
   yourself.
+- **A Touch ID prompt you didn't expect.** An agent can start a vault change and make macOS ask you. Read the
+  sentence in the dialog: if you didn't start that change, cancel it and look at
+  [`tb self vault log`](commands/vault.md#tb-self-vault-log), which shows the programs that started it.
 - **A host that echoes the key in a changed form** (part of it, hashed, re-encoded). Redaction only catches exact
   copies.
 - **A command you allowed to use a key.** It can do anything the key allows on the hosts you bound it to. A command

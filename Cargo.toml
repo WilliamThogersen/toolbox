@@ -27,5 +27,10 @@ url = "2"
 
 # The vault is macOS only: it needs a store that asks before another program reads it, which
 # the Linux Secret Service doesn't. `v1` picks the Keychain and never falls back to another store.
+# The objc2 crates reach LocalAuthentication, for the Touch ID check before every vault change.
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 keyring = { version = "4", default-features = false, features = ["v1"] }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext"] }

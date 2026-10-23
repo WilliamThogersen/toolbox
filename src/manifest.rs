@@ -12,6 +12,10 @@ pub const RESERVED_NAMES: &[&str] = &["self", "help"];
 
 const MAX_NAME_LEN: usize = 64;
 
+/// The most a command can ask for in `limits`: a day of CPU time, 64 GB of memory.
+pub const MAX_CPU_SECONDS: f64 = 24.0 * 60.0 * 60.0;
+pub const MAX_MEMORY_MB: u64 = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -24,6 +28,37 @@ pub struct Manifest {
     pub args: BTreeMap<String, ArgSpec>,
     #[serde(default)]
     pub permissions: Permissions,
+    /// More CPU time or memory than the defaults, for a command that needs it.
+    #[serde(default, skip_serializing_if = "Limits::is_default")]
+    pub limits: Limits,
+}
+
+/// What a command may use. Unset means the default (60 seconds of CPU, 512 MB).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
+}
+
+impl Limits {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn problems(&self) -> Vec<String> {
+        let cpu = self
+            .cpu_seconds
+            .filter(|secs| !(*secs > 0.0 && *secs <= MAX_CPU_SECONDS))
+            .map(|secs| format!("limits.cpu_seconds {secs} must be above 0 and at most {MAX_CPU_SECONDS}"));
+        let memory = self
+            .memory_mb
+            .filter(|mb| !(1..=MAX_MEMORY_MB).contains(mb))
+            .map(|mb| format!("limits.memory_mb {mb} must be between 1 and {MAX_MEMORY_MB}"));
+        cpu.into_iter().chain(memory).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -122,6 +157,7 @@ impl Manifest {
         for (kind, folders) in [("read", &self.permissions.read), ("write", &self.permissions.write)] {
             problems.extend(folders.iter().filter_map(|folder| validate_folder(kind, folder)));
         }
+        problems.extend(self.limits.problems());
         problems
     }
 }
@@ -254,6 +290,25 @@ mod tests {
         assert!(problems.contains("permissions.read must not contain empty paths"), "{problems}");
         assert!(problems.contains("not ~user"), "{problems}");
         assert!(!problems.contains("~/notes"), "{problems}");
+    }
+
+    #[test]
+    fn limits_are_optional_and_checked() {
+        let none = Manifest::parse(r#"{"name":"a","description":"x"}"#).unwrap();
+        assert_eq!(none.limits, Limits::default());
+        assert!(!serde_json::to_string(&none).unwrap().contains("limits"));
+
+        let more = Manifest::parse(r#"{"name":"a","description":"x","limits":{"cpu_seconds":300,"memory_mb":2048}}"#).unwrap();
+        assert_eq!(more.limits, Limits { cpu_seconds: Some(300.0), memory_mb: Some(2048) });
+        assert!(more.validate("a").is_empty());
+
+        let bad = Manifest::parse(r#"{"name":"a","description":"x","limits":{"cpu_seconds":0,"memory_mb":0}}"#).unwrap();
+        let problems = bad.validate("a").join("\n");
+        assert!(problems.contains("limits.cpu_seconds 0 must be above 0"), "{problems}");
+        assert!(problems.contains("limits.memory_mb 0 must be between 1"), "{problems}");
+        let huge = Manifest::parse(r#"{"name":"a","description":"x","limits":{"cpu_seconds":1e9}}"#).unwrap();
+        assert!(!huge.validate("a").is_empty());
+        assert!(Manifest::parse(r#"{"name":"a","description":"x","limits":{"cpu":1}}"#).is_err());
     }
 
     #[test]

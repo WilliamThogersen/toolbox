@@ -15,8 +15,9 @@ tb self vault rm <name>
 tb self vault log [--key <key>] [--command <command>] [--limit <n>]
 ```
 
-Every change needs a person at a real terminal. An AI agent's shell has none, so it can't add, change, allow or
-delete anything.
+Every change asks twice: at the terminal, then in a macOS dialog for Touch ID or your login password that says
+what is about to change. An AI agent's shell has no terminal, and an agent that fakes one still can't answer the
+dialog. Over SSH there is no dialog, so changes need the Mac itself.
 
 A key is used only when three things line up:
 
@@ -69,8 +70,9 @@ use `vault("<name>", "base64")` in the command. See
 
 ### Older versions of toolbox
 
-The vault's stored format changed so that toolbox 0.3.0 and older, which know nothing about approvals, can't use your
-keys without them. Once you add, allow, revoke or remove anything with this version, an older one sees an empty vault.
+The vault's stored format changed so older versions can't skip rules they don't know: 0.3.0 and older know nothing
+about approvals, and 0.4.0 to 0.6.0 don't ask for Touch ID. Once you add, allow, revoke or remove anything with this
+version, 0.3.0 sees an empty vault and 0.4.0 to 0.6.0 refuse to open it.
 
 ## tb self vault list
 

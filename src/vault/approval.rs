@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 
 use super::SecretEntry;
 use crate::install::confirm;
-use crate::manifest::Permissions;
 use crate::registry::{CommandDef, Registry};
+use crate::screen::{one_line, one_line_permissions, printable};
 
 /// The command asking to use secrets, as it is about to run.
 #[derive(Debug, Clone)]
@@ -182,39 +182,6 @@ fn has_word(line: &str, word: &str) -> bool {
         let after = line[at + word.len()..].chars().next();
         !before.is_some_and(ident) && !after.is_some_and(ident)
     })
-}
-
-/// Only the script may span lines. A newline in a manifest field could print a
-/// fake line, like a second, harmless-looking `permissions:`.
-fn one_line(text: &str) -> String {
-    text.replace('\n', "\\n").replace('\t', "\\t")
-}
-
-fn one_line_permissions(perms: &Permissions) -> Permissions {
-    let all = |values: &[String]| values.iter().map(|v| one_line(v)).collect();
-    Permissions {
-        http: all(&perms.http),
-        vault: all(&perms.vault),
-        exec: all(&perms.exec),
-        env: all(&perms.env),
-        read: all(&perms.read),
-        write: all(&perms.write),
-    }
-}
-
-/// Escapes characters that could hide or reorder text on a terminal: ANSI
-/// escapes, carriage returns and bidi overrides ("Trojan Source").
-fn printable(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            let hidden = (c.is_control() && c != '\n' && c != '\t')
-                || matches!(
-                    c,
-                    '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
-                );
-            if hidden { c.escape_unicode().to_string() } else { c.to_string() }
-        })
-        .collect()
 }
 
 #[cfg(test)]

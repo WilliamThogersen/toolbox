@@ -19,9 +19,14 @@ pub const TEST_VAULT_ENV: &str = "TOOLBOX_INSECURE_TEST_VAULT";
 
 /// The stored shape. Version 2 keeps keys under `keys` where version 1 had
 /// `secrets`, so toolbox 0.3.0, which knows nothing of command approvals or port
-/// rules, reads an empty vault instead of using keys without them. Unknown fields
-/// and versions are refused, so a newer toolbox's vault fails closed here too.
-const FORMAT: u32 = 2;
+/// rules, reads an empty vault instead of using keys without them. Version 3 has the
+/// same shape, but 0.4.0 to 0.6.0 only open version 2, and they would change the
+/// vault without asking for Touch ID. Unknown fields and versions are refused, so a
+/// newer toolbox's vault fails closed here too.
+const FORMAT: u32 = 3;
+
+/// Older versions this one still opens. The next save writes `FORMAT`.
+const READABLE_FORMATS: [u32; 2] = [2, FORMAT];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,7 +78,7 @@ pub fn decode(raw: &str) -> Result<VaultData> {
     }
     let stored: Stored = serde_json::from_value(value)?;
     ensure!(
-        stored.format == FORMAT,
+        READABLE_FORMATS.contains(&stored.format),
         "the vault was saved by a newer toolbox (format {}). Upgrade toolbox",
         stored.format
     );
@@ -84,7 +89,9 @@ pub fn decode(raw: &str) -> Result<VaultData> {
 
 pub trait VaultStore {
     fn load(&self) -> Result<VaultData>;
-    fn save(&self, data: &VaultData) -> Result<()>;
+    /// `change` says what the person approves, like `delete the API key github`. The
+    /// Keychain store shows it in the Touch ID dialog it needs before every write.
+    fn save(&self, data: &VaultData, change: &str) -> Result<()>;
 }
 
 pub fn default_store() -> Box<dyn VaultStore> {
@@ -138,8 +145,10 @@ impl VaultStore for KeychainStore {
         }
     }
 
-    fn save(&self, data: &VaultData) -> Result<()> {
+    fn save(&self, data: &VaultData, change: &str) -> Result<()> {
         let raw = encode(data)?;
+        // Asked here, in the store, so no way of changing the real vault skips it.
+        super::presence::confirm(change)?;
         Self::entry()?
             .set_password(&raw)
             .map_err(|e| anyhow!("could not write the vault to the macOS Keychain: {e}"))
@@ -164,12 +173,12 @@ impl VaultStore for Unsupported {
         Err(anyhow!(UNSUPPORTED))
     }
 
-    fn save(&self, _data: &VaultData) -> Result<()> {
+    fn save(&self, _data: &VaultData, _change: &str) -> Result<()> {
         Err(anyhow!(UNSUPPORTED))
     }
 }
 
-/// Plain JSON file. Never use for real keys.
+/// Plain JSON file, which never asks for Touch ID. Never use for real keys.
 pub struct FileStore {
     pub path: PathBuf,
 }
@@ -184,7 +193,7 @@ impl VaultStore for FileStore {
         decode(&raw).context("could not read the test vault file")
     }
 
-    fn save(&self, data: &VaultData) -> Result<()> {
+    fn save(&self, data: &VaultData, _change: &str) -> Result<()> {
         fs::write(&self.path, encode(data)?)
             .with_context(|| format!("could not write {}", self.path.display()))
     }
@@ -193,6 +202,8 @@ impl VaultStore for FileStore {
 #[cfg(test)]
 pub struct MemoryStore {
     pub data: std::cell::RefCell<VaultData>,
+    /// What each save said it changes, in order.
+    pub changes: std::cell::RefCell<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -200,6 +211,7 @@ impl MemoryStore {
     pub fn new(data: VaultData) -> Self {
         Self {
             data: std::cell::RefCell::new(data),
+            changes: std::cell::RefCell::new(Vec::new()),
         }
     }
 }
@@ -210,8 +222,9 @@ impl VaultStore for MemoryStore {
         Ok(self.data.borrow().clone())
     }
 
-    fn save(&self, data: &VaultData) -> Result<()> {
+    fn save(&self, data: &VaultData, change: &str) -> Result<()> {
         *self.data.borrow_mut() = data.clone();
+        self.changes.borrow_mut().push(change.to_string());
         Ok(())
     }
 }
@@ -237,7 +250,7 @@ mod tests {
                 commands: [("stars".to_string(), "fp".to_string())].into(),
             },
         );
-        store.save(&data).unwrap();
+        store.save(&data, "test").unwrap();
         let none = crate::registry::Registry::default();
         assert_eq!(store.load().unwrap().summaries(&none), data.summaries(&none));
     }
@@ -255,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn version_2_hides_keys_from_toolbox_0_3() {
+    fn saved_vaults_hide_keys_from_older_toolboxes() {
         let data = VaultData::default().with_secret(
             "gh",
             SecretEntry {
@@ -266,7 +279,8 @@ mod tests {
             },
         );
         let raw: serde_json::Value = serde_json::from_str(&encode(&data).unwrap()).unwrap();
-        assert_eq!(raw["format"], 2);
+        // 0.4.0 to 0.6.0 only open format 2 and save without asking for Touch ID.
+        assert_eq!(raw["format"], 3);
         assert!(raw.get("secrets").is_none(), "0.3.0 reads `secrets`: {raw}");
         assert!(raw["keys"]["gh"].is_object());
     }
@@ -276,15 +290,21 @@ mod tests {
     fn outside_macos_the_vault_refuses_to_keep_keys() {
         let err = os_store().load().unwrap_err().to_string();
         assert!(err.starts_with("the vault only works on macOS"), "{err}");
-        assert!(os_store().save(&VaultData::default()).is_err());
+        assert!(os_store().save(&VaultData::default(), "test").is_err());
+    }
+
+    #[test]
+    fn format_2_still_loads() {
+        let raw = r#"{"format":2,"keys":{"gh":{"value":"super-secret-token","hosts":["x.com"]}}}"#;
+        assert_eq!(decode(raw).unwrap().get("gh").unwrap().hosts, vec!["x.com"]);
     }
 
     #[test]
     fn newer_or_unknown_shapes_are_refused() {
         let base = r#""value":"super-secret-token","hosts":["x.com"]"#;
         for bad in [
-            r#"{"format":3,"keys":{}}"#.to_string(),
-            r#"{"format":2,"keys":{},"rules":{}}"#.to_string(),
+            r#"{"format":4,"keys":{}}"#.to_string(),
+            r#"{"format":3,"keys":{},"rules":{}}"#.to_string(),
             format!(r#"{{"format":2,"keys":{{"gh":{{{base},"methods":["GET"]}}}}}}"#),
         ] {
             assert!(decode(&bad).is_err(), "{bad}");
