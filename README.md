@@ -99,6 +99,14 @@ $ tb stars --repo rust-lang/rust
 
 Next: [Writing commands](docs/writing-commands.md) has every `command.json` field and the full Lua API.
 
+Or start from ready-made ones: the [starter marketplace](https://github.com/WilliamThogersen/toolbox-commands) has
+`crate`, `npm`, `pypi`, `weather`, `hn`, `gh-repo` and `gh-prs`.
+
+```console
+$ tb self market add starter https://github.com/WilliamThogersen/toolbox-commands.git
+$ tb self install starter/weather
+```
+
 ## How the vault works
 
 You store a key once, at your own terminal, and say which hosts it may go to. A script asks for it by name and only
