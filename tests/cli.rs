@@ -553,6 +553,9 @@ fn spy_proxy() -> (String, Arc<AtomicBool>) {
         for stream in listener.incoming().flatten() {
             flag.store(true, Ordering::SeqCst);
             let mut stream = stream;
+            // Answer after the request: closing first can make the client's socket setup
+            // fail with EINVAL on macOS before it sends anything.
+            read_head(&stream);
             let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
         }
     });
