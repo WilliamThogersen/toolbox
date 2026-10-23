@@ -45,7 +45,7 @@ A closed stdout pipe (`tb ... | head`) is not an error.
 | Can | Can't |
 |-----|-------|
 | Write commands, run them, check them | Read a key's value |
-| Use keys in commands the human allowed, for hosts the human allowed | Add, change, allow or delete keys (needs a real terminal) |
+| Use keys in commands the human allowed, for hosts the human allowed | Add, change, allow or delete keys (needs your Touch ID or password) |
 | Search marketplaces | Install or update without `--yes` (it gets the permission list instead) |
 | Uninstall installed commands | Delete commands the human made |
 

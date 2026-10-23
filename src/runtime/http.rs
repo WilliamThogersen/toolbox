@@ -418,7 +418,10 @@ fn run<S: AsSendBody>(
     agent.run(request)
 }
 
-/// Scrubs secrets first, then parses JSON from the scrubbed text.
+/// Scrubs secrets first, then parses JSON from the scrubbed text. A key written with
+/// JSON escapes (`token`, `a\/b`) only shows up once parsed, so then the parsed
+/// strings are scrubbed too and the body is rewritten from them: neither `res.json`
+/// nor `json.decode(res.body)` can hand the script the key.
 fn redact_response(redactor: &Redactor, response: ResponseData) -> ResponseData {
     let body = redactor.redact(&response.body);
     let headers = response
@@ -426,12 +429,44 @@ fn redact_response(redactor: &Redactor, response: ResponseData) -> ResponseData 
         .into_iter()
         .map(|(name, value)| (name, redactor.redact(&value)))
         .collect();
-    let json = parse_json(&body);
+    let (body, json) = match parse_json(&body) {
+        Some(value) if json_has_secret(redactor, &value) => {
+            let clean = redact_json(redactor, value);
+            (clean.to_string(), Some(clean))
+        }
+        parsed => (body, parsed),
+    };
     ResponseData {
         status: response.status,
         headers,
         body,
         json,
+    }
+}
+
+fn json_has_secret(redactor: &Redactor, value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => redactor.finds(text),
+        serde_json::Value::Array(items) => items.iter().any(|item| json_has_secret(redactor, item)),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| redactor.finds(key) || json_has_secret(redactor, item)),
+        _ => false,
+    }
+}
+
+fn redact_json(redactor: &Redactor, value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => serde_json::Value::String(redactor.redact(&text)),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(|item| redact_json(redactor, item)).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, item)| (redactor.redact(&key), redact_json(redactor, item)))
+                .collect(),
+        ),
+        other => other,
     }
 }
 
@@ -485,6 +520,7 @@ fn send_to_lua(lua: &Lua, client: &HttpClient, spec: RequestSpec) -> mlua::Resul
 mod tests {
     use super::*;
     use crate::vault::store::MemoryStore;
+    use crate::vault::{SecretEntry, SecretValue};
 
     fn client(http: &[&str], vault: &[&str]) -> HttpClient {
         let perms = Permissions {
@@ -695,6 +731,43 @@ mod tests {
             format!("{err:#}"),
             r#"127.0.0.1 redirected to another host: host "evil.example" is not listed in this command's permissions.http"#
         );
+    }
+
+    fn redactor_for(secret: &str) -> Redactor {
+        let entry = SecretEntry {
+            value: SecretValue::new(secret.into()).unwrap(),
+            hosts: vec![],
+            query_params: vec![],
+            commands: BTreeMap::new(),
+        };
+        Redactor::new(&VaultData::default().with_secret("k", entry))
+    }
+
+    fn with_body(body: &str) -> ResponseData {
+        ResponseData {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: body.into(),
+            json: None,
+        }
+    }
+
+    #[test]
+    fn keys_in_json_escapes_are_redacted_in_json_and_body() {
+        let redactor = redactor_for("abcd/efgh_1234");
+        // PHP escapes every `/`, and any character may be written as \uXXXX.
+        let clean = redact_response(&redactor, with_body(r#"{"a":"abcd\/efgh_1234","b":"\u0061bcd/efgh_1234","n":1}"#));
+        let expected = serde_json::json!({ "a": "[REDACTED:k]", "b": "[REDACTED:k]", "n": 1 });
+        assert_eq!(clean.json.as_ref(), Some(&expected));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&clean.body).unwrap(), expected, "{}", clean.body);
+    }
+
+    #[test]
+    fn bodies_without_a_key_keep_their_exact_text() {
+        let body = "{ \"a\" : \"x\\/y\",\n  \"n\": 1 }";
+        let clean = redact_response(&redactor_for("abcd/efgh_1234"), with_body(body));
+        assert_eq!(clean.body, body);
+        assert_eq!(clean.json, Some(serde_json::json!({ "a": "x/y", "n": 1 })));
     }
 
     #[test]

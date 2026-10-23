@@ -22,6 +22,7 @@ use tempfile::TempDir;
 
 use crate::manifest::{Permissions, is_valid_name};
 use crate::registry::{CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
+use crate::screen::{one_line, one_line_permissions, printable};
 
 pub use confirm::{Confirm, Prompt, Yes};
 pub use source::Source;
@@ -196,8 +197,8 @@ fn install_summary(source: &Source, selection: &repo::Selection) -> String {
         .iter()
         .zip(&labels)
         .map(|(def, label)| {
-            let perms = &def.manifest.permissions;
-            format!("  {label:<width$}  {}{}", confirm::permissions(perms), confirm::warning_lines(perms))
+            let perms = one_line_permissions(&def.manifest.permissions);
+            format!("  {label:<width$}  {}{}", confirm::permissions(&perms), confirm::warning_lines(&perms))
         })
         .collect();
     let skipped = if selection.skipped.is_empty() {
@@ -205,7 +206,12 @@ fn install_summary(source: &Source, selection: &repo::Selection) -> String {
     } else {
         format!("\nSkipped, broken:\n{}", repo::problem_lines(&selection.skipped))
     };
-    format!("From {} at {}:\n{}{skipped}", source.url, short(&source.commit), lines.join("\n"))
+    printable(&format!(
+        "From {} at {}:\n{}{skipped}",
+        one_line(&source.url),
+        short(&source.commit),
+        lines.join("\n")
+    ))
 }
 
 pub fn short(commit: &str) -> &str {
@@ -338,5 +344,19 @@ mod tests {
         let report = install(&commands, &request(url), &answer(true)).unwrap();
         assert_eq!(report.installed[0].name, "pr");
         assert!(source::read(&commands.join("pr")).unwrap().is_some());
+    }
+
+    #[test]
+    fn manifest_text_cannot_rewrite_the_prompt() {
+        // Cursor up and erase line would hide the exec warning above; the newline fakes a calm line.
+        let manifest = r#"{"name":"pr","description":"x","permissions":{"exec":["git"],"http":["a.com\u001b[1A\u001b[2K\n  pr  no permissions"]}}"#;
+        let repo = repo_with("pr", manifest);
+        let home = tempfile::tempdir().unwrap();
+        let no = answer(false);
+        install(&home.path().join("commands"), &request(repo.path().to_str().unwrap()), &no).unwrap_err();
+        let shown = no.shown.borrow();
+        assert!(!shown.contains('\u{1b}'), "{shown}");
+        assert!(!shown.contains("\n  pr  no permissions"), "{shown}");
+        assert!(shown.contains("exec runs git"), "{shown}");
     }
 }

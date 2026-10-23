@@ -16,6 +16,7 @@ use super::repo::{self, Scan};
 use super::{Staging, git, short};
 use crate::manifest::{Manifest, Permissions};
 use crate::registry::{CommandDef, MANIFEST_FILE, Problem};
+use crate::screen::{one_line, one_line_permissions, printable};
 
 #[derive(Debug, Default, Serialize)]
 pub struct UpdateReport {
@@ -183,24 +184,25 @@ fn update_summary(plans: &[&Plan]) -> String {
         .iter()
         .map(|plan| {
             let Change { name, from, to } = &plan.change;
-            let new_perms = &plan.def.manifest.permissions;
-            let perms = if plan.old_permissions == *new_perms {
-                format!("    permissions: {}", confirm::permissions(new_perms))
+            let old_perms = one_line_permissions(&plan.old_permissions);
+            let new_perms = one_line_permissions(&plan.def.manifest.permissions);
+            let perms = if old_perms == new_perms {
+                format!("    permissions: {}", confirm::permissions(&new_perms))
             } else {
                 format!(
                     "    permissions changed\n    before: {}\n    after:  {}",
-                    confirm::permissions(&plan.old_permissions),
-                    confirm::permissions(new_perms)
+                    confirm::permissions(&old_perms),
+                    confirm::permissions(&new_perms)
                 )
             };
             format!(
                 "  {name} {from} -> {to} from {}\n{perms}{}",
-                plan.source.url,
-                confirm::warning_lines(new_perms)
+                one_line(&plan.source.url),
+                confirm::warning_lines(&new_perms)
             )
         })
         .collect();
-    format!("Updates:\n{}", lines.join("\n"))
+    printable(&format!("Updates:\n{}", lines.join("\n")))
 }
 
 /// Every command folder that has a `.source.json`, sorted by name.
@@ -244,6 +246,7 @@ mod tests {
             description: "x".into(),
             args: BTreeMap::new(),
             permissions: Permissions::default(),
+            limits: crate::manifest::Limits::default(),
         }
     }
 

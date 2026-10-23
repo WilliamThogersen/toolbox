@@ -9,7 +9,10 @@ pub mod commands;
 pub mod hosts;
 pub mod inject;
 pub mod log;
+#[cfg(target_os = "macos")]
+mod presence;
 pub mod store;
+mod unescape;
 
 use std::collections::BTreeMap;
 use std::fmt;

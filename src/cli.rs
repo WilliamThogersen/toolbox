@@ -1,6 +1,6 @@
 //! Builds the top-level app from every loaded command, then dispatches.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -112,6 +112,15 @@ fn run_user_command(registry: &Registry, name: &str, matches: &ArgMatches) -> Re
     let output = runtime::run(def, &args, vault::default_store(), log)
         .with_context(|| format!("command {name:?} failed"))?;
     print_json(&output)
+}
+
+/// An error on stderr: `{"error": ...}` for programs, plain text for a person at a terminal.
+pub fn report_error(message: &str) {
+    if io::stderr().is_terminal() {
+        eprintln!("error: {message}");
+    } else {
+        eprintln!("{}", serde_json::json!({ "error": message }));
+    }
 }
 
 pub fn print_json(value: &impl Serialize) -> Result<ExitCode> {

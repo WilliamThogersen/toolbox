@@ -131,7 +131,7 @@ pub fn add(
         query_params: query_params.into_iter().collect(),
         commands: existing.map(|current| current.commands.clone()).unwrap_or_default(),
     };
-    store.save(&vault.with_secret(name, entry.clone()))?;
+    store.save(&vault.with_secret(name, entry.clone()), &add_change(name, existing, &entry, new_value))?;
     log.record(Event::Added {
         key: name.to_string(),
         hosts: entry.hosts.clone(),
@@ -139,6 +139,29 @@ pub fn add(
         new_value,
     });
     Ok(entry.summary(name, registry))
+}
+
+/// The Touch ID sentence for `add`. Moving an existing key to new hosts must read
+/// differently from adding one: with a faked terminal it is all the person sees.
+fn add_change(name: &str, existing: Option<&SecretEntry>, entry: &SecretEntry, new_value: bool) -> String {
+    let destination = |entry: &SecretEntry| match entry.query_params.as_slice() {
+        [] => entry.hosts.join(", "),
+        params => format!("{} (also as query parameter {})", entry.hosts.join(", "), params.join(", ")),
+    };
+    let Some(old) = existing else {
+        return format!("add the API key {name} for {}", destination(entry));
+    };
+    let action = if new_value {
+        format!("replace the API key {name}")
+    } else {
+        format!("change where your API key {name} may go")
+    };
+    let (now, was) = (destination(entry), destination(old));
+    if now == was {
+        format!("{action}: still {now}")
+    } else {
+        format!("{action}: now {now}, was {was}")
+    }
 }
 
 pub fn list(store: &dyn VaultStore, registry: &Registry) -> Result<Vec<SecretSummary>> {
@@ -173,7 +196,8 @@ pub fn allow(
         log.record(Event::Declined { key, command: name });
         return Ok(false);
     }
-    store.save(&vault.with_secret(secret, entry.with_command(command, fingerprint)))?;
+    let change = format!("let the command {command} use the API key {secret}");
+    store.save(&vault.with_secret(secret, entry.with_command(command, fingerprint)), &change)?;
     log.record(Event::Allowed { key, command: name });
     Ok(true)
 }
@@ -210,7 +234,8 @@ pub fn revoke(
     if !term.confirm(&format!("Stop {command:?} from using secret {secret:?}?"))? {
         return Ok(false);
     }
-    store.save(&vault.with_secret(secret, entry.without_command(command)))?;
+    let change = format!("stop the command {command} from using the API key {secret}");
+    store.save(&vault.with_secret(secret, entry.without_command(command)), &change)?;
     log.record(Event::Revoked { key: secret.to_string(), command: command.to_string() });
     Ok(true)
 }
@@ -222,7 +247,7 @@ pub fn remove(store: &dyn VaultStore, log: &dyn AuditLog, term: &dyn Terminal, n
     if !term.confirm(&format!("Delete secret {name:?}?"))? {
         return Ok(false);
     }
-    store.save(&vault.without_secret(name))?;
+    store.save(&vault.without_secret(name), &format!("delete the API key {name}"))?;
     log.record(Event::Removed { key: name.to_string() });
     Ok(true)
 }
@@ -335,7 +360,7 @@ mod tests {
         let store = MemoryStore::new(VaultData::default());
         add_simple(&store, &term(), &["api.stripe.com"]).unwrap();
         let entry = store.load().unwrap().get("stripe").unwrap().with_command("charge", "fp".into());
-        store.save(&store.load().unwrap().with_secret("stripe", entry)).unwrap();
+        store.save(&store.load().unwrap().with_secret("stripe", entry), "test").unwrap();
 
         let keep = FakeTerminal::new("", true);
         let summary = add_simple(&store, &keep, &["api.stripe.com", "files.stripe.com"]).unwrap();
@@ -404,7 +429,7 @@ mod tests {
         let store = MemoryStore::new(VaultData::default());
         add_simple(&store, &term(), &["api.stripe.com"]).unwrap();
         let entry = store.load().unwrap().get("stripe").unwrap().with_command("charge", "fp".into());
-        store.save(&store.load().unwrap().with_secret("stripe", entry)).unwrap();
+        store.save(&store.load().unwrap().with_secret("stripe", entry), "test").unwrap();
 
         let decline = FakeTerminal::new("", false);
         assert!(!revoke(&store, &*MemoryLog::new(), &decline, "stripe", "charge").unwrap());
@@ -425,6 +450,34 @@ mod tests {
         assert!(remove(&store, &*MemoryLog::new(), &term(), "stripe").unwrap());
         assert!(store.load().unwrap().get("stripe").is_none());
         assert!(remove(&store, &*MemoryLog::new(), &term(), "stripe").is_err());
+    }
+
+    #[test]
+    fn every_change_says_what_the_person_approves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(VaultData::default());
+        let hosts = vec!["api.stripe.com".to_string(), "files.stripe.com".to_string()];
+        let evil = vec!["evil.example".to_string()];
+        let none = Registry::default();
+        add(&store, &*MemoryLog::new(), &term(), &none, "stripe", rules(&hosts, &[])).unwrap();
+        let keep = FakeTerminal::new("", true);
+        add(&store, &*MemoryLog::new(), &keep, &none, "stripe", rules(&evil, &[])).unwrap();
+        add(&store, &*MemoryLog::new(), &term(), &none, "stripe", rules(&evil, &["key".to_string()])).unwrap();
+        let registry = Registry { commands: vec![command(tmp.path(), "charge", &["stripe"])], problems: vec![] };
+        allow(&store, &*MemoryLog::new(), &term(), &registry, "stripe", "charge").unwrap();
+        revoke(&store, &*MemoryLog::new(), &term(), "stripe", "charge").unwrap();
+        remove(&store, &*MemoryLog::new(), &term(), "stripe").unwrap();
+        assert_eq!(
+            *store.changes.borrow(),
+            vec![
+                "add the API key stripe for api.stripe.com, files.stripe.com",
+                "change where your API key stripe may go: now evil.example, was api.stripe.com, files.stripe.com",
+                "replace the API key stripe: now evil.example (also as query parameter key), was evil.example",
+                "let the command charge use the API key stripe",
+                "stop the command charge from using the API key stripe",
+                "delete the API key stripe",
+            ]
+        );
     }
 
     #[test]

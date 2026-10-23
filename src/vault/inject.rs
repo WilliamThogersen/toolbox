@@ -1,13 +1,15 @@
 //! Placeholder handling: swapping `{{vault:name}}` for real values on the way
 //! out, and scrubbing real values from responses on the way back.
 
+use std::ops::Range;
+
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use url::{Host, Url};
 
 use super::approval::{self, Caller};
-use super::{MIN_SECRET_LEN, SecretEntry, VaultData, hosts};
+use super::{MIN_SECRET_LEN, SecretEntry, VaultData, hosts, unescape};
 use crate::manifest::is_valid_name;
 
 const PREFIX: &str = "{{vault:";
@@ -257,6 +259,10 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
+/// How many layers of JSON escapes are undone when looking for a key: JSON in a JSON
+/// string in a JSON string is deeper than real responses go.
+const ESCAPE_LAYERS: usize = 3;
+
 /// Replaces any known secret value (and common encodings of it) in text.
 #[derive(Debug, Default)]
 pub struct Redactor {
@@ -282,11 +288,66 @@ impl Redactor {
         Self { needles }
     }
 
-    pub fn redact(&self, text: &str) -> String {
-        self.needles
-            .iter()
-            .fold(text.to_string(), |acc, (needle, label)| acc.replace(needle, label))
+    /// Whether `text` holds a secret `redact` would replace.
+    pub fn finds(&self, text: &str) -> bool {
+        self.needles.iter().any(|(needle, _)| text.contains(needle.as_str()))
     }
+
+    pub fn redact(&self, text: &str) -> String {
+        let exact = self
+            .needles
+            .iter()
+            .fold(text.to_string(), |acc, (needle, label)| acc.replace(needle, label));
+        self.redact_escaped(exact)
+    }
+
+    /// Keys written with JSON escapes, in any text and up to `ESCAPE_LAYERS` deep, are
+    /// found in the unescaped text and replaced where they sit in `text`. So neither
+    /// `json.decode` nor a script's own unescaping can turn them back into the key.
+    fn redact_escaped(&self, text: String) -> String {
+        if self.needles.is_empty() || !text.contains('\\') {
+            return text;
+        }
+        let layers = unescape::layers(&text, ESCAPE_LAYERS);
+        let hits: Vec<(Range<usize>, &str)> = layers
+            .iter()
+            .enumerate()
+            .flat_map(|(depth, layer)| {
+                let below = &layers[..=depth];
+                self.matches(&layer.text).map(move |(range, label)| {
+                    let range = below.iter().rev().fold(range, |range, lower| lower.source_range(range));
+                    (range, label)
+                })
+            })
+            .collect();
+        splice(&text, hits)
+    }
+
+    fn matches<'s>(&'s self, text: &'s str) -> impl Iterator<Item = (Range<usize>, &'s str)> + 's {
+        self.needles.iter().flat_map(move |(needle, label)| {
+            text.match_indices(needle.as_str())
+                .map(move |(at, _)| (at..at + needle.len(), label.as_str()))
+        })
+    }
+}
+
+/// `text` with each range replaced by its label. Overlapping ranges become one.
+fn splice(text: &str, hits: Vec<(Range<usize>, &str)>) -> String {
+    let mut sorted = hits;
+    sorted.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    for (range, label) in sorted {
+        if range.start < done {
+            done = done.max(range.end);
+            continue;
+        }
+        out.push_str(&text[done..range.start]);
+        out.push_str(label);
+        done = range.end;
+    }
+    out.push_str(&text[done..]);
+    out
 }
 
 /// The whole secret, plus the password of a `user:password` login (for Basic
@@ -536,6 +597,50 @@ mod tests {
         assert!(!clean.contains(TOKEN));
         assert!(!clean.contains(&b64));
         assert_eq!(clean.matches("[REDACTED:github]").count(), 3, "{clean}");
+    }
+
+    /// Every character of `text` as a JSON `\uXXXX` escape.
+    fn escaped(text: &str) -> String {
+        text.chars().map(|c| format!("\\u{:04x}", c as u32)).collect()
+    }
+
+    #[test]
+    fn redacts_keys_written_with_json_escapes() {
+        let redactor = Redactor::new(&vault());
+        let label = "[REDACTED:github]";
+
+        let bare = redactor.redact(&format!(r#""{}""#, escaped(TOKEN)));
+        assert_eq!(serde_json::from_str::<String>(&bare).unwrap(), label, "{bare}");
+
+        let partly = TOKEN.replacen('g', "\\u0067", 1).replacen('_', "\\u005F", 1);
+        let object = redactor.redact(&format!(r#"{{"a":"{partly}"}}"#));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&object).unwrap()["a"], label, "{object}");
+
+        let jsonp = redactor.redact(&format!(r#"cb({{"a":"x{}y"}})"#, escaped(TOKEN)));
+        assert_eq!(jsonp, format!(r#"cb({{"a":"x{label}y"}})"#));
+
+        // JSON inside a JSON string: the escapes are escaped once more.
+        let nested = redactor.redact(&format!(r#"{{"inner":"{{\"a\":\"{}\"}}"}}"#, escaped(TOKEN).replace('\\', "\\\\")));
+        let outer: serde_json::Value = serde_json::from_str(&nested).unwrap();
+        let inner: serde_json::Value = serde_json::from_str(outer["inner"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["a"], label, "{nested}");
+    }
+
+    #[test]
+    fn redacts_escaped_characters_outside_the_basic_plane() {
+        let secret = "key\u{1F600}value";
+        let mut entry = entry(&["x.com"], &[]);
+        entry.value = SecretValue::new(secret.to_string()).unwrap();
+        let redactor = Redactor::new(&VaultData::default().with_secret("emoji", entry));
+        let text = r#""key\ud83d\ude00value""#.to_string();
+        assert_eq!(redactor.redact(&text), r#""[REDACTED:emoji]""#);
+    }
+
+    #[test]
+    fn other_escapes_are_left_alone() {
+        let redactor = Redactor::new(&vault());
+        let text = r#"{"a":"line\nbreak \u00e9 \\u0041 \/ \x \u12"}"#;
+        assert_eq!(redactor.redact(text), text);
     }
 
     #[test]

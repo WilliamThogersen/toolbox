@@ -9,6 +9,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -41,6 +42,29 @@ impl Toolbox {
         let mut cmd = self.command(args);
         cmd.envs(vars.iter().copied()).stdin(Stdio::null());
         cmd.output().unwrap()
+    }
+
+    /// Like `run_with_env`, but kills `tb` after `limit`, so a run that never ends
+    /// fails the test instead of hanging it. `None` means it was killed.
+    fn run_within(&self, args: &[&str], vars: &[(&str, &str)], limit: Duration) -> Option<Output> {
+        let mut child = self
+            .command(args)
+            .envs(vars.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + limit;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Some(child.wait_with_output().unwrap())
     }
 
     /// Runs in `dir` with `input` piped to stdin, like `echo input | tb ...` there.
@@ -151,6 +175,26 @@ fn read_head(stream: &TcpStream) -> String {
 /// Serves one request, echoing the Authorization header back in body and headers,
 /// and the path with its query in the body.
 fn echo_server() -> (String, mpsc::Receiver<String>) {
+    serve_echo(|auth, path| json!({ "you_sent": auth, "path": path }).to_string())
+}
+
+/// Like `echo_server`, but writes every character of the echoed header in the body as
+/// a JSON `\uXXXX` escape, so the raw body never contains the key as typed.
+fn escaping_echo_server() -> (String, mpsc::Receiver<String>) {
+    serve_echo(|auth, path| format!(r#"{{"you_sent":"{}","path":{}}}"#, json_escaped(auth), json!(path)))
+}
+
+/// Echoes the Authorization header as a bare JSON string, every character escaped.
+fn bare_string_echo_server() -> (String, mpsc::Receiver<String>) {
+    serve_echo(|auth, _| format!(r#""{}""#, json_escaped(auth)))
+}
+
+fn json_escaped(text: &str) -> String {
+    text.chars().map(|c| format!("\\u{:04x}", c as u32)).collect()
+}
+
+/// Serves one request, answering with `body(authorization header, path)`.
+fn serve_echo(body: fn(&str, &str) -> String) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
     let (tx, rx) = mpsc::channel();
@@ -163,7 +207,7 @@ fn echo_server() -> (String, mpsc::Receiver<String>) {
             .unwrap_or("")
             .to_string();
         let path = request.split(' ').nth(1).unwrap_or("").to_string();
-        let body = json!({ "you_sent": auth, "path": path }).to_string();
+        let body = body(&auth, &path);
         write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-echo: {auth}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -260,6 +304,42 @@ fn errors_are_json_on_stderr() {
 }
 
 #[test]
+fn runaway_scripts_stop_at_the_cpu_limit_even_when_they_catch_it() {
+    let tb = Toolbox::new();
+    let scripts = [
+        ("spin", "while true do end"),
+        ("catch", "while true do pcall(function() while true do end end) end"),
+        ("resume", "while true do coroutine.resume(coroutine.create(function() while true do end end)) end"),
+    ];
+    for (name, body) in scripts {
+        let manifest = json!({ "name": name, "description": "x", "limits": { "cpu_seconds": 0.3 } });
+        tb.add_command(name, manifest, &format!("return function() {body} end"));
+        let out = tb
+            .run_within(&[name], &[], Duration::from_secs(15))
+            .unwrap_or_else(|| panic!("{name} was still running after 15s"));
+        assert_eq!(out.status.code(), Some(1), "{name}");
+        let err: Value = serde_json::from_str(stderr(&out).trim()).unwrap();
+        let message = err["error"].as_str().unwrap();
+        assert!(message.contains(&format!("command \"{name}\" failed")) && message.contains("0.3s of CPU time"), "{message}");
+    }
+}
+
+#[test]
+fn runaway_memory_stops_at_the_memory_limit() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "hog",
+        json!({ "name": "hog", "description": "x", "limits": { "memory_mb": 32 } }),
+        "return function() local t = {} for i = 1, 1e9 do t[i] = i end end",
+    );
+    let out = tb
+        .run_within(&["hog"], &[], Duration::from_secs(15))
+        .expect("hog was still running after 15s");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("more than 32 MB of memory"), "{}", stderr(&out));
+}
+
+#[test]
 fn agents_never_trigger_the_update_check() {
     let tb = Toolbox::new();
     for args in [&[][..], &["self", "check"][..]] {
@@ -268,6 +348,69 @@ fn agents_never_trigger_the_update_check() {
         assert_eq!(stderr(&out), "", "tb {args:?}");
     }
     assert!(!tb.home.path().join("update-check.json").exists());
+}
+
+#[test]
+fn keys_hidden_in_json_escapes_are_redacted_too() {
+    let tb = Toolbox::new();
+    let (url, _received) = escaping_echo_server();
+    tb.add_secret("test", SECRET, &[host_of(&url)]);
+    tb.add_command(
+        "call",
+        echo_manifest("call"),
+        r#"return function(args)
+            local res = http.get(args.url, { headers = { Authorization = "Bearer " .. vault("test") } })
+            local manual = res.body:gsub("\\u(%x%x%x%x)", function(hex) return utf8.char(tonumber(hex, 16)) end)
+            return { parsed = res.json.you_sent, decoded = json.decode(res.body).you_sent, manual = manual }
+        end"#,
+    );
+    tb.allow("test", "call");
+    let out = tb.run(&["call", "--url", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed = stdout(&out) + &stderr(&out);
+    assert!(!printed.contains(SECRET), "secret leaked: {printed}");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["parsed"], "Bearer [REDACTED:test]");
+    assert_eq!(result["decoded"], "Bearer [REDACTED:test]");
+    assert!(result["manual"].as_str().unwrap().contains("Bearer [REDACTED:test]"), "{result}");
+}
+
+#[test]
+fn keys_escaped_in_a_bare_json_string_are_redacted() {
+    let tb = Toolbox::new();
+    let (url, _received) = bare_string_echo_server();
+    tb.add_secret("test", SECRET, &[host_of(&url)]);
+    tb.add_command(
+        "call",
+        echo_manifest("call"),
+        r#"return function(args)
+            local res = http.get(args.url, { headers = { Authorization = "Bearer " .. vault("test") } })
+            return json.decode(res.body)
+        end"#,
+    );
+    tb.allow("test", "call");
+    let out = tb.run(&["call", "--url", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), "Bearer [REDACTED:test]");
+}
+
+#[test]
+fn exec_passes_only_the_base_environment_and_declared_vars() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "envs",
+        json!({ "name": "envs", "description": "x", "permissions": { "exec": ["env"], "env": ["TB_DECLARED"] } }),
+        r#"return function() return exec("env", {}, { env = { TB_FROM_SCRIPT = "s" } }).stdout end"#,
+    );
+    let out = tb.run_with_env(&["envs"], &[("TB_UNDECLARED_SECRET", "leak"), ("TB_DECLARED", "ok")]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let seen: String = serde_json::from_slice(&out.stdout).unwrap();
+    for wanted in ["TB_DECLARED=ok", "TB_FROM_SCRIPT=s", "PATH="] {
+        assert!(seen.lines().any(|line| line.starts_with(wanted)), "missing {wanted}: {seen}");
+    }
+    for unwanted in ["TB_UNDECLARED_SECRET", "TOOLBOX_"] {
+        assert!(!seen.contains(unwanted), "leaked {unwanted}: {seen}");
+    }
 }
 
 #[test]

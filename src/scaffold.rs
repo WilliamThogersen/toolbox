@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-use crate::manifest::{ArgSpec, ArgType, Manifest, Permissions, RESERVED_NAMES, is_valid_name};
+use crate::manifest::{ArgSpec, ArgType, Limits, Manifest, Permissions, RESERVED_NAMES, is_valid_name};
 use crate::registry::{MANIFEST_FILE, SCRIPT_FILE};
 
 const FIRST_VERSION: &str = "0.1.0";
@@ -46,6 +46,7 @@ pub fn create(commands_dir: &Path, name: &str, description: &str) -> Result<Crea
             },
         )]),
         permissions: Permissions::default(),
+        limits: Limits::default(),
     };
     fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
     let manifest_path = dir.join(MANIFEST_FILE);

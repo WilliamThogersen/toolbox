@@ -5,6 +5,7 @@ mod encoding;
 mod exec;
 mod fs;
 mod http;
+mod limits;
 mod sandbox;
 mod time;
 
@@ -52,18 +53,20 @@ pub fn run(
     // Read once: the vault approves this exact source, so it must also be what runs.
     let script = def.read_script()?;
     let lua = sandbox::new_lua()?;
+    let budget = limits::Budget::for_command(&def.manifest.limits)?;
+    limits::install(&lua, budget, &def.manifest.name)?;
     let perms = &def.manifest.permissions;
     api::install(&lua, perms)?;
     encoding::install(&lua)?;
     time::install(&lua)?;
-    exec::install(&lua, perms.exec.clone())?;
+    exec::install(&lua, perms.exec.clone(), perms.env.clone())?;
     fs::install(&lua, Rc::new(fs::FsGuard::new(perms)))?;
     let caller = Caller::new(def, &script);
     http::install(&lua, Rc::new(http::HttpClient::new(perms, caller, store, log)))?;
-    let entry = load_entry(&lua, def, &script)?;
+    let entry = load_entry(&lua, def, &script, &budget)?;
     let result: Value = entry
         .call(lua.to_value_with(args, ser_options())?)
-        .map_err(|err| tidy(&err))?;
+        .map_err(|err| explain(&err, &budget))?;
     lua.from_value(result)
         .context("the command returned a value that cannot be turned into JSON")
 }
@@ -85,16 +88,25 @@ fn compile(def: &CommandDef, chunk: String) -> Result<()> {
     Ok(())
 }
 
-fn load_entry(lua: &Lua, def: &CommandDef, script: &str) -> Result<Function> {
+fn load_entry(lua: &Lua, def: &CommandDef, script: &str, budget: &limits::Budget) -> Result<Function> {
     let returned: Value = sandbox::load_source(lua, script, chunk_name(def))
         .eval()
-        .map_err(|err| tidy(&err))?;
+        .map_err(|err| explain(&err, budget))?;
     match returned {
         Value::Function(entry) => Ok(entry),
         other => bail!(
             "run.lua must end with `return function(args) ... end`, but it returned {}",
             other.type_name()
         ),
+    }
+}
+
+/// Lua's "not enough memory" means the script hit its memory limit, so it says which.
+fn explain(err: &mlua::Error, budget: &limits::Budget) -> anyhow::Error {
+    if err.to_string().contains("not enough memory") {
+        anyhow!(budget.memory_message())
+    } else {
+        tidy(err)
     }
 }
 

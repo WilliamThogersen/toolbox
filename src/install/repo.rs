@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::manifest::{Manifest, is_valid_name};
 use crate::registry::{self, CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
 use crate::runtime;
+use crate::screen::one_line;
 
 const ROOT_LABEL: &str = "(repo root)";
 
@@ -115,7 +116,7 @@ pub fn select(scan: Scan, names: &[String]) -> Result<Selection> {
 pub fn problem_lines(problems: &[Problem]) -> String {
     problems
         .iter()
-        .map(|p| format!("  {}: {}", p.command, p.problem))
+        .map(|p| format!("  {}: {}", one_line(&p.command), one_line(&p.problem)))
         .collect::<Vec<_>>()
         .join("\n")
 }
