@@ -1,6 +1,7 @@
 //! A Lua state without file, OS or code-loading access.
 
 use anyhow::Result;
+use mlua::chunk::{AsChunk, Chunk, ChunkMode};
 use mlua::{Lua, LuaOptions, StdLib, Table, Value};
 
 fn safe_libs() -> StdLib {
@@ -19,6 +20,12 @@ pub fn new_lua() -> Result<Lua> {
     let string: Table = globals.get("string")?;
     string.set("dump", Value::Nil)?;
     Ok(lua)
+}
+
+/// A script's source, ready to compile. Precompiled chunks are refused: Lua doesn't
+/// verify bytecode, so a crafted one could corrupt memory and escape the sandbox.
+pub fn load_source<'a>(lua: &Lua, source: impl AsChunk + 'a, name: String) -> Chunk<'a> {
+    lua.load(source).set_name(name).set_mode(ChunkMode::Text)
 }
 
 #[cfg(test)]
@@ -46,6 +53,17 @@ mod tests {
         assert_eq!(result, "Lua 5.5 nil 8.0 2.0");
         let err = lua.load("for i = 1, 2 do i = 5 end").exec().unwrap_err();
         assert!(err.to_string().contains("i"), "{err}");
+    }
+
+    #[test]
+    fn bytecode_is_refused() {
+        let lua = new_lua().unwrap();
+        let bytecode = lua.load("return 1").into_function().unwrap().dump(false);
+        let compiled = load_source(&lua, &bytecode, "=t".into()).into_function();
+        assert!(compiled.unwrap_err().to_string().contains("binary chunk"));
+        // run.lua goes through `eval`, which first retries the source as an expression.
+        let evaluated = load_source(&lua, &bytecode, "=t".into()).eval::<Value>();
+        assert!(evaluated.unwrap_err().to_string().contains("binary chunk"));
     }
 
     #[test]

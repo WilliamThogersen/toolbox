@@ -77,12 +77,12 @@ pub fn check_syntax_as(def: &CommandDef, label: &str) -> Result<()> {
 fn compile(def: &CommandDef, chunk: String) -> Result<()> {
     let lua = sandbox::new_lua()?;
     let source = def.read_script()?;
-    lua.load(&source).set_name(chunk).into_function()?;
+    sandbox::load_source(&lua, &source, chunk).into_function()?;
     Ok(())
 }
 
 fn load_entry(lua: &Lua, def: &CommandDef, script: &str) -> Result<Function> {
-    let returned: Value = lua.load(script).set_name(chunk_name(def)).eval()?;
+    let returned: Value = sandbox::load_source(lua, script, chunk_name(def)).eval()?;
     match returned {
         Value::Function(entry) => Ok(entry),
         other => bail!(

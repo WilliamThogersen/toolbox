@@ -43,7 +43,7 @@ on stderr.
   A boolean is a flag: never `required`, defaults to `false`.
 - Unknown fields are errors, so typos are caught by `tb self check`.
 - `permissions` lists everything the script may touch. Anything not listed fails at runtime.
-  - `http`: hosts it may call. `"*"` allows any host.
+  - `http`: hosts it may call, also when following a redirect. `"*"` allows any host.
   - `vault`: secret names it may use (see Vault below).
   - `exec`: programs it may run.
   - `env`: environment variables it may read.
@@ -94,6 +94,8 @@ local res = http.request{ method = "POST", url = url, headers = {...}, json = {.
 The response is `{ status = 200, headers = {...}, body = "raw text", json = table or nil }`.
 Header names are lowercase. `json` is set when the body is JSON. A 4xx or 5xx
 status is not an error: check `res.status`. Network failures and timeouts raise an error.
+Up to 10 redirects are followed, each only to a host in `permissions.http`: a redirect to
+any other host raises an error, so list every host the API sends you to.
 
 ### json
 

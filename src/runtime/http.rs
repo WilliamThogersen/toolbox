@@ -3,9 +3,9 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde::{Deserialize, Serialize};
 use ureq::http::{Request, Response};
@@ -131,11 +131,24 @@ pub struct HttpClient {
     allowed_hosts: Vec<String>,
     caller: Caller,
     vault: LazyVault,
-    following: Agent,
+    /// Used without a secret. Redirects are followed by `follow`, which checks each host.
+    plain: Agent,
     /// Used whenever a secret is attached. No redirects (they could carry the
     /// secret elsewhere) and no env proxy (HTTP_PROXY could point at an attacker).
     secret_safe: Agent,
 }
+
+/// One request on the way to a response: the script's own, or a redirect being followed.
+#[derive(Debug)]
+struct Hop {
+    method: String,
+    url: Url,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// Request headers a redirect leaves behind, as ureq does.
+const DROPPED_ON_REDIRECT: &[&str] = &["authorization", "cookie", "content-length"];
 
 impl HttpClient {
     pub fn new(perms: &Permissions, caller: Caller, store: Box<dyn VaultStore>) -> Self {
@@ -146,8 +159,8 @@ impl HttpClient {
                 store,
                 loaded: RefCell::new(None),
             },
-            following: agent(MAX_REDIRECTS, Proxy::try_from_env()),
-            secret_safe: agent(0, None),
+            plain: agent(Proxy::try_from_env()),
+            secret_safe: agent(None),
         }
     }
 
@@ -170,23 +183,51 @@ impl HttpClient {
             .iter()
             .chain(&query)
             .any(|(k, v)| mentions_vault(k) || mentions_vault(v));
-        let (headers, query, agent) = if uses_vault {
+        let (headers, query) = if uses_vault {
             let vault = self.vault.get()?;
             let injector = Injector {
                 vault: &vault,
                 caller: &self.caller,
                 url: &url,
             };
-            (injector.headers(&headers)?, injector.query(&query)?, &self.secret_safe)
+            (injector.headers(&headers)?, injector.query(&query)?)
         } else {
-            (headers, query, &self.following)
+            (headers, query)
         };
         append_query(&mut url, &query);
 
+        let hop = Hop {
+            method: spec.method,
+            url,
+            headers,
+            body,
+        };
         let redactor = self.vault.redactor();
-        let response = execute(agent, &spec.method, &url, &headers, body, timeout)
-            .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))))?;
+        let response = if uses_vault {
+            execute(&self.secret_safe, &hop, timeout)
+        } else {
+            self.follow(hop, timeout)
+        }
+        .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))))?;
         Ok(redact_response(&redactor, response))
+    }
+
+    /// Sends `hop` and follows its redirects, each only to a host in `permissions.http`.
+    /// `timeout` covers the whole chain, as ureq's own redirects did.
+    fn follow(&self, mut hop: Hop, timeout: Option<Duration>) -> Result<ResponseData> {
+        let deadline = Instant::now() + timeout.unwrap_or(TIMEOUT);
+        for _ in 0..=MAX_REDIRECTS {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let response = execute(&self.plain, &hop, Some(left))?;
+            let Some(next) = redirect(&hop, &response)? else {
+                return Ok(response);
+            };
+            self.check_host(&next.url).with_context(|| {
+                format!("{} redirected to another host", hop.url.host_str().unwrap_or("?"))
+            })?;
+            hop = next;
+        }
+        bail!("stopped after {MAX_REDIRECTS} redirects")
     }
 
     fn check_host(&self, url: &Url) -> Result<()> {
@@ -200,10 +241,11 @@ impl HttpClient {
     }
 }
 
-fn agent(max_redirects: u32, proxy: Option<Proxy>) -> Agent {
+/// ureq never follows redirects itself: it would not check the new host.
+fn agent(proxy: Option<Proxy>) -> Agent {
     Agent::config_builder()
         .http_status_as_error(false)
-        .max_redirects(max_redirects)
+        .max_redirects(0)
         .proxy(proxy)
         .timeout_global(Some(TIMEOUT))
         .build()
@@ -249,26 +291,53 @@ fn encode_pairs(location: &str, params: &BTreeMap<String, serde_json::Value>) ->
         .finish())
 }
 
-fn execute(
-    agent: &Agent,
-    method: &str,
-    url: &Url,
-    headers: &[(String, String)],
-    body: Vec<u8>,
-    timeout: Option<Duration>,
-) -> Result<ResponseData> {
-    let builder = headers.iter().fold(
-        ureq::http::Request::builder()
-            .method(method.to_ascii_uppercase().as_str())
-            .uri(url.as_str()),
+/// The request to send next when `response` redirects `hop`, by ureq's (and curl's)
+/// rules: 307 and 308 repeat the method but are not followed for POST, PUT, PATCH or
+/// DELETE, the others continue as GET (HEAD stays HEAD). The body never comes along.
+fn redirect(hop: &Hop, response: &ResponseData) -> Result<Option<Hop>> {
+    let Some(location) = response.headers.get("location") else {
+        return Ok(None);
+    };
+    if !(300..400).contains(&response.status) || response.status == 304 {
+        return Ok(None);
+    }
+    let method = hop.method.to_ascii_uppercase();
+    let method = match (response.status, method.as_str()) {
+        (307 | 308, "POST" | "PUT" | "PATCH" | "DELETE") => return Ok(None),
+        (307 | 308, _) | (_, "GET" | "HEAD") => method,
+        _ => "GET".to_string(),
+    };
+    let url = hop
+        .url
+        .join(location)
+        .with_context(|| format!("invalid redirect to {location:?}"))?;
+    let headers = hop
+        .headers
+        .iter()
+        .filter(|(name, _)| !DROPPED_ON_REDIRECT.iter().any(|d| name.eq_ignore_ascii_case(d)))
+        .cloned()
+        .collect();
+    Ok(Some(Hop {
+        method,
+        url,
+        headers,
+        body: Vec::new(),
+    }))
+}
+
+fn execute(agent: &Agent, hop: &Hop, timeout: Option<Duration>) -> Result<ResponseData> {
+    let builder = hop.headers.iter().fold(
+        Request::builder()
+            .method(hop.method.to_ascii_uppercase().as_str())
+            .uri(hop.url.as_str()),
         |builder, (name, value)| builder.header(name.as_str(), value.as_str()),
     );
-    let mut response = if body.is_empty() {
+    let mut response = if hop.body.is_empty() {
         run(agent, builder.body(ureq::SendBody::none()).context("invalid request")?, timeout)
     } else {
-        run(agent, builder.body(body).context("invalid request")?, timeout)
+        run(agent, builder.body(hop.body.as_slice()).context("invalid request")?, timeout)
     }
-    .map_err(|e| anyhow!("request to {} failed: {e}", url.host_str().unwrap_or("?")))?;
+    .map_err(|e| anyhow!("request to {} failed: {e}", hop.url.host_str().unwrap_or("?")))?;
 
     let headers = response.headers().iter().fold(
         BTreeMap::<String, String>::new(),
@@ -510,6 +579,74 @@ mod tests {
             .send(spec(&url, RequestOptions { timeout: Some(1e19), ..RequestOptions::default() }))
             .unwrap_err();
         assert!(huge.to_string().contains("not a valid number of seconds"), "{huge}");
+    }
+
+    fn hop(method: &str, headers: &[(&str, &str)]) -> Hop {
+        Hop {
+            method: method.into(),
+            url: Url::parse("https://a.example/dir/page?x=1").unwrap(),
+            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body: b"data".to_vec(),
+        }
+    }
+
+    fn response(status: u16, location: Option<&str>) -> ResponseData {
+        ResponseData {
+            status,
+            headers: location.map(|l| ("location".to_string(), l.to_string())).into_iter().collect(),
+            body: String::new(),
+            json: None,
+        }
+    }
+
+    #[test]
+    fn redirects_follow_ureq_rules() {
+        let posted = hop("POST", &[("Authorization", "a"), ("cookie", "c"), ("Accept", "x")]);
+        let next = redirect(&posted, &response(302, Some("../other"))).unwrap().unwrap();
+        assert_eq!(next.method, "GET");
+        assert_eq!(next.url.as_str(), "https://a.example/other");
+        assert_eq!(next.headers, vec![("Accept".to_string(), "x".to_string())]);
+        assert!(next.body.is_empty());
+
+        let head = redirect(&hop("head", &[]), &response(301, Some("https://b.example/"))).unwrap().unwrap();
+        assert_eq!((head.method.as_str(), head.url.as_str()), ("HEAD", "https://b.example/"));
+        let get = redirect(&hop("GET", &[]), &response(307, Some("/x"))).unwrap().unwrap();
+        assert_eq!(get.method, "GET");
+
+        // Not followed: the script gets the response itself.
+        for (method, status, location) in [
+            ("POST", 307, Some("/x")),
+            ("DELETE", 308, Some("/x")),
+            ("GET", 304, Some("/x")),
+            ("GET", 302, None),
+            ("GET", 200, Some("/x")),
+        ] {
+            assert!(redirect(&hop(method, &[]), &response(status, location)).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn redirects_to_unlisted_hosts_are_refused() {
+        let redirector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", redirector.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            let (mut stream, _) = redirector.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            let reply = "HTTP/1.1 302 Found\r\nlocation: https://evil.example/\r\ncontent-length: 0\r\n\r\n";
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        let err = client(&["127.0.0.1"], &[])
+            .send(spec(&url, RequestOptions { timeout: Some(5.0), ..RequestOptions::default() }))
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            r#"127.0.0.1 redirected to another host: host "evil.example" is not listed in this command's permissions.http"#
+        );
     }
 
     #[test]

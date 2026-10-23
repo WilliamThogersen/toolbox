@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -134,6 +134,20 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// Reads a request line and headers, up to the blank line after them.
+fn read_head(stream: &TcpStream) -> String {
+    let mut reader = BufReader::new(stream);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+            break;
+        }
+        head.push_str(&line);
+    }
+    head
+}
+
 /// Serves one request, echoing the Authorization header back in body and headers,
 /// and the path with its query in the body.
 fn echo_server() -> (String, mpsc::Receiver<String>) {
@@ -142,15 +156,7 @@ fn echo_server() -> (String, mpsc::Receiver<String>) {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut request = String::new();
-        loop {
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
-                break;
-            }
-            request.push_str(&line);
-        }
+        let request = read_head(&stream);
         let auth = request
             .lines()
             .find_map(|l| l.strip_prefix("authorization: ").or_else(|| l.strip_prefix("Authorization: ")))
@@ -627,4 +633,54 @@ fn http_query_reaches_the_server() {
     assert_eq!(tb.json(&["search", "--url", &url]), json!(200));
     let request = received.recv().unwrap();
     assert!(request.starts_with("GET /?lang=en&page=2&q=a+b HTTP/1.1"), "{request}");
+}
+
+/// Answers every request with a redirect to `location`.
+fn redirect_server(location: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            read_head(&stream);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+        }
+    });
+    url
+}
+
+#[test]
+fn redirects_only_reach_listed_hosts() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "fetch",
+        json!({
+            "name": "fetch",
+            "description": "Fetches a URL",
+            "args": { "url": { "type": "string", "required": true } },
+            "permissions": { "http": ["127.0.0.1"] }
+        }),
+        r#"return function(args)
+            local res = http.get(args.url, { timeout = 5 })
+            return { status = res.status, path = res.json and res.json.path }
+        end"#,
+    );
+
+    let (echo, _received) = echo_server();
+    let to_listed = redirect_server(format!("{echo}landed"));
+    assert_eq!(
+        tb.json(&["fetch", "--url", &to_listed]),
+        json!({ "status": 200, "path": "/landed" })
+    );
+
+    // `localhost` reaches the same machine, but it is not the listed host.
+    let (spy, contacted) = spy_proxy();
+    let to_unlisted = redirect_server(spy.replace("127.0.0.1", "localhost") + "/steal?data=x");
+    let out = tb.run(&["fetch", "--url", &to_unlisted]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(err.contains("redirected") && err.contains("permissions.http"), "{err}");
+    assert!(!contacted.load(Ordering::SeqCst), "a redirect reached a host not in permissions.http");
 }

@@ -6,12 +6,12 @@ commands only touch what they declare.
 ## What every command gets
 
 Scripts run in a sandboxed Lua 5.5 with no `io`, `os`, `require`, `load` or `dofile`. They can't open sockets or
-load other code, and they only see files through `fs`. Everything that touches the outside goes through globals that
-are each gated by the command's `permissions`:
+load other code (`run.lua` must be source: precompiled bytecode is refused), and they only see files through `fs`.
+Everything that touches the outside goes through globals that are each gated by the command's `permissions`:
 
 | Permission | Lets the command |
 |------------|------------------|
-| `http` | Call these hosts. `"*"` means any host. |
+| `http` | Call these hosts. Redirects are only followed to them too. `"*"` means any host. |
 | `exec` | Run these programs, with any arguments, without a shell. |
 | `env` | Read these environment variables. |
 | `vault` | Use these keys in HTTP requests once you allow the command, never read them. |
