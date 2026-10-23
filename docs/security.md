@@ -75,10 +75,10 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
 - **A human makes every change.** Adding, changing, allowing and removing need a real terminal (`/dev/tty`). An
   AI's shell has none. The approval prompt escapes terminal control codes and bidi characters, so a script can't
   hide lines from you.
-- **Other programs get asked.** The vault is one macOS Keychain item, so tools like the `security` CLI trigger a
-  permission prompt.
-- **No injection.** Release binaries are signed with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and debuggers
-  can't get inside them.
+- **Other programs get asked (macOS).** The vault is one macOS Keychain item, so tools like the `security` CLI
+  trigger a permission prompt. Linux has no such prompt: see "Other programs on Linux" below.
+- **No injection.** macOS release binaries are signed with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and
+  debuggers can't get inside them. Linux release binaries are static, so `LD_PRELOAD` has nothing to load into.
 
 ### What it does not protect against
 
@@ -92,5 +92,13 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
 - **A local port someone else takes.** A key bound to `127.0.0.1:8080` goes to whatever listens there. While your
   server is stopped, any program can. If your server listens on all addresses (`0.0.0.0`), macOS lets another
   program of yours listen on `127.0.0.1` with the same port and take its connections, even while it runs.
-- **Other platforms.** Releases are macOS only. Built from source on Linux or Windows the keychain storage works, but
-  there is no hardened-runtime signing.
+- **Other programs on Linux.** On Linux the vault is one item in the Secret Service (GNOME Keyring, KWallet), under
+  service `toolbox`, account `vault`. The Secret Service has no per-program permission like the Keychain's: while
+  your keyring is unlocked, GNOME Keyring hands the item to any program running as you, without asking. An AI agent
+  with a shell in your desktop session can read every key with a tool like `secret-tool`, or rewrite the hosts and
+  approvals. On Linux, only trust the vault against agents that run as another user, or in a sandbox or container
+  that can't reach your session bus (`DBUS_SESSION_BUS_ADDRESS`).
+- **No Secret Service, no vault.** On a Linux server, in a container or over SSH without a session bus, there is no
+  Secret Service. Vault commands then fail with an error that says so, instead of keeping keys somewhere less safe.
+  Commands that don't use keys still work.
+- **Other platforms.** Releases are for macOS and Linux (x86_64 and arm64). Windows isn't supported.
