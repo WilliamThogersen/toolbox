@@ -205,8 +205,10 @@ fn send(message: &Value) -> Result<()> {
 /// Tells the client to fetch the tool list again after a command is added, removed or its
 /// `command.json` changes, so a command an agent just wrote is usable right away.
 fn watch(commands_dir: PathBuf) {
+    // Taken before the next message is read: on the new thread it could miss a command
+    // added right after the handshake.
+    let mut seen = tools::fingerprint(&commands_dir);
     thread::spawn(move || {
-        let mut seen = tools::fingerprint(&commands_dir);
         loop {
             thread::sleep(WATCH_INTERVAL);
             let now = tools::fingerprint(&commands_dir);
