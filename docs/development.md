@@ -27,6 +27,19 @@ Every `tb self` command has a page in `docs/commands/`, linked from `docs/README
 subcommand or flag is missing from its page. `docs/writing-commands.md` is built into the binary and printed by
 `tb self guide`.
 
+## Demo GIF
+
+The README's `assets/demo.gif` is recorded with [VHS](https://github.com/charmbracelet/vhs) from
+`assets/demo/demo.tape`. Record it again after changing anything it shows:
+
+```bash
+brew install vhs
+cargo build --release && vhs assets/demo/demo.tape
+```
+
+The tape uses a throwaway `TOOLBOX_HOME` in `/tmp/toolbox-demo`, the plain-text test vault, a fake key and the
+`peek` command in `assets/demo/peek/`. The last scene calls httpbin.org, so it needs the network.
+
 ## Releasing
 
 1. Bump `version` in `Cargo.toml`, run `cargo build` (updates `Cargo.lock`) and commit.
@@ -57,3 +70,4 @@ on a clean Mac and fails if it isn't the latest release. Run it by hand with `gh
 | `src/vault/` | Keychain storage, placeholder injection, redaction, `vault` subcommands |
 | `src/update.rs` | Once-a-day new-version notice on the terminal |
 | `docs/` | These docs. `docs/writing-commands.md` is printed by `tb self guide` |
+| `assets/demo/` | The VHS tape and the command behind the README's demo GIF |

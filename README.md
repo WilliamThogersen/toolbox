@@ -23,6 +23,10 @@
   <a href="docs/README.md">Docs</a>
 </p>
 
+<p align="center">
+  <img alt="Demo: create a command, store an API key, allow one command to use it, and run it. The script only sees a placeholder." src="assets/demo.gif" width="800">
+</p>
+
 Every command is a folder with a `command.json` (name, args, permissions) and a `run.lua` (the logic).
 Drop a folder in `~/.toolbox/commands/` and it is a new subcommand. No rebuild.
 

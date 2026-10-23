@@ -1,0 +1,6 @@
+{
+  "name": "peek",
+  "version": "1.0.0",
+  "description": "Sends the demo key to httpbin, which echoes it back",
+  "permissions": { "http": ["httpbin.org"], "vault": ["demo"] }
+}
