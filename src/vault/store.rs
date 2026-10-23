@@ -1,4 +1,4 @@
-//! Where the vault lives. The real store is the OS keychain.
+//! Where the vault lives. The real store is the OS one: the Keychain on macOS, the Secret Service on Linux.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -94,23 +94,65 @@ pub fn default_store() -> Box<dyn VaultStore> {
     }
 }
 
-/// The whole vault as one keychain item, so its host bindings can't be edited
-/// from outside without the keychain's permission prompt.
+/// The OS store that holds the vault, as errors name it.
+#[cfg(target_os = "macos")]
+const OS_STORE: &str = "the macOS Keychain";
+#[cfg(not(target_os = "macos"))]
+const OS_STORE: &str = "the Secret Service";
+
+/// What to do when the OS store can't be reached.
+#[cfg(target_os = "macos")]
+const OS_STORE_HELP: &str = "";
+#[cfg(not(target_os = "macos"))]
+const OS_STORE_HELP: &str = ". On Linux the vault is kept in the Secret Service (GNOME Keyring or KWallet): \
+     run tb in a desktop session where one is running and unlocked. Without one (a server, a container, \
+     SSH without a session bus) the vault can't be used, but commands that don't use keys still work";
+
+/// What to do when the store is there but refuses access (locked, or no default keyring).
+#[cfg(target_os = "macos")]
+const OS_STORE_ACCESS_HELP: &str = "";
+#[cfg(not(target_os = "macos"))]
+const OS_STORE_ACCESS_HELP: &str = ". Unlock your keyring, and check that one is set as the default \
+     (GNOME Keyring's \"login\" keyring usually is)";
+
+fn unavailable(err: &keyring::Error) -> anyhow::Error {
+    anyhow!("{OS_STORE} is not available ({err}){OS_STORE_HELP}")
+}
+
+fn failed(action: &str, err: &keyring::Error) -> anyhow::Error {
+    let help = match err {
+        keyring::Error::NoStorageAccess(_) => OS_STORE_ACCESS_HELP,
+        _ => "",
+    };
+    anyhow!("could not {action} {OS_STORE}: {err}{help}")
+}
+
+/// The whole vault as one item in the OS store: the Keychain on macOS, the
+/// Secret Service on Linux. On macOS its host bindings can't be edited from
+/// outside without the Keychain's permission prompt.
+///
+/// keyring's `v1` store has no fallback: if the OS store can't be reached,
+/// every call fails. Keep it that way: a store that forgets keys, or keeps
+/// them in a plain file, would break the vault.
 pub struct KeychainStore;
 
 impl KeychainStore {
     fn entry() -> Result<keyring::Entry> {
-        keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .map_err(|e| anyhow!("the OS keychain is not available: {e}"))
+        // keyring connects once and keeps why that failed. `Entry::new` would
+        // only say that no store is set.
+        if let Err(e) = keyring::Entry::store_status() {
+            return Err(unavailable(e));
+        }
+        keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| unavailable(&e))
     }
 }
 
 impl VaultStore for KeychainStore {
     fn load(&self) -> Result<VaultData> {
         match Self::entry()?.get_password() {
-            Ok(raw) => decode(&raw).context("could not read the vault in the keychain"),
+            Ok(raw) => decode(&raw).with_context(|| format!("could not read the vault in {OS_STORE}")),
             Err(keyring::Error::NoEntry) => Ok(VaultData::default()),
-            Err(e) => Err(anyhow!("could not read the vault from the keychain: {e}")),
+            Err(e) => Err(failed("read the vault from", &e)),
         }
     }
 
@@ -118,7 +160,7 @@ impl VaultStore for KeychainStore {
         let raw = encode(data)?;
         Self::entry()?
             .set_password(&raw)
-            .map_err(|e| anyhow!("could not write the vault to the keychain: {e}"))
+            .map_err(|e| failed("write the vault to", &e))
     }
 }
 
@@ -222,6 +264,26 @@ mod tests {
         assert_eq!(raw["format"], 2);
         assert!(raw.get("secrets").is_none(), "0.3.0 reads `secrets`: {raw}");
         assert!(raw["keys"]["gh"].is_object());
+    }
+
+    #[test]
+    fn os_store_errors_say_what_to_do() {
+        let gone = unavailable(&keyring::Error::NoDefaultStore).to_string();
+        let locked = failed("read the vault from", &keyring::Error::NoStorageAccess("locked".into())).to_string();
+        let other = failed("write the vault to", &keyring::Error::NoEntry).to_string();
+        assert!(!other.contains("Unlock"), "{other}");
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(gone.starts_with("the Secret Service is not available"), "{gone}");
+            assert!(gone.contains("GNOME Keyring"), "{gone}");
+            assert!(gone.contains("commands that don't use keys still work"), "{gone}");
+            assert!(locked.contains("Unlock your keyring"), "{locked}");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert!(gone.starts_with("the macOS Keychain is not available"), "{gone}");
+            assert_eq!(locked, "could not read the vault from the macOS Keychain: Couldn't access platform storage: locked");
+        }
     }
 
     #[test]

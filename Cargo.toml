@@ -13,7 +13,10 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 clap = { version = "4", features = ["derive", "string"] }
 dirs = "7"
 hmac = "0.13"
-keyring = "4"
+# `v1` picks the OS store at build time and never falls back to another one: the macOS
+# Keychain, and on Linux the Secret Service through zbus (pure Rust D-Bus and crypto, so
+# no libdbus or OpenSSL at runtime).
+keyring = { version = "4", default-features = false, features = ["v1"] }
 libc = "0.2.191"
 mlua = { version = "0.12", features = ["lua55", "vendored", "serde", "anyhow"] }
 percent-encoding = "2"

@@ -407,6 +407,44 @@ fn vault_add_and_rm_need_a_human_terminal() {
     assert_eq!(tb.vault(), before);
 }
 
+/// On Linux the vault lives in the Secret Service. Without one it fails and says so,
+/// never falls back to a store that forgets keys. Commands that don't use keys still run.
+#[cfg(target_os = "linux")]
+#[test]
+fn without_a_secret_service_the_vault_fails_clearly() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "call",
+        echo_manifest("call"),
+        r#"return function(args)
+            return http.get(args.url, { headers = { Authorization = vault("test") } }).status
+        end"#,
+    );
+    tb.add_command(
+        "plain",
+        json!({ "name": "plain", "description": "Uses no keys" }),
+        "return function() return 1 end",
+    );
+    let no_bus = format!("unix:path={}", tb.home.path().join("no-bus").display());
+    let run = |args: &[&str]| {
+        tb.command(args)
+            .env_remove("TOOLBOX_INSECURE_TEST_VAULT")
+            .env("DBUS_SESSION_BUS_ADDRESS", &no_bus)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    for args in [&["self", "vault", "list"][..], &["call", "--url", "https://127.0.0.1:9/"][..]] {
+        let out = run(args);
+        assert!(!out.status.success(), "{args:?} worked without a Secret Service");
+        let err = stderr(&out);
+        assert!(err.contains("the Secret Service is not available"), "{args:?}: {err}");
+        assert!(err.contains("GNOME Keyring"), "{args:?}: {err}");
+    }
+    let plain = run(&["plain"]);
+    assert!(plain.status.success(), "{}", stderr(&plain));
+}
+
 #[test]
 fn only_commands_the_human_allowed_can_use_a_secret() {
     let tb = Toolbox::new();
