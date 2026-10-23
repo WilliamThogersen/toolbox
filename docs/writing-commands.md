@@ -223,6 +223,7 @@ Rules:
    edit, the human has to allow it again.
 5. Requests that carry a secret never follow redirects.
 6. Any secret value that appears in a response is replaced with `[REDACTED:<name>]`.
+7. The vault is macOS only for now: elsewhere `vault()` raises an error that says so.
 
 `tb self vault list` shows which secrets exist, where they may be sent and which
 commands may use them. The error message tells you what to ask the user, for

@@ -92,13 +92,9 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
 - **A local port someone else takes.** A key bound to `127.0.0.1:8080` goes to whatever listens there. While your
   server is stopped, any program can. If your server listens on all addresses (`0.0.0.0`), macOS lets another
   program of yours listen on `127.0.0.1` with the same port and take its connections, even while it runs.
-- **Other programs on Linux.** On Linux the vault is one item in the Secret Service (GNOME Keyring, KWallet), under
-  service `toolbox`, account `vault`. The Secret Service has no per-program permission like the Keychain's: while
-  your keyring is unlocked, GNOME Keyring hands the item to any program running as you, without asking. An AI agent
-  with a shell in your desktop session can read every key with a tool like `secret-tool`, or rewrite the hosts and
-  approvals. On Linux, only trust the vault against agents that run as another user, or in a sandbox or container
-  that can't reach your session bus (`DBUS_SESSION_BUS_ADDRESS`).
-- **No Secret Service, no vault.** On a Linux server, in a container or over SSH without a session bus, there is no
-  Secret Service. Vault commands then fail with an error that says so, instead of keeping keys somewhere less safe.
-  Commands that don't use keys still work.
+- **Linux: no vault yet.** The Linux keyring (the Secret Service: GNOME Keyring, KWallet) has no per-program
+  permission like the Keychain's. While your keyring is unlocked it hands stored items to any program running as you,
+  without asking, so an AI agent with a shell could read every key with a tool like `secret-tool`. Rather than
+  pretend, toolbox has no vault on Linux: vault commands and `vault()` fail with an error that says so. Commands that
+  don't use keys work.
 - **Other platforms.** Releases are for macOS and Linux (x86_64 and arm64). Windows isn't supported.

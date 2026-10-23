@@ -46,7 +46,8 @@ brew install WilliamThogersen/tap/toolbox
 ```
 
 This installs `toolbox` and `tb` (macOS on Apple Silicon and Intel, Linux on x86_64 and arm64). Update with
-`brew upgrade toolbox`.
+`brew upgrade toolbox`. The key vault is macOS only for now: on Linux the system keyring gives keys to any program, so
+toolbox doesn't use it ([why](docs/security.md#what-it-does-not-protect-against)).
 
 When a new version is out, `tb` says so on your terminal. It asks GitHub at most once a day, and only when a
 person is at the terminal: agents and pipes never see the notice. Set `TOOLBOX_NO_UPDATE_CHECK=1` to turn it off.

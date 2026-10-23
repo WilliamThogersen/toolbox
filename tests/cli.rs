@@ -407,11 +407,11 @@ fn vault_add_and_rm_need_a_human_terminal() {
     assert_eq!(tb.vault(), before);
 }
 
-/// On Linux the vault lives in the Secret Service. Without one it fails and says so,
-/// never falls back to a store that forgets keys. Commands that don't use keys still run.
-#[cfg(target_os = "linux")]
+/// Outside macOS there is no vault: the system keyring there hands keys to any program,
+/// agents included. It says so, and commands that don't use keys still run.
+#[cfg(not(target_os = "macos"))]
 #[test]
-fn without_a_secret_service_the_vault_fails_clearly() {
+fn outside_macos_the_vault_is_off() {
     let tb = Toolbox::new();
     tb.add_command(
         "call",
@@ -425,21 +425,18 @@ fn without_a_secret_service_the_vault_fails_clearly() {
         json!({ "name": "plain", "description": "Uses no keys" }),
         "return function() return 1 end",
     );
-    let no_bus = format!("unix:path={}", tb.home.path().join("no-bus").display());
     let run = |args: &[&str]| {
         tb.command(args)
             .env_remove("TOOLBOX_INSECURE_TEST_VAULT")
-            .env("DBUS_SESSION_BUS_ADDRESS", &no_bus)
             .stdin(Stdio::null())
             .output()
             .unwrap()
     };
     for args in [&["self", "vault", "list"][..], &["call", "--url", "https://127.0.0.1:9/"][..]] {
         let out = run(args);
-        assert!(!out.status.success(), "{args:?} worked without a Secret Service");
+        assert!(!out.status.success(), "{args:?} used a vault outside macOS");
         let err = stderr(&out);
-        assert!(err.contains("the Secret Service is not available"), "{args:?}: {err}");
-        assert!(err.contains("GNOME Keyring"), "{args:?}: {err}");
+        assert!(err.contains("the vault only works on macOS"), "{args:?}: {err}");
     }
     let plain = run(&["plain"]);
     assert!(plain.status.success(), "{}", stderr(&plain));

@@ -66,7 +66,7 @@ formula in [WilliamThogersen/homebrew-tap](https://github.com/WilliamThogersen/h
 After each release, and every Monday, [brew-check](../.github/workflows/brew-check.yml) installs toolbox from the tap
 on a clean Mac and on clean Linux runners (x86_64 and arm64), and fails if it isn't the latest release, or if
 `brew test` or `brew audit --strict` fail. On macOS it also checks the hardened runtime, on Linux that the binary is
-static and that the vault refuses to work without a Secret Service. Run it by hand with
+static and that the vault is off. Run it by hand with
 `gh workflow run brew-check.yml`.
 
 ## CI
@@ -95,7 +95,7 @@ The image's rustup installs the pinned toolchain without clippy, hence the `rust
 | `src/install/` | Install from git repos and marketplaces, version-aware updates, `.source.json` |
 | `src/mcp/` | `tb self mcp`: commands as MCP tools over stdio |
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
-| `src/vault/` | OS store (Keychain, Secret Service), placeholder injection, redaction, `vault` subcommands |
+| `src/vault/` | Keychain storage (macOS only), placeholder injection, redaction, `vault` subcommands |
 | `src/update.rs` | Once-a-day new-version notice on the terminal |
 | `docs/` | These docs. `docs/writing-commands.md` is printed by `tb self guide` |
 | `assets/demo/` | The VHS tape and the command behind the README's demo GIF |

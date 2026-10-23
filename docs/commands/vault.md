@@ -1,9 +1,10 @@
 # tb self vault
 
-API keys that commands can use but never see. The keys live in the macOS Keychain, or on Linux in the Secret
-Service (GNOME Keyring, KWallet). Without a Secret Service (a server, a container, SSH without a session bus) the
-vault commands fail and say so. On Linux any program running as you can read the vault while your keyring is
-unlocked: see [Security](../security.md#what-it-does-not-protect-against).
+API keys that commands can use but never see. The keys live in the macOS Keychain.
+
+The vault is macOS only for now. On Linux the system keyring (GNOME Keyring, KWallet) hands stored keys to any program
+you run, an AI agent included, so there the vault commands and `vault()` refuse with an error that says so. Commands
+that don't use keys work everywhere. See [Security](../security.md#what-it-does-not-protect-against).
 
 ```
 tb self vault add <name> --host <host>... [--query-param <param>...]

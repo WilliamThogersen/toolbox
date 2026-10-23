@@ -113,17 +113,16 @@ jobs:
           tb hello --name ci
           tb self check
 
-      # The vault lives in the Secret Service. Without one it must fail and say so, never
-      # fall back to a store that forgets keys.
-      - name: Check the vault needs a Secret Service
+      # Outside macOS the vault is off: the Linux keyring hands keys to any program.
+      - name: Check the vault is off
         run: |
           export TOOLBOX_HOME="$RUNNER_TEMP/toolbox"
-          if out=$(DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNNER_TEMP/no-bus" tb self vault list 2>&1); then
-            echo "::error::tb self vault list worked without a Secret Service: $out"
+          if out=$(tb self vault list 2>&1); then
+            echo "::error::tb self vault list worked on Linux: $out"
             exit 1
           fi
-          if [[ $out != *"Secret Service is not available"* ]]; then
-            echo "::error::unexpected error without a Secret Service: $out"
+          if [[ $out != *"only works on macOS"* ]]; then
+            echo "::error::unexpected vault error on Linux: $out"
             exit 1
           fi
           echo "$out"
