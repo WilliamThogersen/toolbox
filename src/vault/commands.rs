@@ -9,8 +9,8 @@ use anyhow::{Result, anyhow, bail, ensure};
 
 use super::hosts::{normalize_host, normalize_query_param};
 use super::log::{AuditLog, Event};
+use super::names::{self, NAME_RULES, is_secret_name};
 use super::{SecretEntry, SecretSummary, SecretValue, VaultStore, approval};
-use crate::manifest::is_valid_name;
 use crate::registry::{CommandDef, Registry};
 
 /// Human input. The real one reads `/dev/tty`, which scripts and agents can't type into.
@@ -105,7 +105,7 @@ pub fn add(
     name: &str,
     rules: Rules,
 ) -> Result<SecretSummary> {
-    ensure!(is_valid_name(name), "{name:?} is not a valid secret name (a-z, 0-9, '-', '_')");
+    ensure!(is_secret_name(name), "{name:?} is not a valid secret name ({NAME_RULES})");
     ensure!(!rules.hosts.is_empty(), "give at least one --host the secret may be sent to");
     let hosts: BTreeSet<String> = rules.hosts.iter().map(|h| normalize_host(h)).collect::<Result<_>>()?;
     let query_params: BTreeSet<String> = rules
@@ -184,8 +184,8 @@ pub fn allow(
         .ok_or_else(|| anyhow!("no secret named {secret:?}"))?;
     let def = find_command(registry, command)?;
     ensure!(
-        def.manifest.permissions.vault.iter().any(|s| s == secret),
-        "command {command:?} does not list {secret:?} in permissions.vault, so it could not use it anyway"
+        names::declared(&def.manifest.permissions.vault, secret),
+        "command {command:?} does not list {secret:?} (or a pattern covering it) in permissions.vault, so it could not use it anyway"
     );
     // The prompt and the fingerprint come from the same text, so what was shown is what gets allowed.
     let script = def.read_script()?;
@@ -403,6 +403,33 @@ mod tests {
         fs::write(tmp.path().join("charge/run.lua"), "return function() return 1 end").unwrap();
         let listed = list(&store, &registry).unwrap();
         assert_eq!(listed[0].commands[0].access, Access::Changed);
+    }
+
+    #[test]
+    fn keys_in_a_folder_are_allowed_one_by_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(VaultData::default());
+        let hosts = vec!["api.stripe.com".to_string()];
+        let none = Registry::default();
+        for name in ["stripe/live", "stripe/test"] {
+            add(&store, &*MemoryLog::new(), &term(), &none, name, rules(&hosts, &[])).unwrap();
+        }
+        let err = add(&store, &*MemoryLog::new(), &term(), &none, "stripe/a/b/c", rules(&hosts, &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1-3 parts"), "{err}");
+
+        let registry = Registry { commands: vec![command(tmp.path(), "charge", &["stripe/*"])], problems: vec![] };
+        assert!(allow(&store, &*MemoryLog::new(), &term(), &registry, "stripe/live", "charge").unwrap());
+        let listed = list(&store, &registry).unwrap();
+        let access: Vec<(&str, Access)> = listed.iter().map(|s| (s.name.as_str(), s.commands[0].access)).collect();
+        assert_eq!(access, vec![("stripe/live", Access::Allowed), ("stripe/test", Access::NotAllowed)]);
+
+        for uncovered in ["stripe", "stripe/live/eu"] {
+            add(&store, &*MemoryLog::new(), &term(), &none, uncovered, rules(&hosts, &[])).unwrap();
+            let err = allow(&store, &*MemoryLog::new(), &term(), &registry, uncovered, "charge").unwrap_err();
+            assert!(err.to_string().contains("does not list"), "{uncovered}: {err}");
+        }
     }
 
     #[test]

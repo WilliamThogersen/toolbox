@@ -122,7 +122,11 @@ fn vault_app() -> Command {
         .subcommand(
             Command::new("add")
                 .about("Add a secret or change where it may go. Prompts for the value (empty keeps the current one), so a human must run it in a terminal")
-                .arg(Arg::new("name").required(true))
+                .arg(
+                    Arg::new("name")
+                        .required(true)
+                        .help("Name scripts use, like github, or github/work for one of several accounts"),
+                )
                 .arg(
                     Arg::new("host")
                         .long("host")

@@ -7,6 +7,8 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::vault::names::{NAME_RULES, is_secret_pattern};
+
 /// Top-level names owned by toolbox itself (built-ins live under `self`).
 pub const RESERVED_NAMES: &[&str] = &["self", "help"];
 
@@ -90,7 +92,7 @@ pub struct Permissions {
     /// Hosts the script may call. `"*"` allows any host.
     #[serde(default)]
     pub http: Vec<String>,
-    /// Vault secret names the script may reference.
+    /// Vault secret names the script may reference. `github/*` covers every key one level under `github`.
     #[serde(default)]
     pub vault: Vec<String>,
     /// Programs the script may run with `exec`.
@@ -147,8 +149,10 @@ impl Manifest {
             problems.extend(validate_arg(name, spec));
         }
         for secret in &self.permissions.vault {
-            if !is_valid_name(secret) {
-                problems.push(format!("permissions.vault entry {secret:?} is not a valid secret name"));
+            if !is_secret_pattern(secret) {
+                problems.push(format!(
+                    "permissions.vault entry {secret:?} is not a valid secret name or pattern ({NAME_RULES}, or github/* for any account)"
+                ));
             }
         }
         if self.permissions.http.iter().any(|h| h.trim().is_empty()) {
@@ -202,7 +206,7 @@ fn default_matches(kind: ArgType, value: &Value) -> bool {
     }
 }
 
-/// Names for commands, args and secrets: lowercase, digits, '-' and '_'.
+/// Names for commands, args and each part of a secret name: lowercase, digits, '-' and '_'.
 pub fn is_valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     let starts_ok = chars
@@ -278,6 +282,18 @@ mod tests {
         assert!(problems.contains("description must not be empty"));
         assert!(problems.contains("not a valid secret name"));
         assert!(problems.contains("empty hosts"));
+    }
+
+    #[test]
+    fn vault_entries_may_be_folders_and_patterns() {
+        let manifest = Manifest::parse(
+            r#"{"name":"a","description":"x","permissions":{"vault":["stripe","github/work","github/*/token"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.validate("a"), Vec::<String>::new());
+        let manifest = Manifest::parse(r#"{"name":"a","description":"x","permissions":{"vault":["*"]}}"#).unwrap();
+        let problems = manifest.validate("a").join("\n");
+        assert!(problems.contains("not a valid secret name or pattern"), "{problems}");
     }
 
     #[test]

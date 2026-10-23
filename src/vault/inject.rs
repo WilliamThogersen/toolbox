@@ -9,8 +9,8 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD
 use url::{Host, Url};
 
 use super::approval::{self, Caller};
+use super::names::{self, is_secret_name};
 use super::{MIN_SECRET_LEN, SecretEntry, VaultData, hosts, unescape};
-use crate::manifest::is_valid_name;
 
 const PREFIX: &str = "{{vault:";
 const SUFFIX: &str = "}}";
@@ -97,7 +97,7 @@ fn parse(text: &str) -> Result<Vec<Piece<'_>>> {
             Some((name, label)) => (name, Encoding::parse(label)?),
             None => (&after[..end], Encoding::Raw),
         };
-        ensure!(is_valid_name(name), "invalid vault secret name {name:?}");
+        ensure!(is_secret_name(name), "invalid vault secret name {name:?}");
         pieces.push(Piece::Literal(&rest[..start]));
         pieces.push(Piece::Secret(name, encoding));
         rest = &after[end + SUFFIX.len()..];
@@ -163,7 +163,7 @@ impl<'a> Injector<'a> {
     /// approve a command once it does what it should.
     fn authorize(&self, name: &str, place: Place) -> Result<&'a SecretEntry> {
         ensure!(
-            self.caller.declared.iter().any(|d| d == name),
+            names::declared(&self.caller.declared, name),
             "secret {name:?} is not listed in this command's permissions.vault"
         );
         let entry = self.vault.get(name).ok_or_else(|| {
@@ -487,6 +487,28 @@ mod tests {
         let headers = vec![("X".to_string(), placeholder("stripe", Encoding::Raw))];
         let err = injector_for(&vault, &who, &url).headers(&headers).unwrap_err();
         assert!(err.to_string().contains("tb self vault add stripe"));
+    }
+
+    #[test]
+    fn a_pattern_still_needs_each_key_allowed() {
+        let work = entry(&["api.github.com"], &[]);
+        let personal = SecretEntry { commands: Default::default(), ..work.clone() };
+        let vault = VaultData::default()
+            .with_secret("github/work", work)
+            .with_secret("github/personal", personal);
+        let (who, url) = (caller(&["github/*"], FINGERPRINT), Url::parse("https://api.github.com/").unwrap());
+        let send = |name: &str| {
+            let headers = vec![("X".to_string(), placeholder(name, Encoding::Raw))];
+            injector_for(&vault, &who, &url)
+                .headers(&headers)
+                .map(|mut filled| filled.remove(0).1)
+                .map_err(|err| err.to_string())
+        };
+        assert_eq!(send("github/work").unwrap(), TOKEN);
+        let err = send("github/personal").unwrap_err();
+        assert!(err.contains("tb self vault allow github/personal call"), "{err}");
+        assert!(send("gitlab/work").unwrap_err().contains("permissions.vault"));
+        assert!(send("github/*").unwrap_err().contains("invalid vault secret name"));
     }
 
     #[test]

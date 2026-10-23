@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::SecretEntry;
+use super::{SecretEntry, names};
 use crate::install::confirm;
 use crate::registry::{CommandDef, Registry};
 use crate::screen::{one_line, one_line_permissions, printable};
@@ -17,7 +17,7 @@ use crate::screen::{one_line, one_line_permissions, printable};
 #[derive(Debug, Clone)]
 pub struct Caller {
     pub name: String,
-    /// The secrets its manifest lists in `permissions.vault`.
+    /// The secrets (or patterns, like `github/*`) its manifest lists in `permissions.vault`.
     pub declared: Vec<String>,
     pub fingerprint: String,
 }
@@ -77,12 +77,13 @@ pub struct CommandAccess {
     pub access: Access,
 }
 
-/// Every command that lists `secret` or was allowed to use it, sorted by name.
+/// Every command that lists `secret` (or a pattern covering it) or was allowed to
+/// use it, sorted by name.
 pub fn access(secret: &str, entry: &SecretEntry, registry: &Registry) -> Vec<CommandAccess> {
     let users = registry
         .commands
         .iter()
-        .filter(|def| def.manifest.permissions.vault.iter().any(|s| s == secret))
+        .filter(|def| names::declared(&def.manifest.permissions.vault, secret))
         .map(|def| def.manifest.name.as_str());
     let names: BTreeSet<&str> = users.chain(entry.commands.keys().map(String::as_str)).collect();
     names
