@@ -157,6 +157,19 @@ fn vault_app() -> Command {
                 .about("Delete a secret. Asks for confirmation in a terminal")
                 .arg(Arg::new("name").required(true)),
         )
+        .subcommand(
+            Command::new("log")
+                .about("When keys were added, allowed, used or refused, by which command and from which programs (never values)")
+                .arg(Arg::new("key").long("key").help("Only entries for this key"))
+                .arg(Arg::new("command").long("command").help("Only entries for this command"))
+                .arg(
+                    Arg::new("limit")
+                        .long("limit")
+                        .value_parser(clap::value_parser!(usize))
+                        .default_value("50")
+                        .help("How many entries to show, newest first"),
+                ),
+        )
 }
 
 pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Result<ExitCode> {
@@ -239,6 +252,7 @@ fn new_command(commands_dir: &Path, matches: &ArgMatches) -> Result<ExitCode> {
 
 fn vault_command(matches: &ArgMatches, registry: &Registry) -> Result<ExitCode> {
     let store = vault::default_store();
+    let log = vault::log::default_log()?;
     let pair = |m: &ArgMatches| {
         let get = |id| m.get_one::<String>(id).expect("required").clone();
         (get("secret"), get("command"))
@@ -249,7 +263,7 @@ fn vault_command(matches: &ArgMatches, registry: &Registry) -> Result<ExitCode> 
             let values = |id| m.get_many::<String>(id).into_iter().flatten().cloned().collect::<Vec<_>>();
             let (hosts, query_params) = (values("host"), values("query-param"));
             let rules = Rules { hosts: &hosts, query_params: &query_params };
-            let summary = vault_ops::add(store.as_ref(), &Tty, registry, name, rules)?;
+            let summary = vault_ops::add(store.as_ref(), &log, &Tty, registry, name, rules)?;
             if let Some(note) = vault::hosts::local_note(&summary.hosts) {
                 eprintln!("{note}");
             }
@@ -258,18 +272,26 @@ fn vault_command(matches: &ArgMatches, registry: &Registry) -> Result<ExitCode> 
         Some(("list", _)) => print_json(&vault_ops::list(store.as_ref(), registry)?),
         Some(("allow", m)) => {
             let (secret, command) = pair(m);
-            let allowed = vault_ops::allow(store.as_ref(), &Tty, registry, &secret, &command)?;
+            let allowed = vault_ops::allow(store.as_ref(), &log, &Tty, registry, &secret, &command)?;
             print_json(&serde_json::json!({ "secret": secret, "command": command, "allowed": allowed }))
         }
         Some(("revoke", m)) => {
             let (secret, command) = pair(m);
-            let revoked = vault_ops::revoke(store.as_ref(), &Tty, &secret, &command)?;
+            let revoked = vault_ops::revoke(store.as_ref(), &log, &Tty, &secret, &command)?;
             print_json(&serde_json::json!({ "secret": secret, "command": command, "revoked": revoked }))
         }
         Some(("rm", m)) => {
             let name = m.get_one::<String>("name").expect("required");
-            let deleted = vault_ops::remove(store.as_ref(), &Tty, name)?;
+            let deleted = vault_ops::remove(store.as_ref(), &log, &Tty, name)?;
             print_json(&serde_json::json!({ "name": name, "deleted": deleted }))
+        }
+        Some(("log", m)) => {
+            let filter = vault::log::Filter {
+                key: m.get_one::<String>("key").map(String::as_str),
+                command: m.get_one::<String>("command").map(String::as_str),
+                limit: *m.get_one::<usize>("limit").expect("has default"),
+            };
+            print_json(&vault::log::read(&log.path, &filter)?)
         }
         _ => unreachable!("clap requires a vault subcommand"),
     }

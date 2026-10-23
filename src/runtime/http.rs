@@ -16,7 +16,8 @@ use super::encoding::query_pairs;
 use super::{seconds, ser_options};
 use crate::manifest::Permissions;
 use crate::vault::approval::Caller;
-use crate::vault::inject::{Injector, Redactor, ensure_absent, mentions_vault};
+use crate::vault::inject::{Injector, Redactor, ensure_absent, mentions_vault, secret_names};
+use crate::vault::log::{self as key_log, AuditLog, Event, Outcome};
 use crate::vault::{VaultData, VaultStore};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -136,6 +137,8 @@ pub struct HttpClient {
     /// Used whenever a secret is attached. No redirects (they could carry the
     /// secret elsewhere) and no env proxy (HTTP_PROXY could point at an attacker).
     secret_safe: Agent,
+    /// Records every request that carries a secret, or was refused one.
+    log: Box<dyn AuditLog>,
 }
 
 /// One request on the way to a response: the script's own, or a redirect being followed.
@@ -151,7 +154,7 @@ struct Hop {
 const DROPPED_ON_REDIRECT: &[&str] = &["authorization", "cookie", "content-length"];
 
 impl HttpClient {
-    pub fn new(perms: &Permissions, caller: Caller, store: Box<dyn VaultStore>) -> Self {
+    pub fn new(perms: &Permissions, caller: Caller, store: Box<dyn VaultStore>, log: Box<dyn AuditLog>) -> Self {
         Self {
             allowed_hosts: perms.http.iter().map(|h| h.to_ascii_lowercase()).collect(),
             caller,
@@ -161,6 +164,7 @@ impl HttpClient {
             },
             plain: agent(Proxy::try_from_env()),
             secret_safe: agent(None),
+            log,
         }
     }
 
@@ -183,6 +187,14 @@ impl HttpClient {
             .iter()
             .chain(&query)
             .any(|(k, v)| mentions_vault(k) || mentions_vault(v));
+        let keys: Vec<String> = headers
+            .iter()
+            .chain(&query)
+            .flat_map(|(_, value)| secret_names(value))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let request = logged_request(&spec.method, &url);
         let (headers, query) = if uses_vault {
             let vault = self.vault.get()?;
             let injector = Injector {
@@ -190,7 +202,18 @@ impl HttpClient {
                 caller: &self.caller,
                 url: &url,
             };
-            (injector.headers(&headers)?, injector.query(&query)?)
+            match injector.headers(&headers).and_then(|h| Ok((h, injector.query(&query)?))) {
+                Ok(filled) => filled,
+                Err(err) => {
+                    self.log.record(Event::Refused {
+                        keys,
+                        command: self.caller.name.clone(),
+                        request,
+                        reason: format!("{err:#}"),
+                    });
+                    return Err(err);
+                }
+            }
         } else {
             (headers, query)
         };
@@ -208,8 +231,15 @@ impl HttpClient {
         } else {
             self.follow(hop, timeout)
         }
-        .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))))?;
-        Ok(redact_response(&redactor, response))
+        .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))));
+        if uses_vault {
+            let outcome = match &response {
+                Ok(done) => Outcome::Status(done.status),
+                Err(err) => Outcome::Failed(err.to_string()),
+            };
+            self.log.record(Event::Used { keys, command: self.caller.name.clone(), request, outcome });
+        }
+        Ok(redact_response(&redactor, response?))
     }
 
     /// Sends `hop` and follows its redirects, each only to a host in `permissions.http`.
@@ -238,6 +268,19 @@ impl HttpClient {
             "host {host:?} is not listed in this command's permissions.http"
         );
         Ok(())
+    }
+}
+
+/// Where a request goes, for the key log: no query string, which may hold the key.
+fn logged_request(method: &str, url: &Url) -> key_log::Request {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    key_log::Request {
+        method: method.to_ascii_uppercase(),
+        host: match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        },
+        path: url.path().to_string(),
     }
 }
 
@@ -454,7 +497,12 @@ mod tests {
             declared: perms.vault.clone(),
             fingerprint: "t".into(),
         };
-        HttpClient::new(&perms, caller, Box::new(MemoryStore::new(VaultData::default())))
+        HttpClient::new(
+            &perms,
+            caller,
+            Box::new(MemoryStore::new(VaultData::default())),
+            Box::new(crate::vault::log::MemoryLog::new()),
+        )
     }
 
     fn spec(url: &str, options: RequestOptions) -> RequestSpec {

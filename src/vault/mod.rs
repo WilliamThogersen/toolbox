@@ -8,6 +8,7 @@ pub mod approval;
 pub mod commands;
 pub mod hosts;
 pub mod inject;
+pub mod log;
 pub mod store;
 
 use std::collections::BTreeMap;

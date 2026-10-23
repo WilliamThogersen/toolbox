@@ -106,32 +106,82 @@ fn access_of(name: &str, entry: &SecretEntry, registry: &Registry) -> Access {
     }
 }
 
-/// What the human sees before allowing: the command, its permissions, its whole
-/// script, and where the key may go. Built from the same text that gets fingerprinted,
-/// and escaped as a whole, since any manifest string could carry terminal codes.
-pub fn prompt(def: &CommandDef, script: &str, secret: &str, entry: &SecretEntry) -> String {
+/// What the human sees before allowing a command to use a key.
+pub struct Review {
+    /// The short screen: the command, its permissions, where the key may go, and
+    /// every line of the script that reaches outside it.
+    pub summary: String,
+    /// The whole script with line numbers, for the pager.
+    pub full: String,
+    pub question: String,
+}
+
+/// Globals a script reaches the world through. `_G`, `_ENV` and `rawget` reach the
+/// same globals under another name, so lines using them are shown too.
+const REACHING: &[&str] = &["http", "exec", "fs", "env", "stdin", "vault", "_G", "_ENV", "rawget"];
+
+/// More than this and the short screen would be the long one again.
+const MAX_SHOWN: usize = 25;
+
+/// Built from the same text that gets fingerprinted, and escaped as a whole, since
+/// any manifest string or script line could carry terminal codes.
+pub fn review(def: &CommandDef, script: &str, secret: &str, entry: &SecretEntry) -> Review {
     let manifest = &def.manifest;
     let perms = one_line_permissions(&manifest.permissions);
-    let rule = "-".repeat(72);
     let query = if entry.query_params.is_empty() {
         String::new()
     } else {
         format!(" (also as query parameter {})", entry.query_params.join(", "))
     };
-    let text = format!(
-        "Command {name}: {description}\n  permissions: {perms}{warnings}\n\n{path}\n{rule}\n{script}\n{rule}\n\
-         {secret} may be sent to {hosts}{query}.\n\
-         Once allowed, this command can do anything the key allows there. Read the script above first.\n\
-         Allow {name} to use {secret}?",
+    let lines: Vec<&str> = script.lines().collect();
+    let reaching: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| reaches_out(line))
+        .map(|(i, line)| numbered(i + 1, line))
+        .collect();
+    let shown = match reaching.len() {
+        0 => "  (none)".to_string(),
+        n if n > MAX_SHOWN => format!("{}\n  ... and {} more", reaching[..MAX_SHOWN].join("\n"), n - MAX_SHOWN),
+        _ => reaching.join("\n"),
+    };
+    let summary = format!(
+        "{name} wants to use your key {secret}\n  {description}\n  permissions: {perms}{warnings}\n  \
+         {secret} may be sent to {hosts}{query}\n\n\
+         Lines of its run.lua ({count} in all) that reach outside the script:\n{shown}\n\n\
+         Once allowed, this exact version can do anything the key allows on those hosts.",
         name = manifest.name,
         description = one_line(&manifest.description),
         perms = confirm::permissions(&perms),
         warnings = confirm::warning_lines(&perms),
-        path = def.script_path().display(),
-        script = script.trim_end(),
         hosts = entry.hosts.join(", "),
+        count = lines.len(),
     );
-    printable(&text)
+    let all: Vec<String> = lines.iter().enumerate().map(|(i, line)| numbered(i + 1, line)).collect();
+    let full = format!("{}\n\n{}\n", def.script_path().display(), all.join("\n"));
+    Review {
+        summary: printable(&summary),
+        full: printable(&full),
+        question: printable(&format!("Allow {} to use {secret}?", manifest.name)),
+    }
+}
+
+fn numbered(number: usize, line: &str) -> String {
+    format!("{number:>5}  {}", line.trim_end())
+}
+
+/// A line that calls out of the sandbox, or names a URL.
+fn reaches_out(line: &str) -> bool {
+    line.contains("://") || REACHING.iter().any(|word| has_word(line, word))
+}
+
+fn has_word(line: &str, word: &str) -> bool {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(word).any(|(at, _)| {
+        let before = line[..at].chars().next_back();
+        let after = line[at + word.len()..].chars().next();
+        !before.is_some_and(ident) && !after.is_some_and(ident)
+    })
 }
 
 /// Only the script may span lines. A newline in a manifest field could print a
@@ -263,19 +313,47 @@ mod tests {
     }
 
     #[test]
-    fn prompt_shows_the_script_with_hidden_characters_escaped() {
+    fn review_shows_lines_that_reach_out_and_escapes_hidden_characters() {
         let tmp = tempfile::tempdir().unwrap();
-        let script = "return function()\n  -- \u{1b}[2Khidden\u{202e}x\r\nend\n";
+        let script = "local API = \"https://api.github.com\"\nlocal n = 1\nreturn function()\n  \
+                      local res = http.get(API) -- \u{1b}[2Khidden\u{202e}x\rcover\n  local httpish = 2\nend\n";
         let def = command(tmp.path(), "stars", &["github"], script);
-        let text = prompt(&def, script, "github", &entry(&[]));
-        assert!(text.contains("return function()"), "{text}");
-        assert!(text.contains("\\u{1b}[2Khidden\\u{202e}x\\u{d}"), "{text}");
-        assert!(text.contains("read: /tmp/\\u{1b}[8m, /a\\nfake"), "{text}");
-        assert!(text.contains("Command stars: test\\n  permissions: no permissions\n"), "{text}");
-        assert_eq!(text.matches("\n  permissions:").count(), 1, "{text}");
-        assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}') && !text.contains('\r'));
-        assert!(text.contains("vault: github"), "{text}");
-        assert!(text.contains("may be sent to api.github.com"), "{text}");
-        assert!(text.ends_with("Allow stars to use github?"), "{text}");
+        let review = review(&def, script, "github", &entry(&[]));
+        let summary = &review.summary;
+        assert!(summary.starts_with("stars wants to use your key github\n"), "{summary}");
+        assert!(summary.contains("    1  local API = \"https://api.github.com\""), "{summary}");
+        assert!(summary.contains("    4    local res = http.get(API) -- \\u{1b}[2Khidden\\u{202e}x\\u{d}cover"), "{summary}");
+        assert!(!summary.contains("local n = 1") && !summary.contains("httpish"), "{summary}");
+        assert!(summary.contains("(6 in all)"), "{summary}");
+        assert!(summary.contains("read: /tmp/\\u{1b}[8m, /a\\nfake"), "{summary}");
+        assert!(summary.contains("  test\\n  permissions: no permissions\n"), "{summary}");
+        assert_eq!(summary.matches("\n  permissions:").count(), 1, "{summary}");
+        assert!(summary.contains("github may be sent to api.github.com"), "{summary}");
+        for text in [summary, &review.full, &review.question] {
+            assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}') && !text.contains('\r'));
+        }
+        assert!(review.full.contains("    2  local n = 1\n"), "{}", review.full);
+        assert!(review.full.contains("    5    local httpish = 2\n"), "{}", review.full);
+        assert_eq!(review.question, "Allow stars to use github?");
+    }
+
+    #[test]
+    fn reaching_out_means_whole_words() {
+        for line in ["http.get(x)", "local f = fs", "exec(\"git\")", "x = _G[\"ht\" .. \"tp\"]", "rawget(_ENV, k)", "u = 'http://x'", "vault('k')"] {
+            assert!(reaches_out(line), "{line}");
+        }
+        for line in ["local https = 1", "local myfs = 2", "envelope()", "-- nothing here", "vaulted = true"] {
+            assert!(!reaches_out(line), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_long_list_is_cut_short() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "http.get(1)\n".repeat(MAX_SHOWN + 3);
+        let def = command(tmp.path(), "many", &["github"], &script);
+        let review = review(&def, &script, "github", &entry(&[]));
+        assert!(review.summary.contains("... and 3 more"), "{}", review.summary);
+        assert_eq!(review.full.matches("http.get(1)").count(), MAX_SHOWN + 3);
     }
 }

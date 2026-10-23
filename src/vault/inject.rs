@@ -66,6 +66,22 @@ pub fn ensure_absent(location: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The secrets `text` asks for. A malformed placeholder is left out here: filling
+/// it in fails later with a clear error.
+pub fn secret_names(text: &str) -> Vec<String> {
+    parse(text)
+        .map(|pieces| {
+            pieces
+                .into_iter()
+                .filter_map(|piece| match piece {
+                    Piece::Secret(name, _) => Some(name.to_string()),
+                    Piece::Literal(_) => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Splits `text` into literal pieces and placeholders, in order.
 fn parse(text: &str) -> Result<Vec<Piece<'_>>> {
     let mut pieces = Vec::new();

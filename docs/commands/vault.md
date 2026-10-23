@@ -12,6 +12,7 @@ tb self vault list
 tb self vault allow <secret> <command>
 tb self vault revoke <secret> <command>
 tb self vault rm <name>
+tb self vault log [--key <key>] [--command <command>] [--limit <n>]
 ```
 
 Every change needs a person at a real terminal. An AI agent's shell has none, so it can't add, change, allow or
@@ -97,8 +98,27 @@ Each key's rules and the commands that use it. Never values.
 
 ## tb self vault allow
 
-Lets a command use a key. It prints the command's permissions, its whole `run.lua`, and where the key may go, then
-asks. Read the script: once allowed, the command can do anything the key allows on those hosts.
+Lets a command use a key. It shows the command's permissions, where the key may go, and every line of its `run.lua`
+that reaches outside the script, with line numbers: calls to `http`, `exec`, `fs`, `env`, `stdin` and `vault`, and
+URLs. Answer `v` to read the whole script in a pager, then `y` or `n`. Once allowed, the command can do anything the
+key allows on those hosts.
+
+```
+lighthouse wants to use your key pagespeed
+  Google Lighthouse for a URL via the PageSpeed API
+  permissions: http: www.googleapis.com; vault: pagespeed
+    ! vault uses your pagespeed key(s) on the hosts you allowed for them
+  pagespeed may be sent to www.googleapis.com (also as query parameter key)
+
+Lines of its run.lua (171 in all) that reach outside the script:
+    3  local API = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+  132    local ok, res = pcall(http.get, API, {
+  137        key = vault("pagespeed"),
+
+Once allowed, this exact version can do anything the key allows on those hosts.
+
+Allow lighthouse to use pagespeed? [y/N, v = read the whole script]
+```
 
 | Argument | Meaning |
 |----------|---------|
@@ -140,6 +160,63 @@ Deletes a key after asking for confirmation on the terminal.
 ```
 
 `deleted` is `false` when you answer no.
+
+## tb self vault log
+
+What happened to your keys, newest first: added, allowed, declined, revoked, removed, used and refused. Never
+values.
+
+| Flag | Meaning |
+|------|---------|
+| `--key <key>` | Only entries for this key. |
+| `--command <command>` | Only entries for this command. |
+| `--limit <n>` | How many entries to show. Default 50. |
+
+```json
+[
+  {
+    "time": "2026-10-23T09:12:03+02:00",
+    "event": "used",
+    "keys": ["pagespeed"],
+    "command": "lighthouse",
+    "request": { "method": "GET", "host": "www.googleapis.com", "path": "/pagespeedonline/v5/runPagespeed" },
+    "outcome": { "status": 200 },
+    "by": ["/opt/homebrew/Cellar/toolbox/0.6.0/bin/toolbox", "~/.local/share/claude/versions/2.1.308", "/bin/zsh"],
+    "terminal": false
+  },
+  {
+    "time": "2026-10-23T09:05:51+02:00",
+    "event": "allowed",
+    "key": "pagespeed",
+    "command": "lighthouse",
+    "by": ["/bin/zsh", "/usr/bin/login", "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"],
+    "terminal": true
+  }
+]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `event` | `added`, `allowed`, `declined`, `revoked`, `removed`, `used` or `refused`. |
+| `request` | Where a key went: method, host and path. Never the query string, which can hold the key. |
+| `outcome` | `{ "status": 200 }`, or `{ "failed": "..." }` when no answer came back. |
+| `reason` | Why a key was refused, for `refused`. |
+| `by` | The programs that started `tb`, nearest first, by path (`~` is your home folder). Claude Code shows as `~/.local/share/claude/versions/<version>`, and `toolbox` first means the [MCP server](mcp.md) ran it. |
+| `terminal` | Whether a person's terminal was attached. An agent's shell and MCP calls have none. |
+
+The log is the file `~/.toolbox/vault-log.jsonl`, readable only by you. Past 5 MB it starts over and keeps the
+previous one as `vault-log.1.jsonl`.
+
+### The copy an agent can't change
+
+An AI agent with your shell could edit or delete that file. Every entry also goes to the macOS system log, which it
+can't change, and which records the path of the program that wrote each entry:
+
+```bash
+log show --last 7d --style compact --predicate 'process == "toolbox" AND eventMessage BEGINSWITH "vault "'
+```
+
+macOS keeps it for days to weeks, depending on disk space.
 
 ## Using a key in a command
 

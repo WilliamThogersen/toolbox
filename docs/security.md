@@ -80,6 +80,12 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
 - **No injection.** macOS release binaries are signed with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and
   debuggers can't get inside them. Linux release binaries are static, so `LD_PRELOAD` has nothing to load into.
 
+### Seeing what happened
+
+[`tb self vault log`](commands/vault.md#tb-self-vault-log) lists every time a key was added, allowed, revoked,
+removed, used or refused: when, by which command, to which host and path, and which programs started `tb` (your
+shell, or an AI app like `claude`). An agent can edit that file, but not the copy in the macOS system log.
+
 ### What it does not protect against
 
 - **A rebuilt toolbox.** If an AI edits the Rust source and rebuilds it, the new binary can do anything. macOS asks

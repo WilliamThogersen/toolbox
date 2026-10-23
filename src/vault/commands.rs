@@ -1,12 +1,14 @@
 //! `tb self vault add|list|allow|revoke|rm`. Every change needs a human at a terminal.
 
 use std::collections::BTreeSet;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow, bail, ensure};
 
 use super::hosts::{normalize_host, normalize_query_param};
+use super::log::{AuditLog, Event};
 use super::{SecretEntry, SecretSummary, SecretValue, VaultStore, approval};
 use crate::manifest::is_valid_name;
 use crate::registry::{CommandDef, Registry};
@@ -15,6 +17,9 @@ use crate::registry::{CommandDef, Registry};
 pub trait Terminal {
     fn read_secret(&self, prompt: &str) -> Result<String>;
     fn confirm(&self, prompt: &str) -> Result<bool>;
+    /// Shows `summary`, then asks `question`. Answering `v` shows `full` in a pager
+    /// and asks again.
+    fn review(&self, summary: &str, full: &str, question: &str) -> Result<bool>;
 }
 
 pub struct Tty;
@@ -25,17 +30,57 @@ impl Terminal for Tty {
     }
 
     fn confirm(&self, prompt: &str) -> Result<bool> {
-        let mut tty = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-            .map_err(no_tty)?;
-        write!(tty, "{prompt} [y/N] ")?;
-        tty.flush()?;
-        let mut answer = String::new();
-        BufReader::new(tty).read_line(&mut answer)?;
-        Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+        let tty = open_tty()?;
+        Ok(matches!(ask(&tty, &format!("{prompt} [y/N] "))?.as_str(), "y" | "Y" | "yes"))
     }
+
+    fn review(&self, summary: &str, full: &str, question: &str) -> Result<bool> {
+        let mut tty = open_tty()?;
+        writeln!(tty, "{summary}\n")?;
+        loop {
+            match ask(&tty, &format!("{question} [y/N, v = read the whole script] "))?.as_str() {
+                "v" | "V" => page(&tty, full)?,
+                "y" | "Y" | "yes" => return Ok(true),
+                _ => return Ok(false),
+            }
+        }
+    }
+}
+
+fn open_tty() -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(no_tty)
+}
+
+fn ask(mut tty: &File, prompt: &str) -> Result<String> {
+    write!(tty, "{prompt}")?;
+    tty.flush()?;
+    let mut answer = String::new();
+    BufReader::new(tty).read_line(&mut answer)?;
+    Ok(answer.trim().to_string())
+}
+
+/// Shows `text` in `less` on the terminal, never on stdout, which carries the JSON
+/// result. The system `less`, not whatever `less` is first in PATH. Without it, the
+/// text is printed.
+fn page(mut tty: &File, text: &str) -> Result<()> {
+    let spawned = Command::new("/usr/bin/less")
+        .stdin(Stdio::piped())
+        .stdout(tty.try_clone()?)
+        .spawn();
+    let Ok(mut less) = spawned else {
+        tty.write_all(text.as_bytes())?;
+        return Ok(());
+    };
+    if let Some(mut input) = less.stdin.take() {
+        // Quitting before the end closes the pipe, which is fine.
+        let _ = input.write_all(text.as_bytes());
+    }
+    less.wait()?;
+    Ok(())
 }
 
 fn no_tty(err: io::Error) -> anyhow::Error {
@@ -54,6 +99,7 @@ pub struct Rules<'a> {
 /// keeps the stored one, and the commands allowed to use it stay allowed.
 pub fn add(
     store: &dyn VaultStore,
+    log: &dyn AuditLog,
     term: &dyn Terminal,
     registry: &Registry,
     name: &str,
@@ -74,6 +120,7 @@ pub fn add(
         None => format!("Value for {name} (input is hidden): "),
     };
     let typed = term.read_secret(&prompt)?;
+    let new_value = !typed.trim().is_empty() || existing.is_none();
     let value = match (typed.trim(), existing) {
         ("", Some(current)) => current.value.clone(),
         (typed, _) => SecretValue::new(typed.to_string())?,
@@ -85,6 +132,12 @@ pub fn add(
         commands: existing.map(|current| current.commands.clone()).unwrap_or_default(),
     };
     store.save(&vault.with_secret(name, entry.clone()))?;
+    log.record(Event::Added {
+        key: name.to_string(),
+        hosts: entry.hosts.clone(),
+        query_params: entry.query_params.clone(),
+        new_value,
+    });
     Ok(entry.summary(name, registry))
 }
 
@@ -96,6 +149,7 @@ pub fn list(store: &dyn VaultStore, registry: &Registry) -> Result<Vec<SecretSum
 /// Returns whether access was given (the human may decline).
 pub fn allow(
     store: &dyn VaultStore,
+    log: &dyn AuditLog,
     term: &dyn Terminal,
     registry: &Registry,
     secret: &str,
@@ -113,10 +167,14 @@ pub fn allow(
     // The prompt and the fingerprint come from the same text, so what was shown is what gets allowed.
     let script = def.read_script()?;
     let fingerprint = approval::fingerprint(&def.manifest_source, &script);
-    if !term.confirm(&approval::prompt(def, &script, secret, entry))? {
+    let (key, name) = (secret.to_string(), command.to_string());
+    let review = approval::review(def, &script, secret, entry);
+    if !term.review(&review.summary, &review.full, &review.question)? {
+        log.record(Event::Declined { key, command: name });
         return Ok(false);
     }
     store.save(&vault.with_secret(secret, entry.with_command(command, fingerprint)))?;
+    log.record(Event::Allowed { key, command: name });
     Ok(true)
 }
 
@@ -134,7 +192,13 @@ fn find_command<'r>(registry: &'r Registry, name: &str) -> Result<&'r CommandDef
 }
 
 /// Takes a command's access away. Returns whether it was removed (the human may decline).
-pub fn revoke(store: &dyn VaultStore, term: &dyn Terminal, secret: &str, command: &str) -> Result<bool> {
+pub fn revoke(
+    store: &dyn VaultStore,
+    log: &dyn AuditLog,
+    term: &dyn Terminal,
+    secret: &str,
+    command: &str,
+) -> Result<bool> {
     let vault = store.load()?;
     let entry = vault
         .get(secret)
@@ -147,17 +211,19 @@ pub fn revoke(store: &dyn VaultStore, term: &dyn Terminal, secret: &str, command
         return Ok(false);
     }
     store.save(&vault.with_secret(secret, entry.without_command(command)))?;
+    log.record(Event::Revoked { key: secret.to_string(), command: command.to_string() });
     Ok(true)
 }
 
 /// Returns whether the secret was deleted (the human may decline).
-pub fn remove(store: &dyn VaultStore, term: &dyn Terminal, name: &str) -> Result<bool> {
+pub fn remove(store: &dyn VaultStore, log: &dyn AuditLog, term: &dyn Terminal, name: &str) -> Result<bool> {
     let vault = store.load()?;
     ensure!(vault.get(name).is_some(), "no secret named {name:?}");
     if !term.confirm(&format!("Delete secret {name:?}?"))? {
         return Ok(false);
     }
     store.save(&vault.without_secret(name))?;
+    log.record(Event::Removed { key: name.to_string() });
     Ok(true)
 }
 
@@ -171,6 +237,7 @@ mod tests {
     use crate::manifest::Manifest;
     use crate::vault::VaultData;
     use crate::vault::approval::Access;
+    use crate::vault::log::MemoryLog;
     use crate::vault::store::MemoryStore;
 
     struct FakeTerminal {
@@ -198,6 +265,10 @@ mod tests {
             self.prompts.borrow_mut().push(prompt.to_string());
             Ok(self.confirm)
         }
+        fn review(&self, summary: &str, full: &str, question: &str) -> Result<bool> {
+            self.prompts.borrow_mut().push(format!("{summary}\n{full}\n{question}"));
+            Ok(self.confirm)
+        }
     }
 
     fn term() -> FakeTerminal {
@@ -210,7 +281,7 @@ mod tests {
 
     fn add_simple(store: &MemoryStore, term: &FakeTerminal, hosts: &[&str]) -> Result<SecretSummary> {
         let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
-        add(store, term, &Registry::default(), "stripe", rules(&hosts, &[]))
+        add(store, &*MemoryLog::new(), term, &Registry::default(), "stripe", rules(&hosts, &[]))
     }
 
     fn command(root: &Path, name: &str, vault: &[&str]) -> CommandDef {
@@ -235,7 +306,7 @@ mod tests {
         let store = MemoryStore::new(VaultData::default());
         let hosts = vec!["API.Stripe.com".to_string(), "127.0.0.1:8080".to_string()];
         let params = vec!["key".to_string()];
-        let summary = add(&store, &term(), &Registry::default(), "stripe", rules(&hosts, &params)).unwrap();
+        let summary = add(&store, &*MemoryLog::new(), &term(), &Registry::default(), "stripe", rules(&hosts, &params)).unwrap();
         assert_eq!(summary.hosts, vec!["127.0.0.1:8080", "api.stripe.com"]);
         assert_eq!(summary.query_params, vec!["key"]);
         let saved = store.load().unwrap();
@@ -247,11 +318,11 @@ mod tests {
         let store = MemoryStore::new(VaultData::default());
         let ok = vec!["x.com".to_string()];
         let none = Registry::default();
-        assert!(add(&store, &term(), &none, "Bad Name", rules(&ok, &[])).is_err());
-        assert!(add(&store, &term(), &none, "ok", rules(&[], &[])).is_err());
+        assert!(add(&store, &*MemoryLog::new(), &term(), &none, "Bad Name", rules(&ok, &[])).is_err());
+        assert!(add(&store, &*MemoryLog::new(), &term(), &none, "ok", rules(&[], &[])).is_err());
         assert!(add_simple(&store, &term(), &["https://x.com"]).is_err());
         assert!(add_simple(&store, &term(), &["localhost"]).is_err());
-        assert!(add(&store, &term(), &none, "ok", rules(&ok, &["a b".to_string()])).is_err());
+        assert!(add(&store, &*MemoryLog::new(), &term(), &none, "ok", rules(&ok, &["a b".to_string()])).is_err());
         let short = FakeTerminal::new("abc", true);
         assert!(add_simple(&store, &short, &["x.com"]).is_err());
         let empty = FakeTerminal::new("", true);
@@ -296,11 +367,11 @@ mod tests {
         };
 
         let decline = FakeTerminal::new("", false);
-        assert!(!allow(&store, &decline, &registry, "stripe", "charge").unwrap());
+        assert!(!allow(&store, &*MemoryLog::new(), &decline, &registry, "stripe", "charge").unwrap());
         assert!(decline.prompts.borrow()[0].contains("return function() end"));
         assert!(store.load().unwrap().get("stripe").unwrap().commands.is_empty());
 
-        assert!(allow(&store, &term(), &registry, "stripe", "charge").unwrap());
+        assert!(allow(&store, &*MemoryLog::new(), &term(), &registry, "stripe", "charge").unwrap());
         let listed = list(&store, &registry).unwrap();
         assert_eq!(listed[0].commands[0].access, Access::Allowed);
 
@@ -321,7 +392,7 @@ mod tests {
                 problem: "missing run.lua".into(),
             }],
         };
-        let err = |secret, cmd| allow(&store, &term(), &registry, secret, cmd).unwrap_err().to_string();
+        let err = |secret, cmd| allow(&store, &*MemoryLog::new(), &term(), &registry, secret, cmd).unwrap_err().to_string();
         assert!(err("stripe", "nope").contains("no command named"));
         assert!(err("stripe", "broken").contains("missing run.lua"));
         assert!(err("stripe", "other").contains("does not list"));
@@ -336,10 +407,10 @@ mod tests {
         store.save(&store.load().unwrap().with_secret("stripe", entry)).unwrap();
 
         let decline = FakeTerminal::new("", false);
-        assert!(!revoke(&store, &decline, "stripe", "charge").unwrap());
-        assert!(revoke(&store, &term(), "stripe", "charge").unwrap());
+        assert!(!revoke(&store, &*MemoryLog::new(), &decline, "stripe", "charge").unwrap());
+        assert!(revoke(&store, &*MemoryLog::new(), &term(), "stripe", "charge").unwrap());
         assert!(store.load().unwrap().get("stripe").unwrap().commands.is_empty());
-        assert!(revoke(&store, &term(), "stripe", "charge").is_err());
+        assert!(revoke(&store, &*MemoryLog::new(), &term(), "stripe", "charge").is_err());
     }
 
     #[test]
@@ -348,11 +419,37 @@ mod tests {
         add_simple(&store, &term(), &["api.stripe.com"]).unwrap();
 
         let decline = FakeTerminal::new("", false);
-        assert!(!remove(&store, &decline, "stripe").unwrap());
+        assert!(!remove(&store, &*MemoryLog::new(), &decline, "stripe").unwrap());
         assert!(store.load().unwrap().get("stripe").is_some());
 
-        assert!(remove(&store, &term(), "stripe").unwrap());
+        assert!(remove(&store, &*MemoryLog::new(), &term(), "stripe").unwrap());
         assert!(store.load().unwrap().get("stripe").is_none());
-        assert!(remove(&store, &term(), "stripe").is_err());
+        assert!(remove(&store, &*MemoryLog::new(), &term(), "stripe").is_err());
+    }
+
+    #[test]
+    fn every_change_is_logged_without_the_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new(VaultData::default());
+        let log = MemoryLog::new();
+        let hosts = vec!["api.stripe.com".to_string()];
+        add(&store, &log, &term(), &Registry::default(), "stripe", rules(&hosts, &[])).unwrap();
+        add(&store, &log, &FakeTerminal::new("", true), &Registry::default(), "stripe", rules(&hosts, &[])).unwrap();
+        let registry = Registry { commands: vec![command(tmp.path(), "charge", &["stripe"])], problems: vec![] };
+        allow(&store, &log, &FakeTerminal::new("", false), &registry, "stripe", "charge").unwrap();
+        allow(&store, &log, &term(), &registry, "stripe", "charge").unwrap();
+        revoke(&store, &log, &term(), "stripe", "charge").unwrap();
+        remove(&store, &log, &term(), "stripe").unwrap();
+
+        let events = log.0.borrow();
+        let (key, command) = ("stripe".to_string(), "charge".to_string());
+        assert!(matches!(&events[0], Event::Added { new_value: true, .. }), "{events:?}");
+        assert!(matches!(&events[1], Event::Added { new_value: false, .. }), "{events:?}");
+        assert_eq!(events[2], Event::Declined { key: key.clone(), command: command.clone() });
+        assert_eq!(events[3], Event::Allowed { key: key.clone(), command: command.clone() });
+        assert_eq!(events[4], Event::Revoked { key: key.clone(), command });
+        assert_eq!(events[5], Event::Removed { key });
+        assert_eq!(events.len(), 6);
+        assert!(!format!("{events:?}").contains("fake_stripe"));
     }
 }

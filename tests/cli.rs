@@ -443,6 +443,43 @@ fn outside_macos_the_vault_is_off() {
 }
 
 #[test]
+fn key_use_is_logged_without_the_key() {
+    let tb = Toolbox::new();
+    let (url, received) = echo_server();
+    tb.add_secret("test", SECRET, &[host_of(&url)]);
+    let script = r#"return function(args)
+        return http.get(args.url .. "path?q=1", { headers = { Authorization = vault("test") } }).status
+    end"#;
+    tb.add_command("call", echo_manifest("call"), script);
+
+    let refused = tb.run(&["call", "--url", &url]);
+    assert!(!refused.status.success());
+    tb.allow("test", "call");
+    let out = tb.run(&["call", "--url", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(received.recv().unwrap().contains(SECRET));
+
+    let raw = fs::read_to_string(tb.home.path().join("vault-log.jsonl")).unwrap();
+    assert!(!raw.contains(SECRET) && !raw.contains("q=1"), "{raw}");
+    let log = tb.json(&["self", "vault", "log"]);
+    let entries = log.as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{log}");
+    let (used, refusal) = (&entries[0], &entries[1]);
+    assert_eq!(used["event"], "used");
+    assert_eq!(used["keys"], json!(["test"]));
+    assert_eq!(used["command"], "call");
+    assert_eq!(used["request"], json!({ "method": "GET", "host": host_of(&url), "path": "/path" }));
+    assert_eq!(used["outcome"], json!({ "status": 200 }));
+    assert_eq!(used["terminal"], false, "the tests run without a terminal, like an agent");
+    assert_eq!(refusal["event"], "refused");
+    assert!(refusal["reason"].as_str().unwrap().contains("tb self vault allow test call"), "{refusal}");
+
+    assert_eq!(tb.json(&["self", "vault", "log", "--limit", "1"]).as_array().unwrap().len(), 1);
+    assert_eq!(tb.json(&["self", "vault", "log", "--key", "other"]), json!([]));
+    assert_eq!(tb.json(&["self", "vault", "log", "--command", "call"]).as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn only_commands_the_human_allowed_can_use_a_secret() {
     let tb = Toolbox::new();
     let (spy, contacted) = spy_proxy();
