@@ -12,7 +12,7 @@ use crate::cli::{ignore_closed_pipe, print_json};
 use crate::install::{self, Confirm, Prompt, Yes, market};
 use crate::registry::Registry;
 use crate::vault::commands::{self as vault_ops, Rules, Tty};
-use crate::{check, describe, paths, scaffold, vault};
+use crate::{check, describe, mcp, paths, scaffold, vault};
 
 pub const NAMESPACE: &str = "self";
 
@@ -75,6 +75,7 @@ pub fn app() -> Command {
         )
         .subcommand(market_app())
         .subcommand(vault_app())
+        .subcommand(Command::new("mcp").about("Serve your commands as MCP tools over stdio, for Claude Code and other AI apps"))
 }
 
 fn market_app() -> Command {
@@ -189,6 +190,7 @@ pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Re
             print_json(&serde_json::json!({ "name": name, "uninstalled": true }))
         }
         Some(("vault", m)) => vault_command(m, registry),
+        Some(("mcp", _)) => mcp::serve(commands_dir),
         _ => unreachable!("clap requires a `self` subcommand"),
     }
 }

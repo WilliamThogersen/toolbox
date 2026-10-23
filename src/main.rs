@@ -4,6 +4,7 @@ mod cli;
 mod describe;
 mod install;
 mod manifest;
+mod mcp;
 mod paths;
 mod registry;
 mod runtime;

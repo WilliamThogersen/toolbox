@@ -66,6 +66,7 @@ on a clean Mac and fails if it isn't the latest release. Run it by hand with `gh
 | `src/cli.rs` | Top level: your commands, built from manifests |
 | `src/builtin.rs` | `tb self`: every built-in command |
 | `src/install/` | Install from git repos and marketplaces, version-aware updates, `.source.json` |
+| `src/mcp/` | `tb self mcp`: commands as MCP tools over stdio |
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
 | `src/vault/` | Keychain storage, placeholder injection, redaction, `vault` subcommands |
 | `src/update.rs` | Once-a-day new-version notice on the terminal |

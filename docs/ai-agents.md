@@ -16,6 +16,17 @@ Before writing a new command, check `tb self search <words>` for one in my marke
 Before `tb self install <source> --yes`, show me the permissions it lists and wait for my OK.
 ```
 
+## Or give it the commands as tools
+
+Apps that speak [MCP](https://modelcontextprotocol.io) can call your commands as tools instead of through a shell:
+
+```bash
+claude mcp add toolbox -- tb self mcp
+```
+
+New commands show up as tools within a few seconds. See [`tb self mcp`](commands/mcp.md). Writing new commands
+still happens in the shell, so keep the snippet above too.
+
 ## Output rules
 
 | What | Where |

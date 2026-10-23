@@ -16,6 +16,7 @@ Plain `tb` lists only your own commands. Everything that manages toolbox lives u
 | [`tb self uninstall <name>`](commands/uninstall.md) | Remove an installed command |
 | [`tb self market`](commands/market.md) | Save, list and remove marketplaces |
 | [`tb self vault`](commands/vault.md) | Add API keys and choose which commands may use them |
+| [`tb self mcp`](commands/mcp.md) | Serve your commands as MCP tools for Claude Code and other AI apps |
 
 Your own commands run as `tb <name> --<arg> <value>`. Add `--help` to see their args.
 
