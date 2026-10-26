@@ -258,12 +258,23 @@ Rules:
 3. The request must go to a host the human allowed for that secret, over https.
    Plain http is allowed only for this computer, at the exact address and port the
    human set (like `http://127.0.0.1:8080`, never `localhost`).
-4. The human must allow your command, with `tb self vault setup`. The approval
+4. If the human limited the key to some methods or paths (`tb self vault list`
+   shows `methods` and `paths`), other requests raise an error before anything is
+   sent. A path with an encoded `.`, `/`, `\` or `%`, or a `..;` part, is refused.
+5. The human must allow your command, with `tb self vault setup`. The approval
    covers the exact `command.json` and `run.lua` they saw: after any edit, the
    human has to allow it again.
-5. Requests that carry a secret never follow redirects.
-6. Any secret value that appears in a response is replaced with `[REDACTED:<name>]`.
-7. The vault is macOS only for now: elsewhere `vault()` raises an error that says so.
+6. A key with `confirm` makes the human approve each matching request with Touch
+   ID. If they say no, the request raises an error and nothing is sent: don't
+   retry unless they ask you to.
+7. Requests that carry a secret never follow redirects.
+8. Any secret value that appears in a response is replaced with `[REDACTED:<name>]`.
+9. The vault is macOS only for now: elsewhere `vault()` raises an error that says so.
+
+Keys from an OAuth sign-in (`"oauth"` in `tb self vault list`) work the same way:
+`vault("google")` becomes a fresh access token while sending. toolbox renews it
+itself. If it says the sign-in expired, ask the human to run
+`tb self vault oauth <name>` in their own terminal.
 
 ### Getting a key from the human
 
@@ -277,6 +288,10 @@ tb self vault request pagespeed --host www.googleapis.com --query-param key \
   --note "Get it at https://console.cloud.google.com/apis/credentials"
 ```
 
+Ask for no more than the command needs: add `--method GET` when it only reads, and
+`--path /pagespeedonline` when it only calls part of the API. The human sees and
+can change these at `setup`.
+
 Use the exact host the API lives on, and `--query-param` only when the API wants
 the key in the query string (otherwise it goes in headers only). `--why` is
 required: one line saying what the key is for, in the user's terms. The note is
@@ -288,6 +303,27 @@ only review it once. After you edit the command, ask them to run
 
 When a run fails because of the vault, the error says which of these to do. You
 cannot add, change, allow or read secrets yourself.
+
+### Keys that need a sign-in (OAuth)
+
+Some APIs (Google, Microsoft, Slack, GitHub Apps) hand out tokens through a
+sign-in page instead of a key to paste. Write the command as usual, with
+`vault("gmail")` in the header, and ask the human to run the sign-in in their own
+terminal. Give them the full command, with the provider's URLs and the scopes your
+command needs:
+
+```bash
+tb self vault oauth gmail --host gmail.googleapis.com \
+  --auth-url https://accounts.google.com/o/oauth2/v2/auth \
+  --token-url https://oauth2.googleapis.com/token \
+  --client-id <their OAuth app's client id> \
+  --scope https://www.googleapis.com/auth/gmail.send \
+  --auth-param access_type=offline --auth-param prompt=consent
+```
+
+They need an OAuth app (client id, often a client secret) from the provider's
+developer console; say where to create it. Then they allow the command with
+`tb self vault setup <command>`.
 
 ## Full example
 

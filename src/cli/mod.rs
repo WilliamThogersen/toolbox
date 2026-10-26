@@ -111,9 +111,12 @@ fn run_user_command(registry: &Registry, name: &str, matches: &ArgMatches) -> Re
         .find(name)
         .with_context(|| format!("unknown command {name:?}"))?;
     let args = collect_args(&def.manifest, matches)?;
-    let log = Box::new(vault::log::default_log()?);
-    let output = runtime::run(def, &args, vault::default_store(), log)
-        .with_context(|| format!("command {name:?} failed"))?;
+    let keys = vault::Keys {
+        store: vault::default_store(),
+        log: Box::new(vault::log::default_log()?),
+        tokens: vault::oauth::TokenCache::in_home()?,
+    };
+    let output = runtime::run(def, &args, keys).with_context(|| format!("command {name:?} failed"))?;
     print_json(&output)
 }
 

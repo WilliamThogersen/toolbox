@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -7,6 +7,7 @@ use serde::Serialize;
 use super::approval::{self, fingerprint};
 use super::commands::{Terminal, destination, find_command};
 use super::hosts::{local_note, normalize_host, normalize_query_param};
+use super::scope::{normalize_method, normalize_path};
 use super::log::{AuditLog, Event};
 use super::names::{self, is_secret_name};
 use super::requests::{self, KeyRequest};
@@ -148,12 +149,7 @@ fn save(
     }
     store.save(done, &change(added, allowed))?;
     for (name, entry) in added {
-        log.record(Event::Added {
-            key: name.clone(),
-            hosts: entry.hosts.clone(),
-            query_params: entry.query_params.clone(),
-            new_value: true,
-        });
+        log.record(Event::added(name, entry, true));
     }
     for grant in allowed {
         log.record(Event::Allowed { key: grant.key.clone(), command: grant.command.clone() });
@@ -188,6 +184,8 @@ fn keys_to_add(vault: &VaultData, waiting: &[KeyRequest], only: Option<&CommandD
                     name: name.clone(),
                     hosts: if calls.len() == 1 { calls.clone() } else { Vec::new() },
                     query_params: Vec::new(),
+                    methods: Vec::new(),
+                    paths: Vec::new(),
                     why: String::new(),
                     note: None,
                 },
@@ -229,17 +227,27 @@ fn ask_new_key(term: &dyn Terminal, registry: &Registry, key: &NewKey) -> Result
     if let Some(note) = local_note(&hosts) {
         term.show(&note)?;
     }
-    let query_params = match req.query_params.as_slice() {
-        [] => Vec::new(),
-        params => {
-            let prompt = format!("Query parameters it may go in (Enter keeps {}, - for headers only): ", params.join(", "));
-            ask_list(term, &prompt, params, normalize_query_param)?
-        }
-    };
+    let query_params = ask_limit(term, &req.query_params, "Query parameters it may go in", "for headers only", normalize_query_param)?;
+    let methods = ask_limit(term, &req.methods, "Methods it may be sent with", "for any", normalize_method)?;
+    let paths = ask_limit(term, &req.paths, "Paths it may go to", "for any", normalize_path)?;
     let Some(value) = ask_value(term, &req.name)? else {
         return Ok(None);
     };
-    Ok(Some(SecretEntry { value, hosts, query_params, commands: BTreeMap::new() }))
+    Ok(Some(SecretEntry { query_params, methods, paths, ..SecretEntry::new(value, hosts) }))
+}
+
+fn ask_limit(
+    term: &dyn Terminal,
+    requested: &[String],
+    what: &str,
+    without: &str,
+    check: fn(&str) -> Result<String>,
+) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prompt = format!("{what} (Enter keeps {}, - {without}): ", requested.join(", "));
+    ask_list(term, &prompt, requested, check)
 }
 
 fn ask_list(term: &dyn Terminal, prompt: &str, default: &[String], check: fn(&str) -> Result<String>) -> Result<Vec<String>> {
@@ -509,6 +517,25 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_request_keeps_or_drops_its_limits() {
+        let home = Home::new(&[("lighthouse", &["www.googleapis.com"], &["maps"])]);
+        let strings = |items: &[&str]| items.iter().map(std::string::ToString::to_string).collect::<Vec<_>>();
+        let narrow = KeyRequest::new("maps", &strings(&["www.googleapis.com"]), &[], "Run audits", None)
+            .unwrap()
+            .limited_to(&strings(&["GET"]), &strings(&["/pagespeedonline"]))
+            .unwrap();
+        requests::save(&home.requests(), &[narrow]).unwrap();
+        let term = Script::new(&["", "", "-", VALUE, "y"]);
+        home.setup(&term, None).unwrap();
+        assert!(term.saw("Methods it may be sent with (Enter keeps GET, - for any): "));
+        assert!(term.saw("Paths it may go to (Enter keeps /pagespeedonline, - for any): "));
+        let saved = home.store.load().unwrap();
+        let maps = saved.get("maps").unwrap();
+        assert_eq!((maps.methods.as_slice(), maps.paths.len()), (&strings(&["GET"])[..], 0));
+        assert!(home.store.changes.borrow()[0].starts_with("add the API key maps for www.googleapis.com (GET only)"));
+    }
+
+    #[test]
     fn the_human_can_change_where_a_requested_key_goes() {
         let home = Home::new(&[]);
         home.request("maps", &["evil.example"], &["key"]);
@@ -615,12 +642,7 @@ mod tests {
     fn requests_for_keys_added_another_way_are_dropped() {
         let home = Home::new(&[]);
         home.request("maps", &["maps.googleapis.com"], &[]);
-        let entry = SecretEntry {
-            value: SecretValue::new(VALUE.into()).unwrap(),
-            hosts: vec!["maps.googleapis.com".into()],
-            query_params: vec![],
-            commands: BTreeMap::new(),
-        };
+        let entry = SecretEntry::new(SecretValue::new(VALUE.into()).unwrap(), vec!["maps.googleapis.com".into()]);
         home.store.save(&VaultData::default().with_secret("maps", entry), "test").unwrap();
         assert!(home.setup(&Script::new(&[]), None).unwrap().is_empty());
         assert!(requests::load(&home.requests()).unwrap().requests.is_empty());
@@ -629,12 +651,7 @@ mod tests {
     #[test]
     fn a_key_you_already_had_is_named_first_at_touch_id() {
         let home = Home::new(&[("evil", &["api.github.com"], &["github", "k0", "k1"])]);
-        let entry = SecretEntry {
-            value: SecretValue::new(VALUE.into()).unwrap(),
-            hosts: vec!["api.github.com".into()],
-            query_params: vec![],
-            commands: BTreeMap::new(),
-        };
+        let entry = SecretEntry::new(SecretValue::new(VALUE.into()).unwrap(), vec!["api.github.com".into()]);
         home.store.save(&VaultData::default().with_secret("github", entry), "test").unwrap();
         home.request("k0", &["a.example"], &[]);
         home.request("k1", &["b.example"], &[]);

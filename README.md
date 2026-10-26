@@ -41,6 +41,9 @@ Now that key sits in the chat log, the agent can print it, and nothing stops it 
 
 - ⚡ **Two files, one new command.** A folder with `command.json` and `run.lua` becomes `tb <name>`. No compile, no restart. Your AI writes it and uses it the same minute.
 - 🔑 **Keys it can use but never see.** Scripts only get `{{vault:github}}`. The real key is swapped in on the way out, for hosts and commands you approved.
+- ✋ **You approve the risky calls.** Limit a key to `GET` or to `/repos/acme`, and have macOS ask for Touch ID before each write it makes.
+- 🔄 **Sign-ins too.** OAuth keys (Google, Microsoft, Slack) sign in once in your browser and renew themselves. The agent never sees a token.
+- 👀 **Watch it live.** `tb self vault log --pretty --follow` shows every key use and refusal as it happens.
 - 🔒 **Sandboxed by default.** A command can only touch the hosts, programs, env vars, folders and keys its `command.json` lists.
 - 🧾 **JSON out, always.** Results on stdout, errors as `{"error": "..."}` on stderr. Easy for agents to read.
 - 🔌 **A tool in any AI app.** `tb self mcp` serves every command as an MCP tool for Claude Code, Claude Desktop, Cursor and more.
@@ -51,6 +54,7 @@ Now that key sits in the chat log, the agent can print it, and nothing stops it 
 | Where the key lives | Pasted into the prompt or an env var | In the vault (macOS Keychain) |
 | What the agent sees | The real key, `ghp_...` | Only `{{vault:github}}` |
 | Where the key can go | Anywhere the agent sends it | Only to hosts you approved, from commands you allowed |
+| What the key can do | Everything the token allows | Only the methods and paths you set, with Touch ID per write if you like |
 | Key echoed back in a response | Visible to the agent | Redacted as `[REDACTED:github]` |
 
 ## 🚀 Install

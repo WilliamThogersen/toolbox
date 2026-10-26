@@ -71,9 +71,22 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
   named), only for hosts you allowed, only over https (http for this computer only). Keys for this computer are
   bound to one address and port, like `127.0.0.1:8080`, so a program can't open its own port, or the other address
   family behind `localhost`, to catch a key.
+- **Keys that do only what they're for.** You can limit a key to some HTTP methods and URL paths
+  (`--method GET --path /repos/acme`). toolbox checks the request after resolving `..`, and refuses paths with
+  encoded dots, slashes or percent signs that a server could read as another path. A key with method or confirm
+  rules also refuses the usual ways to fake a method: an `X-HTTP-Method-Override` header or a `_method` field.
+- **You approve each action, if you want.** A key added with `--confirm writes` (or `all`) makes macOS ask for Touch ID
+  before every matching request, naming the command, method, host and path. Nothing is sent before you say yes, and
+  `writes` covers every method except `GET`, `HEAD` and `OPTIONS`, so an unusual method can't skip the question.
+- **Sign-ins without handing over tokens.** Keys from [`tb self vault oauth`](commands/vault.md#tb-self-vault-oauth)
+  keep the refresh token and client secret in the vault. toolbox fetches access tokens itself, never through the
+  script, and redacts them like keys. The sign-in uses PKCE and a one-time `state`, and the page it comes back to
+  only listens on `127.0.0.1` while you sign in. Access tokens wait in `~/.toolbox/oauth/`, encrypted and
+  authenticated with a key kept in the vault, so an agent can delete them (you then sign in again) but not read,
+  change or swap them between keys.
 - **No downgrades.** Once this version has saved the vault, older versions can't use it, even if the Keychain
-  still trusts them: 0.3.0 and older, which don't know about approvals, see an empty vault, and 0.4.0 to 0.6.0,
-  which don't ask for Touch ID, refuse to open it.
+  still trusts them: 0.3.0 and older, which don't know about approvals, see an empty vault, and 0.4.0 to 0.7.0,
+  which don't ask for Touch ID or don't know method, path, confirm and sign-in rules, refuse to open it.
 - **No detours.** Requests that carry a key ignore redirects and `HTTP_PROXY`-style env vars.
 - **No echoes.** A key that shows up in a response (raw, base64, URL-encoded, or written with JSON escapes like
   `\u0074`) is replaced with `[REDACTED:<name>]`, in `res.body`, `res.headers` and `res.json`.
@@ -89,9 +102,10 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
 
 ### Seeing what happened
 
-[`tb self vault log`](commands/vault.md#tb-self-vault-log) lists every time a key was requested, added, allowed,
-revoked, removed, used or refused: when, by which command, to which host and path, and which programs started `tb` (your
-shell, or an AI app like `claude`). An agent can edit that file, but not the copy in the macOS system log.
+[`tb self vault log`](commands/vault.md#tb-self-vault-log) lists every time a key was requested, added, signed in,
+allowed, revoked, removed, refreshed, used or refused: when, by which command, to which host and path, and which
+programs started `tb` (your shell, or an AI app like `claude`). `--pretty --follow` shows it live, one readable line
+each. An agent can edit that file, but not the copy in the macOS system log.
 
 ### What it does not protect against
 
@@ -106,8 +120,20 @@ shell, or an AI app like `claude`). An agent can edit that file, but not the cop
   [`tb self vault log`](commands/vault.md#tb-self-vault-log), which shows the programs that started it.
 - **A host that echoes the key in a changed form** (part of it, hashed, re-encoded). Redaction only catches exact
   copies.
-- **A command you allowed to use a key.** It can do anything the key allows on the hosts you bound it to. A command
-  that takes a URL or a request body as an argument lets whoever runs it, an AI included, decide what that is.
+- **A command you allowed to use a key.** It can do anything the key allows on the hosts, methods and paths you bound
+  it to. A command that takes a URL or a request body as an argument lets whoever runs it, an AI included, decide
+  what that is.
+- **What a confirmed request says.** The Touch ID dialog names the method, host and path, not the body: saying yes
+  to `POST api.sendgrid.com/v3/mail/send` lets that request go out with whatever body the script built.
+- **How a server reads paths.** Path limits compare the path toolbox sends. A server that maps different paths to
+  the same thing (case, `;` parameters, its own rewrites) can still be reached through them.
+- **APIs that bend HTTP.** Method limits and `--confirm writes` trust the method. An API that writes on `GET` (Slack's
+  Web API takes `GET` for `chat.postMessage`) gets through a `GET` limit without a question; use `--confirm all` for
+  those. Fake-method headers and `_method` fields are refused, but a server with its own way of picking the method
+  isn't covered.
+- **A program racing your sign-in.** The sign-in link is passed to `open`, so for a moment another program of yours
+  can see it in `ps`. One that signs in to the provider with its own account faster than you could make the key
+  belong to that account. Check the account a fresh sign-in shows, for example with a first read-only call.
 - **A local port someone else takes.** A key bound to `127.0.0.1:8080` goes to whatever listens there. While your
   server is stopped, any program can. If your server listens on all addresses (`0.0.0.0`), macOS lets another
   program of yours listen on `127.0.0.1` with the same port and take its connections, even while it runs.

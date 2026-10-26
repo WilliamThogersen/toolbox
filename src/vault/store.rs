@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use super::{SecretEntry, SecretValue, VaultData, platform};
 
 pub const TEST_VAULT_ENV: &str = "TOOLBOX_INSECURE_TEST_VAULT";
+pub const TEST_CONFIRM_ENV: &str = "TOOLBOX_INSECURE_TEST_CONFIRM";
 
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 
-const READABLE_FORMATS: [u32; 2] = [2, FORMAT];
+const READABLE_FORMATS: [u32; 3] = [2, 3, FORMAT];
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,15 +48,7 @@ pub fn decode(raw: &str) -> Result<VaultData> {
         let secrets = old
             .secrets
             .into_iter()
-            .map(|(name, entry)| {
-                let upgraded = SecretEntry {
-                    value: entry.value,
-                    hosts: entry.hosts,
-                    query_params: Vec::new(),
-                    commands: BTreeMap::new(),
-                };
-                (name, upgraded)
-            })
+            .map(|(name, entry)| (name, SecretEntry::new(entry.value, entry.hosts)))
             .collect();
         return Ok(VaultData { secrets });
     }
@@ -73,6 +66,21 @@ pub fn decode(raw: &str) -> Result<VaultData> {
 pub trait VaultStore {
     fn load(&self) -> Result<VaultData>;
     fn save(&self, data: &VaultData, change: &str) -> Result<()>;
+    fn confirm_use(&self, request: &str) -> Result<()>;
+}
+
+impl<T: VaultStore + ?Sized> VaultStore for std::rc::Rc<T> {
+    fn load(&self) -> Result<VaultData> {
+        (**self).load()
+    }
+
+    fn save(&self, data: &VaultData, change: &str) -> Result<()> {
+        (**self).save(data, change)
+    }
+
+    fn confirm_use(&self, request: &str) -> Result<()> {
+        (**self).confirm_use(request)
+    }
 }
 
 pub fn default_store() -> Box<dyn VaultStore> {
@@ -102,12 +110,23 @@ impl VaultStore for FileStore {
         fs::write(&self.path, encode(data)?)
             .with_context(|| format!("could not write {}", self.path.display()))
     }
+
+    fn confirm_use(&self, request: &str) -> Result<()> {
+        eprintln!("toolbox test vault: would ask for Touch ID to {request}");
+        ensure!(
+            std::env::var_os(TEST_CONFIRM_ENV).is_some_and(|answer| answer == "yes"),
+            "declined in the test vault ({TEST_CONFIRM_ENV} is not yes)"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 pub struct MemoryStore {
     pub data: std::cell::RefCell<VaultData>,
     pub changes: std::cell::RefCell<Vec<String>>,
+    pub asked: std::cell::RefCell<Vec<String>>,
+    pub confirm: std::cell::Cell<bool>,
 }
 
 #[cfg(test)]
@@ -116,6 +135,8 @@ impl MemoryStore {
         Self {
             data: std::cell::RefCell::new(data),
             changes: std::cell::RefCell::new(Vec::new()),
+            asked: std::cell::RefCell::new(Vec::new()),
+            confirm: std::cell::Cell::new(true),
         }
     }
 }
@@ -129,6 +150,12 @@ impl VaultStore for MemoryStore {
     fn save(&self, data: &VaultData, change: &str) -> Result<()> {
         *self.data.borrow_mut() = data.clone();
         self.changes.borrow_mut().push(change.to_string());
+        Ok(())
+    }
+
+    fn confirm_use(&self, request: &str) -> Result<()> {
+        self.asked.borrow_mut().push(request.to_string());
+        ensure!(self.confirm.get(), "Canceled by user.");
         Ok(())
     }
 }
@@ -148,10 +175,12 @@ mod tests {
         let data = VaultData::default().with_secret(
             "gh",
             SecretEntry {
-                value: SecretValue::new("abcdefghij".into()).unwrap(),
-                hosts: vec!["api.github.com".into()],
                 query_params: vec!["key".into()],
+                methods: vec!["GET".into()],
+                paths: vec!["/repos".into()],
+                confirm: vec!["writes".into()],
                 commands: [("stars".to_string(), "fp".to_string())].into(),
+                ..SecretEntry::new(SecretValue::new("abcdefghij".into()).unwrap(), vec!["api.github.com".into()])
             },
         );
         store.save(&data, "test").unwrap();
@@ -175,32 +204,32 @@ mod tests {
     fn saved_vaults_hide_keys_from_older_toolboxes() {
         let data = VaultData::default().with_secret(
             "gh",
-            SecretEntry {
-                value: SecretValue::new("super-secret-token".into()).unwrap(),
-                hosts: vec!["api.github.com".into()],
-                query_params: vec![],
-                commands: BTreeMap::new(),
-            },
+            SecretEntry::new(SecretValue::new("super-secret-token".into()).unwrap(), vec!["api.github.com".into()]),
         );
         let raw: serde_json::Value = serde_json::from_str(&encode(&data).unwrap()).unwrap();
-        assert_eq!(raw["format"], 3);
+        assert_eq!(raw["format"], 4, "0.7.0 and older only open formats 2 and 3, so they can't skip method, path and confirm rules");
         assert!(raw.get("secrets").is_none(), "0.3.0 reads `secrets`: {raw}");
         assert!(raw["keys"]["gh"].is_object());
     }
 
     #[test]
-    fn format_2_still_loads() {
-        let raw = r#"{"format":2,"keys":{"gh":{"value":"super-secret-token","hosts":["x.com"]}}}"#;
-        assert_eq!(decode(raw).unwrap().get("gh").unwrap().hosts, vec!["x.com"]);
+    fn formats_2_and_3_still_load() {
+        for format in [2, 3] {
+            let raw = format!(r#"{{"format":{format},"keys":{{"gh":{{"value":"super-secret-token","hosts":["x.com"]}}}}}}"#);
+            let vault = decode(&raw).unwrap();
+            let gh = vault.get("gh").unwrap();
+            assert_eq!(gh.hosts, vec!["x.com"]);
+            assert!(gh.methods.is_empty() && gh.paths.is_empty() && gh.confirm.is_empty());
+        }
     }
 
     #[test]
     fn newer_or_unknown_shapes_are_refused() {
         let base = r#""value":"super-secret-token","hosts":["x.com"]"#;
         for bad in [
-            r#"{"format":4,"keys":{}}"#.to_string(),
-            r#"{"format":3,"keys":{},"rules":{}}"#.to_string(),
-            format!(r#"{{"format":2,"keys":{{"gh":{{{base},"methods":["GET"]}}}}}}"#),
+            r#"{"format":5,"keys":{}}"#.to_string(),
+            r#"{"format":4,"keys":{},"rules":{}}"#.to_string(),
+            format!(r#"{{"format":4,"keys":{{"gh":{{{base},"colors":["red"]}}}}}}"#),
         ] {
             assert!(decode(&bad).is_err(), "{bad}");
         }

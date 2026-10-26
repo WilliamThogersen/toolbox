@@ -36,10 +36,19 @@ impl VaultStore for KeychainStore {
 
     fn save(&self, data: &VaultData, change: &str) -> Result<()> {
         let raw = encode(data)?;
-        sys::confirm_presence(change)?;
+        sys::confirm_presence(change).map_err(|why| {
+            anyhow!(
+                "macOS did not confirm it is you ({why}). Nothing changed. Vault changes need Touch ID or your \
+                 password on this Mac itself, so they don't work over SSH"
+            )
+        })?;
         Self::entry()?
             .set_password(&raw)
             .map_err(|e| anyhow!("could not write the vault to the macOS Keychain: {e}"))
+    }
+
+    fn confirm_use(&self, request: &str) -> Result<()> {
+        sys::confirm_presence(request).map_err(|why| anyhow!("{why}"))
     }
 }
 

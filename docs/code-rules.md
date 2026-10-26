@@ -30,6 +30,7 @@ with `#[expect(lint, reason = "...")]`, which says why and fails once the lint n
 | `vault/inject.rs` `parse`, `vault/unescape.rs` `Unescaped::new` | Each turn moves past what it found, so at most one turn per byte |
 | `mcp/mod.rs` `read_messages`, `mcp/lines.rs` `skip_line` | Each turn consumes at least one byte of input; ends at end of input |
 | `mcp/mod.rs` `watch` | Meant to run as long as the server; stops when stdout is gone |
+| `vault/activity.rs` `Follower::run` | Meant to run until the person presses `Ctrl-C`; stops when stdout is gone |
 
 ## Caps on outside input (rule 3)
 
@@ -43,6 +44,11 @@ with `#[expect(lint, reason = "...")]`, which says why and fails once the lint n
 | Lua memory | 512 MB unless `limits.memory_mb` asks for more | `runtime/limits.rs` |
 | Lua CPU time | 60 s unless `limits.cpu_seconds` asks for more. If the CPU clock can't be read, the run fails | `runtime/limits.rs` |
 | Waiting on an `exec` program | 10 min unless the script sets `timeout` | `runtime/exec.rs` |
+| OAuth token endpoint answer | 1 MB, 30 s | `vault/oauth/token.rs` |
+| OAuth sign-in coming back | 5 min in all, 20 visits, 16 KB and 5 s per visit | `vault/oauth/login.rs` |
+| Waiting for another run to renew an OAuth token | 40 s | `vault/oauth/cache.rs` |
+| OAuth token cache file | 64 KB (bigger reads as no cache) | `vault/oauth/cache.rs` |
+| `vault log --follow`, each read | 8 MB | `vault/activity.rs` |
 
 Release builds also keep overflow checks on (`[profile.release]` in `Cargo.toml`), so arithmetic that overflows ends
 the run with an error instead of a wrong number.

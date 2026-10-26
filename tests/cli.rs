@@ -614,6 +614,9 @@ fn vault_list_shows_names_not_values() {
             "name": "test",
             "hosts": ["api.example.com"],
             "query_params": [],
+            "methods": [],
+            "paths": [],
+            "confirm": [],
             "commands": [
                 { "name": "call", "access": "allowed" },
                 { "name": "edited", "access": "changed" },
@@ -934,6 +937,218 @@ fn secret_requests_ignore_proxy_env_vars() {
     assert_eq!(stdout(&out).trim(), "200");
     assert!(received.recv().unwrap().contains(SECRET));
     assert!(!contacted.load(Ordering::SeqCst), "secret request went through the proxy");
+}
+
+fn method_manifest(name: &str) -> Value {
+    json!({
+        "name": name,
+        "description": "Sends a request with the test secret",
+        "args": {
+            "url": { "type": "string", "required": true },
+            "method": { "type": "string", "default": "GET" }
+        },
+        "permissions": { "http": ["127.0.0.1"], "vault": ["test"] }
+    })
+}
+
+const METHOD_SCRIPT: &str = r#"return function(args)
+    return http.request({ method = args.method, url = args.url, headers = { Authorization = vault("test") } }).status
+end"#;
+
+#[test]
+fn keys_only_go_with_the_methods_and_paths_the_human_set() {
+    let tb = Toolbox::new();
+    let (spy, contacted) = spy_proxy();
+    tb.add_secret("test", SECRET, &[host_of(&format!("{spy}/"))]);
+    tb.edit_vault(|vault| {
+        vault["keys"]["test"]["methods"] = json!(["GET"]);
+        vault["keys"]["test"]["paths"] = json!(["/repos/acme"]);
+    });
+    tb.add_command("call", method_manifest("call"), METHOD_SCRIPT);
+    tb.allow("test", "call");
+
+    for (method, path, why) in [
+        ("DELETE", "/repos/acme/x", "may only be sent with GET, not DELETE"),
+        ("GET", "/repos/acmex", "may only be sent to paths under /repos/acme"),
+        ("GET", "/repos/acme/x/../../other", r#"under /repos/acme, not \"/repos/other\""#),
+        ("GET", "/repos/acme/x%2F..%2F..%2Fother", "could lead the server to another path"),
+    ] {
+        let out = tb.run(&["call", "--url", &format!("{spy}{path}"), "--method", method]);
+        assert!(!out.status.success(), "{method} {path} was sent");
+        assert!(stderr(&out).contains(why), "{method} {path}: {}", stderr(&out));
+    }
+    assert!(!contacted.load(Ordering::SeqCst), "a key reached a method or path the human did not allow");
+
+    let out = tb.run(&["call", "--url", &format!("{spy}/repos/acme/x"), "--method", "get"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(contacted.load(Ordering::SeqCst));
+}
+
+#[test]
+fn keys_set_to_ask_need_the_human_for_each_write() {
+    let tb = Toolbox::new();
+    let (spy, contacted) = spy_proxy();
+    tb.add_secret("test", SECRET, &[host_of(&format!("{spy}/"))]);
+    tb.edit_vault(|vault| vault["keys"]["test"]["confirm"] = json!(["writes"]));
+    tb.add_command("call", method_manifest("call"), METHOD_SCRIPT);
+    tb.allow("test", "call");
+
+    let url = format!("{spy}/v3/mail/send");
+    let out = tb.run(&["call", "--url", &url, "--method", "POST"]);
+    assert!(!out.status.success());
+    let asked = format!("would ask for Touch ID to let the command call send POST {}/v3/mail/send with your API key test", host_of(&format!("{spy}/")));
+    assert!(stderr(&out).contains(&asked), "{}", stderr(&out));
+    assert!(stderr(&out).contains("did not confirm"), "{}", stderr(&out));
+    assert!(!contacted.load(Ordering::SeqCst), "a write went out before the human said yes");
+
+    let yes = [("TOOLBOX_INSECURE_TEST_CONFIRM", "yes")];
+    let out = tb.run_with_env(&["call", "--url", &url, "--method", "POST"], &yes);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(contacted.load(Ordering::SeqCst));
+    let read = tb.run(&["call", "--url", &url]);
+    assert!(read.status.success() && !stderr(&read).contains("would ask"), "reads don't ask: {}", stderr(&read));
+
+    let log = tb.json(&["self", "vault", "log", "--command", "call"]);
+    let events: Vec<(&str, Option<bool>)> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["event"].as_str().unwrap(), e["confirmed"].as_bool()))
+        .collect();
+    assert_eq!(events, [("used", None), ("used", Some(true)), ("refused", None)]);
+}
+
+/// Answers token requests with the given JSON bodies, one per connection, and counts them.
+fn token_endpoint(replies: Vec<String>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/token", listener.local_addr().unwrap().port());
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&asked);
+    thread::spawn(move || {
+        for (stream, reply) in listener.incoming().flatten().zip(replies) {
+            let mut stream = stream;
+            let mut reader = BufReader::new(&stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = n.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+        }
+    });
+    (url, asked)
+}
+
+#[test]
+fn signed_in_keys_renew_themselves_and_never_reach_the_script() {
+    let tb = Toolbox::new();
+    let access = "fake_ACCESS_value_123";
+    let reply = json!({ "access_token": access, "expires_in": 3600, "token_type": "Bearer" }).to_string();
+    let (token_url, asked) = token_endpoint(vec![reply]);
+    let (first, first_received) = echo_server();
+    let (second, second_received) = echo_server();
+    tb.add_secret("google", SECRET, &[host_of(&first), host_of(&second)]);
+    tb.edit_vault(|vault| {
+        vault["keys"]["google"]["oauth"] = json!({
+            "auth_url": "https://accounts.example.com/auth",
+            "token_url": token_url,
+            "client_id": "fake-client",
+            "client_secret": "fake_CLIENT_secret_123",
+            "cache_key": "A".repeat(43)
+        });
+    });
+    let mut manifest = echo_manifest("call");
+    manifest["permissions"]["vault"] = json!(["google"]);
+    tb.add_command(
+        "call",
+        manifest,
+        r#"return function(args)
+            local res = http.get(args.url, { headers = { Authorization = "Bearer " .. vault("google") } })
+            return { echo = res.json.you_sent, placeholder = vault("google") }
+        end"#,
+    );
+    tb.allow("google", "call");
+
+    let out = tb.run(&["call", "--url", &first]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(first_received.recv().unwrap().contains(&format!("Bearer {access}")));
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result, json!({ "echo": "Bearer [REDACTED:google]", "placeholder": "{{vault:google}}" }));
+
+    let out = tb.run(&["call", "--url", &second]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(second_received.recv().unwrap().contains(&format!("Bearer {access}")));
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "the second run uses the saved token");
+
+    let saved = fs::read_to_string(tb.home.path().join("oauth/google.json")).unwrap();
+    assert!(!saved.contains(access) && !saved.contains(SECRET), "the token cache is encrypted: {saved}");
+    let log = tb.json(&["self", "vault", "log", "--key", "google"]);
+    let events: Vec<&str> = log.as_array().unwrap().iter().map(|e| e["event"].as_str().unwrap()).collect();
+    assert_eq!(events, ["used", "used", "refreshed"]);
+    let raw_log = fs::read_to_string(tb.home.path().join("vault-log.jsonl")).unwrap();
+    assert!(!raw_log.contains(access) && !raw_log.contains(SECRET), "{raw_log}");
+}
+
+#[test]
+fn signing_in_needs_a_human_terminal() {
+    let tb = Toolbox::new();
+    let out = tb.run(&[
+        "self", "vault", "oauth", "google", "--host", "api.example.com",
+        "--auth-url", "https://accounts.example.com/auth", "--token-url", "https://accounts.example.com/token",
+        "--client-id", "fake-client",
+    ]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("needs a human at an interactive terminal"), "{}", stderr(&out));
+    assert!(!tb.vault_file().exists());
+}
+
+#[test]
+fn the_key_log_reads_as_lines_and_can_be_watched_live() {
+    let tb = Toolbox::new();
+    tb.add_secret("test", SECRET, &["api.example.com"]);
+    tb.add_command(
+        "call",
+        echo_manifest("call"),
+        r#"return function(args) return http.get(args.url, { headers = { Authorization = vault("test") } }).status end"#,
+    );
+    assert!(!tb.run(&["call", "--url", "http://127.0.0.1:9/first"]).status.success());
+
+    let pretty = tb.run(&["self", "vault", "log", "--pretty"]);
+    assert!(pretty.status.success(), "{}", stderr(&pretty));
+    let text = stdout(&pretty);
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("refused   call with test GET 127.0.0.1:9/first: secret"), "{text}");
+    assert!(!text.contains('\u{1b}'), "no colors when stdout is not a terminal: {text:?}");
+
+    let mut watcher = tb
+        .command(&["self", "vault", "log", "--follow", "--limit", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(watcher.stdout.take().unwrap()).lines();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        if let Some(Ok(line)) = lines.next() {
+            tx.send(line).unwrap();
+        }
+    });
+    thread::sleep(Duration::from_millis(700));
+    assert!(!tb.run(&["call", "--url", "http://127.0.0.1:9/second"]).status.success());
+    let line = rx.recv_timeout(Duration::from_secs(10)).expect("the watcher showed the new entry");
+    watcher.kill().unwrap();
+    watcher.wait().unwrap();
+    let entry: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!((entry["event"].as_str(), entry["request"]["path"].as_str()), (Some("refused"), Some("/second")));
 }
 
 #[test]

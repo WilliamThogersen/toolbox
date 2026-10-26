@@ -21,6 +21,10 @@ impl VaultStore for Unsupported {
     fn save(&self, _data: &VaultData, _change: &str) -> Result<()> {
         Err(anyhow!(UNSUPPORTED))
     }
+
+    fn confirm_use(&self, _request: &str) -> Result<()> {
+        Err(anyhow!(UNSUPPORTED))
+    }
 }
 
 pub fn ancestors() -> Vec<String> {
@@ -36,5 +40,6 @@ mod tests {
         let err = store().load().unwrap_err().to_string();
         assert!(err.starts_with("the vault only works on macOS"), "{err}");
         assert!(store().save(&VaultData::default(), "test").is_err());
+        assert!(store().confirm_use("test").is_err());
     }
 }

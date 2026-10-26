@@ -1,11 +1,14 @@
+pub mod activity;
 pub mod approval;
 pub mod commands;
 pub mod hosts;
 pub mod inject;
 pub mod log;
 pub mod names;
+pub mod oauth;
 mod platform;
 pub mod requests;
+pub mod scope;
 pub mod setup;
 pub mod store;
 mod unescape;
@@ -20,6 +23,13 @@ pub use store::{VaultStore, default_store};
 
 use crate::command::registry::Registry;
 use approval::CommandAccess;
+use log::AuditLog;
+
+pub struct Keys {
+    pub store: Box<dyn VaultStore>,
+    pub log: Box<dyn AuditLog>,
+    pub tokens: oauth::TokenCache,
+}
 
 pub(crate) const MIN_SECRET_LEN: usize = 8;
 
@@ -35,11 +45,37 @@ pub struct SecretEntry {
     pub hosts: Vec<String>,
     #[serde(default)]
     pub query_params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirm: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<oauth::OAuth>,
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
 }
 
 impl SecretEntry {
+    pub fn new(value: SecretValue, hosts: Vec<String>) -> Self {
+        Self {
+            value,
+            hosts,
+            query_params: Vec::new(),
+            methods: Vec::new(),
+            paths: Vec::new(),
+            confirm: Vec::new(),
+            oauth: None,
+            commands: BTreeMap::new(),
+        }
+    }
+
+    pub fn secret_values(&self) -> Vec<&SecretValue> {
+        let oauth = self.oauth.iter().flat_map(|oauth| oauth.client_secret.iter().chain([&oauth.cache_key]));
+        std::iter::once(&self.value).chain(oauth).collect()
+    }
+
     pub fn with_command(&self, name: &str, fingerprint: String) -> Self {
         let mut commands = self.commands.clone();
         commands.insert(name.to_string(), fingerprint);
@@ -67,6 +103,10 @@ impl SecretEntry {
             name: name.to_string(),
             hosts: self.hosts.clone(),
             query_params: self.query_params.clone(),
+            methods: self.methods.clone(),
+            paths: self.paths.clone(),
+            confirm: self.confirm.clone(),
+            oauth: self.oauth.as_ref().map(oauth::OAuth::summary),
             commands: approval::access(name, self, registry),
         }
     }
@@ -109,6 +149,11 @@ pub struct SecretSummary {
     pub name: String,
     pub hosts: Vec<String>,
     pub query_params: Vec<String>,
+    pub methods: Vec<String>,
+    pub paths: Vec<String>,
+    pub confirm: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<oauth::OAuthSummary>,
     pub commands: Vec<CommandAccess>,
 }
 
@@ -146,12 +191,7 @@ mod tests {
     use super::*;
 
     fn entry(value: &str) -> SecretEntry {
-        SecretEntry {
-            value: SecretValue::new(value.to_string()).unwrap(),
-            hosts: vec!["api.example.com".to_string()],
-            query_params: vec![],
-            commands: BTreeMap::new(),
-        }
+        SecretEntry::new(SecretValue::new(value.to_string()).unwrap(), vec!["api.example.com".to_string()])
     }
 
     #[test]
@@ -180,7 +220,7 @@ mod tests {
         let json = serde_json::to_string(&vault.summaries(&Registry::default())).unwrap();
         assert_eq!(
             json,
-            r#"[{"name":"gh","hosts":["api.example.com"],"query_params":[],"commands":[]}]"#
+            r#"[{"name":"gh","hosts":["api.example.com"],"query_params":[],"methods":[],"paths":[],"confirm":[],"commands":[]}]"#
         );
     }
 

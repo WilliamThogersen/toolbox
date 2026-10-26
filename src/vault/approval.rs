@@ -177,10 +177,8 @@ mod tests {
 
     fn entry(commands: &[(&str, &str)]) -> SecretEntry {
         SecretEntry {
-            value: SecretValue::new("fake_token_abcdefgh".into()).unwrap(),
-            hosts: vec!["api.github.com".into()],
-            query_params: vec![],
             commands: commands.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ..SecretEntry::new(SecretValue::new("fake_token_abcdefgh".into()).unwrap(), vec!["api.github.com".into()])
         }
     }
 

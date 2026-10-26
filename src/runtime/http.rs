@@ -12,11 +12,13 @@ use url::{Url, form_urlencoded};
 
 use super::encoding::query_pairs;
 use super::{seconds, ser_options};
+use crate::cli::screen::{one_line, printable};
 use crate::command::manifest::Permissions;
 use crate::vault::approval::Caller;
-use crate::vault::inject::{Injector, Redactor, ensure_absent, mentions_vault, secret_names};
+use crate::vault::inject::{Injector, Redactor, Values, ensure_absent, mentions_vault, secret_names};
 use crate::vault::log::{self as key_log, AuditLog, Event, Outcome};
-use crate::vault::{VaultData, VaultStore};
+use crate::vault::oauth::{Minter, TokenCache};
+use crate::vault::{Keys, SecretValue, VaultData, VaultStore, scope};
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: u64 = 20 * 1024 * 1024;
@@ -100,6 +102,7 @@ pub struct ResponseData {
 struct LazyVault {
     store: Box<dyn VaultStore>,
     loaded: RefCell<Option<Rc<VaultData>>>,
+    minted: RefCell<Vec<(String, SecretValue)>>,
 }
 
 impl LazyVault {
@@ -116,7 +119,7 @@ impl LazyVault {
         self.loaded
             .borrow()
             .as_ref()
-            .map(|data| Redactor::new(data))
+            .map(|data| Redactor::new(data, &self.minted.borrow()))
             .unwrap_or_default()
     }
 }
@@ -128,6 +131,7 @@ pub struct HttpClient {
     plain: Agent,
     secret_safe: Agent,
     log: Box<dyn AuditLog>,
+    tokens: TokenCache,
 }
 
 #[derive(Debug)]
@@ -188,17 +192,19 @@ impl Outgoing {
 const DROPPED_ON_REDIRECT: &[&str] = &["authorization", "cookie", "content-length"];
 
 impl HttpClient {
-    pub fn new(perms: &Permissions, caller: Caller, store: Box<dyn VaultStore>, log: Box<dyn AuditLog>) -> Self {
+    pub fn new(perms: &Permissions, caller: Caller, keys: Keys) -> Self {
         Self {
             allowed_hosts: perms.http.iter().map(|h| h.to_ascii_lowercase()).collect(),
             caller,
             vault: LazyVault {
-                store,
+                store: keys.store,
                 loaded: RefCell::new(None),
+                minted: RefCell::new(Vec::new()),
             },
             plain: agent(Proxy::try_from_env()),
             secret_safe: agent(None),
-            log,
+            log: keys.log,
+            tokens: keys.tokens,
         }
     }
 
@@ -224,13 +230,11 @@ impl HttpClient {
         let injector = Injector {
             vault: &vault,
             caller: &self.caller,
+            method: &outgoing.method,
             url: &outgoing.url,
         };
-        let filled = injector
-            .headers(&outgoing.headers)
-            .and_then(|headers| Ok((headers, injector.query(&outgoing.query)?)));
-        let filled = match filled {
-            Ok(filled) => filled,
+        let (filled, confirmed) = match self.prepare(&injector, &outgoing) {
+            Ok(prepared) => prepared,
             Err(err) => {
                 let reason = format!("{err:#}");
                 self.log.record(Event::Refused { keys, command: self.caller.name.clone(), request, reason });
@@ -245,8 +249,47 @@ impl HttpClient {
             Ok(done) => Outcome::Status(done.status),
             Err(err) => Outcome::Failed(err.to_string()),
         };
-        self.log.record(Event::Used { keys, command: self.caller.name.clone(), request, outcome });
+        self.log.record(Event::Used { keys, command: self.caller.name.clone(), request, outcome, confirmed });
         Ok(redact_response(&redactor, response?))
+    }
+
+    fn prepare(&self, injector: &Injector, outgoing: &Outgoing) -> Result<((Pairs, Pairs), bool)> {
+        scope::normalize_method(&outgoing.method)?;
+        let names = injector.authorize_all(&outgoing.headers, &outgoing.query)?;
+        refuse_method_override(injector.vault, &names, outgoing)?;
+        let asks = injector.needs_confirmation(&names);
+        if !asks.is_empty() {
+            let what = confirmation(&self.caller.name, &outgoing.method, &outgoing.url, &asks);
+            self.vault.store.confirm_use(&what).map_err(|why| {
+                anyhow!(
+                    "the user did not confirm this request ({why:#}), so nothing was sent. The key is set to ask for Touch ID before each {} request: don't retry unless the user asks you to",
+                    outgoing.method.to_ascii_uppercase()
+                )
+            })?;
+        }
+        let values = names
+            .iter()
+            .map(|name| Ok((name.clone(), self.value_for(name, injector.vault)?)))
+            .collect::<Result<Values>>()?;
+        let headers = injector.headers(&outgoing.headers, &values)?;
+        let query = injector.query(&outgoing.query, &values)?;
+        Ok(((headers, query), !asks.is_empty()))
+    }
+
+    fn value_for(&self, name: &str, vault: &VaultData) -> Result<SecretValue> {
+        let entry = vault.get(name).ok_or_else(|| anyhow!("no secret named {name:?} in the vault"))?;
+        let Some(oauth) = &entry.oauth else {
+            return Ok(entry.value.clone());
+        };
+        let tokens = Minter { cache: &self.tokens, log: &*self.log, command: &self.caller.name }
+            .access_token(name, entry, oauth)?;
+        let mut minted = self.vault.minted.borrow_mut();
+        for token in [&tokens.access, &tokens.refresh] {
+            if !minted.iter().any(|(_, known)| known == token) {
+                minted.push((name.to_string(), token.clone()));
+            }
+        }
+        Ok(tokens.access)
     }
 
     fn follow(&self, mut hop: Hop, timeout: Option<Duration>) -> Result<ResponseData> {
@@ -274,6 +317,40 @@ impl HttpClient {
         );
         Ok(())
     }
+}
+
+const MAX_SHOWN_PATH: usize = 120;
+
+fn refuse_method_override(vault: &VaultData, names: &BTreeSet<String>, outgoing: &Outgoing) -> Result<()> {
+    let guarded: Vec<&str> = names
+        .iter()
+        .filter(|name| vault.get(name).is_some_and(|entry| !entry.methods.is_empty() || !entry.confirm.is_empty()))
+        .map(String::as_str)
+        .collect();
+    if guarded.is_empty() {
+        return Ok(());
+    }
+    let sent = scope::Sent { headers: &outgoing.headers, query: &outgoing.query, url: &outgoing.url, body: &outgoing.body };
+    match scope::method_override(&sent) {
+        Some(found) => bail!(
+            "the key {} has method or confirm rules, so it can't be sent with {found}: some servers use it to change the method",
+            guarded.join(", ")
+        ),
+        None => Ok(()),
+    }
+}
+
+fn confirmation(command: &str, method: &str, url: &Url, keys: &[String]) -> String {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    let host = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    };
+    let path: String = printable(url.path()).chars().take(MAX_SHOWN_PATH).collect();
+    let method = printable(&one_line(&method.to_ascii_uppercase()));
+    let cut = if url.path().chars().count() > MAX_SHOWN_PATH { "..." } else { "" };
+    let plural = if keys.len() > 1 { "s" } else { "" };
+    format!("let the command {command} send {method} {host}{path}{cut} with your API key{plural} {}", keys.join(", "))
 }
 
 fn logged_request(method: &str, url: &Url) -> key_log::Request {
@@ -538,12 +615,12 @@ mod tests {
             declared: perms.vault.clone(),
             fingerprint: "t".into(),
         };
-        HttpClient::new(
-            &perms,
-            caller,
-            Box::new(MemoryStore::new(VaultData::default())),
-            Box::new(crate::vault::log::MemoryLog::new()),
-        )
+        let keys = Keys {
+            store: Box::new(MemoryStore::new(VaultData::default())),
+            log: Box::new(crate::vault::log::MemoryLog::new()),
+            tokens: TokenCache { dir: std::env::temp_dir().join("toolbox-unused-token-cache") },
+        };
+        HttpClient::new(&perms, caller, keys)
     }
 
     fn spec(url: &str, options: RequestOptions) -> RequestSpec {
@@ -738,13 +815,8 @@ mod tests {
     }
 
     fn redactor_for(secret: &str) -> Redactor {
-        let entry = SecretEntry {
-            value: SecretValue::new(secret.into()).unwrap(),
-            hosts: vec![],
-            query_params: vec![],
-            commands: BTreeMap::new(),
-        };
-        Redactor::new(&VaultData::default().with_secret("k", entry))
+        let entry = SecretEntry::new(SecretValue::new(secret.into()).unwrap(), vec![]);
+        Redactor::new(&VaultData::default().with_secret("k", entry), &[])
     }
 
     fn with_body(body: &str) -> ResponseData {
@@ -754,6 +826,94 @@ mod tests {
             body: body.into(),
             json: None,
         }
+    }
+
+    fn answer_requests(count: usize) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let (mut head, mut line) = (String::new(), String::new());
+                while reader.read_line(&mut line).unwrap() > 2 {
+                    head.push_str(&line);
+                    line.clear();
+                }
+                stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok").unwrap();
+                tx.send(head).unwrap();
+            }
+        });
+        (port, rx)
+    }
+
+    fn asking_client(port: u16, store: &Rc<MemoryStore>, log: &Rc<crate::vault::log::MemoryLog>) -> HttpClient {
+        let asks = SecretEntry {
+            confirm: vec!["writes".into()],
+            commands: [("t".to_string(), "t".to_string())].into(),
+            ..SecretEntry::new(SecretValue::new("fake_mail_key_123".into()).unwrap(), vec![format!("127.0.0.1:{port}")])
+        };
+        *store.data.borrow_mut() = VaultData::default().with_secret("mail", asks);
+        let perms = Permissions { http: vec!["127.0.0.1".into()], vault: vec!["mail".into()], ..Permissions::default() };
+        let caller = Caller { name: "t".into(), declared: perms.vault.clone(), fingerprint: "t".into() };
+        let tokens = TokenCache { dir: std::env::temp_dir().join("toolbox-unused-token-cache") };
+        HttpClient::new(&perms, caller, Keys { store: Box::new(Rc::clone(store)), log: Box::new(Rc::clone(log)), tokens })
+    }
+
+    fn with_key(method: &str, url: &str) -> RequestSpec {
+        let headers = [("Authorization".to_string(), "Bearer {{vault:mail}}".to_string())].into();
+        RequestSpec { method: method.into(), url: url.into(), options: RequestOptions { headers, ..RequestOptions::default() } }
+    }
+
+    #[test]
+    fn keys_set_to_ask_wait_for_the_human_before_each_write() {
+        let (port, received) = answer_requests(2);
+        let (store, log) = (Rc::new(MemoryStore::new(VaultData::default())), crate::vault::log::MemoryLog::new());
+        let client = asking_client(port, &store, &log);
+        let url = format!("http://127.0.0.1:{port}/v3/mail/send");
+
+        store.confirm.set(false);
+        let err = client.send(with_key("post", &url)).unwrap_err().to_string();
+        assert!(err.contains("did not confirm") && err.contains("don't retry"), "{err}");
+        assert_eq!(*store.asked.borrow(), [format!("let the command t send POST 127.0.0.1:{port}/v3/mail/send with your API key mail")]);
+        assert!(received.try_recv().is_err(), "nothing may be sent before the human says yes");
+        assert!(matches!(&log.0.borrow()[0], Event::Refused { reason, .. } if reason.contains("did not confirm")));
+
+        store.confirm.set(true);
+        assert_eq!(client.send(with_key("POST", &url)).unwrap().status, 200);
+        assert!(received.recv().unwrap().contains("Bearer fake_mail_key_123"));
+        assert!(matches!(&log.0.borrow()[1], Event::Used { confirmed: true, .. }));
+
+        assert_eq!(client.send(with_key("GET", &url)).unwrap().status, 200);
+        assert_eq!(store.asked.borrow().len(), 2, "reads don't ask");
+        assert!(matches!(&log.0.borrow()[2], Event::Used { confirmed: false, .. }));
+    }
+
+    #[test]
+    fn guarded_keys_refuse_odd_methods_and_method_overrides() {
+        let (port, received) = answer_requests(1);
+        let (store, log) = (Rc::new(MemoryStore::new(VaultData::default())), crate::vault::log::MemoryLog::new());
+        let client = asking_client(port, &store, &log);
+        let url = format!("http://127.0.0.1:{port}/v3/mail/send");
+        let err = client.send(with_key("GET\nlet the command t read", &url)).unwrap_err().to_string();
+        assert!(err.contains("is not an HTTP method"), "{err}");
+        let mut overridden = with_key("GET", &url);
+        overridden.options.headers.insert("X-HTTP-Method-Override".into(), "DELETE".into());
+        let err = client.send(overridden).unwrap_err().to_string();
+        assert!(err.contains("can't be sent with the X-HTTP-Method-Override header"), "{err}");
+        assert!(store.asked.borrow().is_empty() && received.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_question_shows_where_the_request_goes_and_escapes_it() {
+        let url = Url::parse("https://api.example.com:8443/a\u{202e}b").unwrap();
+        let asked = confirmation("mail", "delete", &url, &["mail".into(), "other".into()]);
+        assert_eq!(asked, "let the command mail send DELETE api.example.com:8443/a%E2%80%AEb with your API keys mail, other");
+        let long = Url::parse(&format!("https://x.example/{}", "a".repeat(300))).unwrap();
+        let asked = confirmation("t", "POST", &long, &["k".into()]);
+        assert!(asked.contains(&format!("/{}... with", "a".repeat(MAX_SHOWN_PATH - 1))), "{asked}");
     }
 
     #[test]
