@@ -34,3 +34,29 @@ keyring = { version = "4", default-features = false, features = ["v1"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext"] }
+
+# Arithmetic that overflows stops the run with an error instead of wrapping to a wrong value.
+[profile.release]
+overflow-checks = true
+
+# Lint levels for every target. CI turns warnings into errors. The rules behind them are in
+# docs/code-rules.md; clippy.toml holds the thresholds.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Its fix, `assert_eq!(x, [] as [T; 0])`, reads worse than `assert!(x.is_empty())`.
+assert_is_empty = "allow"
+allow_attributes_without_reason = "warn"
+exit = "warn"
+expect_used = "warn"
+indexing_slicing = "warn"
+infinite_loop = "warn"
+multiple_unsafe_ops_per_block = "warn"
+panic = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unreachable = "warn"
+unwrap_used = "warn"

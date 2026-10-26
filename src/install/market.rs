@@ -1,7 +1,3 @@
-//! Saved marketplaces: repos of commands added once under a short name, like brew taps.
-//! They live in `$TOOLBOX_HOME/markets.json` and let `tb self install acme/stars` and
-//! `tb self search` work without typing URLs.
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -11,8 +7,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::{Listing, Request, git, list};
-use crate::manifest::is_valid_name;
-use crate::registry::Problem;
+use crate::command::manifest::is_valid_name;
+use crate::command::registry::Problem;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,7 +73,6 @@ pub struct Added {
     pub commands: Vec<String>,
 }
 
-/// Saves a marketplace after fetching it once, so a typo in the URL fails now, not later.
 pub fn add(path: &Path, commands_dir: &Path, name: &str, url: &str, git_ref: Option<&str>) -> Result<Added> {
     ensure!(is_valid_name(name), "{name:?} is not a valid marketplace name (a-z, 0-9, '-', '_')");
     let markets = load(path)?;
@@ -114,17 +109,12 @@ pub fn entries(path: &Path) -> Result<Vec<Entry>> {
         .collect())
 }
 
-/// Forgets a marketplace. Commands installed from it stay, and still update from its URL.
 pub fn remove(path: &Path, name: &str) -> Result<()> {
     let markets = load(path)?;
     ensure!(markets.markets.contains_key(name), "no marketplace named {name:?}");
     save(path, &markets.without(name))
 }
 
-/// Turns what the user typed into a repo and command names.
-///
-/// `acme/stars` and `acme stars` both mean the saved marketplace `acme`. Anything else
-/// is a git URL or a local path (write `./acme` for a folder named like a marketplace).
 pub fn resolve(markets: &Markets, source: &str, git_ref: Option<&str>, names: &[String]) -> Result<Request> {
     let (market_name, picked) = match source.split_once('/') {
         Some((market, command)) if is_valid_name(market) && is_valid_name(command) => (market, Some(command)),
@@ -154,11 +144,9 @@ pub fn resolve(markets: &Markets, source: &str, git_ref: Option<&str>, names: &[
 #[derive(Debug, Serialize)]
 pub struct SearchReport {
     pub results: Vec<Listing>,
-    /// Marketplaces that could not be fetched.
     pub problems: Vec<Problem>,
 }
 
-/// Commands in every saved marketplace whose name or description contains `text`.
 pub fn search(path: &Path, commands_dir: &Path, text: Option<&str>) -> Result<SearchReport> {
     let markets = load(path)?;
     ensure!(
@@ -204,7 +192,7 @@ fn matches(listing: &Listing, needle: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::Permissions;
+    use crate::command::manifest::Permissions;
 
     fn acme() -> Markets {
         Markets::default().with(
@@ -217,7 +205,7 @@ mod tests {
     }
 
     fn strings(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+        items.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]

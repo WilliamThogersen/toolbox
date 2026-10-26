@@ -6,7 +6,11 @@
 cargo build
 cargo test                  # unit + end-to-end tests
 cargo clippy --all-targets  # keep at 0 warnings
+cargo deny --target aarch64-apple-darwin check  # dependency advisories, licenses, sources (cargo install cargo-deny)
 ```
+
+The lint levels are in `Cargo.toml`'s `[lints]` table and the thresholds in `clippy.toml`, so a plain
+`cargo clippy` checks what CI checks. [Code rules](code-rules.md) explains them.
 
 The Rust version is pinned in `rust-toolchain.toml`: rustup installs it on the first build.
 
@@ -72,7 +76,9 @@ static and that the vault is off. Run it by hand with
 ## CI
 
 [ci](../.github/workflows/ci.yml) runs `cargo test` and `cargo clippy --all-targets -- -D warnings` on macOS and
-Linux for every push to `main` and every pull request.
+Linux for every push to `main` and every pull request. [deny](../.github/workflows/deny.yml) checks the dependencies
+against `deny.toml` (security advisories, licenses, sources) for each shipped target, on the same triggers and every
+day, since new advisories appear without any change here.
 
 To run the suite on Linux from a Mac, use a container with its own target folder (never share `target/` with the
 host):
@@ -88,15 +94,14 @@ The image's rustup installs the pinned toolchain without clippy, hence the `rust
 
 | Path | What |
 |------|------|
-| `src/manifest.rs` | `command.json` schema and validation |
-| `src/registry.rs` | Finds and loads command folders |
-| `src/cli.rs` | Top level: your commands, built from manifests |
-| `src/builtin.rs` | `tb self`: every built-in command |
+| `src/main.rs` | The only file in the `src/` root |
+| `src/cli/` | Top level: your commands, built from manifests. Also arg lookups without panics, data paths, terminal-safe text, the new-version notice |
+| `src/builtin/` | `tb self`: one file per built-in command (`app.rs` defines them all) |
+| `src/command/` | `command.json` schema and validation (`manifest.rs`), finding and loading command folders (`registry.rs`) |
+| `src/sys/` | Every C and macOS framework call, the only code with `unsafe` |
 | `src/install/` | Install from git repos and marketplaces, version-aware updates, `.source.json` |
 | `src/mcp/` | `tb self mcp`: commands as MCP tools over stdio |
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
-| `src/vault/` | Keychain storage (macOS only), placeholder injection, redaction, `vault` subcommands |
-| `src/update.rs` | Once-a-day new-version notice on the terminal |
-| `src/init.rs` | `tb self init`: `~/.claude/TOOLBOX.md` and its import in `CLAUDE.md` |
+| `src/vault/` | Placeholder injection, redaction, `vault` subcommands. `platform/` holds the Keychain store (macOS) and the refusal elsewhere |
 | `docs/` | These docs. `docs/writing-commands.md` is printed by `tb self guide`, `docs/agent-instructions.md` is written by `tb self init` |
 | `assets/demo/` | The VHS tape and the command behind the README's demo GIF |

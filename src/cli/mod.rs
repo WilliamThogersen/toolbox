@@ -1,16 +1,20 @@
-//! Builds the top-level app from every loaded command, then dispatches.
-
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
-use crate::manifest::{ArgSpec, ArgType, Manifest};
-use crate::registry::{self, CommandDef, Registry};
-use crate::{builtin, paths, runtime, vault};
+use crate::command::manifest::{ArgSpec, ArgType, Manifest};
+use crate::cli::matches::{flag, optional};
+use crate::command::registry::{self, CommandDef, Registry};
+pub mod matches;
+pub mod notice;
+pub mod paths;
+pub mod screen;
+
+use crate::{builtin, runtime, vault};
 
 pub fn run() -> Result<ExitCode> {
     let commands_dir = paths::commands_dir()?;
@@ -27,7 +31,6 @@ pub fn run() -> Result<ExitCode> {
     }
 }
 
-/// The top level lists only the user's commands. Built-ins live under `tb self`.
 fn app(registry: &Registry) -> Command {
     let base = Command::new("toolbox")
         .version(env!("CARGO_PKG_VERSION"))
@@ -80,41 +83,40 @@ fn user_arg(name: &str, spec: &ArgSpec) -> Arg {
     }
 }
 
-fn collect_args(manifest: &Manifest, matches: &ArgMatches) -> Value {
-    let args: Map<String, Value> = manifest
+fn collect_args(manifest: &Manifest, matches: &ArgMatches) -> Result<Value> {
+    let given = manifest
         .args
         .iter()
-        .filter_map(|(name, spec)| arg_value(name, spec, matches).map(|v| (name.clone(), v)))
-        .collect();
-    Value::Object(args)
+        .map(|(name, spec)| Ok(arg_value(name, spec, matches)?.map(|value| (name.clone(), value))))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Value::Object(given.into_iter().flatten().collect()))
 }
 
-fn arg_value(name: &str, spec: &ArgSpec, matches: &ArgMatches) -> Option<Value> {
+fn arg_value(name: &str, spec: &ArgSpec, matches: &ArgMatches) -> Result<Option<Value>> {
     let given = match spec.kind {
-        ArgType::Boolean => matches.get_flag(name).then_some(Value::Bool(true)),
-        ArgType::String => matches.get_one::<String>(name).map(|s| Value::from(s.clone())),
-        ArgType::Integer => matches.get_one::<i64>(name).map(|n| Value::from(*n)),
-        ArgType::Number => matches.get_one::<f64>(name).map(|n| Value::from(*n)),
+        ArgType::Boolean => flag(matches, name)?.then_some(Value::Bool(true)),
+        ArgType::String => optional(matches, name)?.map(Value::from),
+        ArgType::Integer => matches.try_get_one::<i64>(name)?.map(|n| Value::from(*n)),
+        ArgType::Number => matches.try_get_one::<f64>(name)?.map(|n| Value::from(*n)),
     };
     let fallback = || match spec.kind {
         ArgType::Boolean => Some(spec.default.clone().unwrap_or(Value::Bool(false))),
         _ => spec.default.clone(),
     };
-    given.or_else(fallback)
+    Ok(given.or_else(fallback))
 }
 
 fn run_user_command(registry: &Registry, name: &str, matches: &ArgMatches) -> Result<ExitCode> {
     let def: &CommandDef = registry
         .find(name)
         .with_context(|| format!("unknown command {name:?}"))?;
-    let args = collect_args(&def.manifest, matches);
+    let args = collect_args(&def.manifest, matches)?;
     let log = Box::new(vault::log::default_log()?);
     let output = runtime::run(def, &args, vault::default_store(), log)
         .with_context(|| format!("command {name:?} failed"))?;
     print_json(&output)
 }
 
-/// An error on stderr: `{"error": ...}` for programs, plain text for a person at a terminal.
 pub fn report_error(message: &str) {
     if io::stderr().is_terminal() {
         eprintln!("error: {message}");
@@ -129,7 +131,6 @@ pub fn print_json(value: &impl Serialize) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `tb ... | head` closes stdout early; that is not an error.
 pub fn ignore_closed_pipe(result: io::Result<()>) -> Result<()> {
     match result {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),

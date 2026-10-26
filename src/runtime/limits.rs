@@ -1,41 +1,30 @@
-//! What one run may use: memory for Lua values, and CPU time. A runaway script
-//! (`while true do end`, a table that grows forever) ends with an error instead of
-//! running until someone kills it. A command that needs more says so in its
-//! `command.json` under `limits`.
-
 use std::cell::Cell;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mlua::{HookTriggers, Lua, VmState};
 
-use crate::manifest::Limits;
+use crate::command::manifest::Limits;
+use crate::sys;
 
 pub const DEFAULT_CPU_SECONDS: f64 = 60.0;
 pub const DEFAULT_MEMORY_MB: u64 = 512;
 
-/// Lua instructions between two looks at the CPU time. A C function like
-/// `string.rep` counts as one instruction, however long it runs.
 const CHECK_EVERY: u32 = 10_000;
 
-/// The limits one run gets: the command's own, or the defaults.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Budget {
-    /// CPU time the script may use. Waiting for `http` or `exec` uses none.
     pub cpu: Duration,
-    /// Memory for Lua values, in MB.
     pub memory_mb: u64,
 }
 
 impl Budget {
-    /// `Manifest::validate` already checked the numbers, so commands with bad limits never run.
     pub fn for_command(limits: &Limits) -> Result<Self> {
         let cpu = super::seconds(limits.cpu_seconds.unwrap_or(DEFAULT_CPU_SECONDS))?;
         let memory_mb = limits.memory_mb.unwrap_or(DEFAULT_MEMORY_MB);
         Ok(Self { cpu, memory_mb })
     }
 
-    /// The error for a script that ran out of memory.
     pub fn memory_message(&self) -> String {
         format!(
             "the script used more than {} MB of memory. If it needs more, raise limits.memory_mb in its command.json",
@@ -51,40 +40,26 @@ impl Budget {
     }
 }
 
-/// Caps Lua's memory and checks its CPU time as it runs, in coroutines too: a global
-/// hook is copied into every coroutine the script creates. Past the CPU limit the
-/// script gets an error. If it catches that (`pcall`) and keeps going, the next check
-/// ends the whole process, which no Lua code can catch.
 pub fn install(lua: &Lua, budget: Budget, command: &str) -> Result<()> {
     let bytes = usize::try_from(budget.memory_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX);
     lua.set_memory_limit(bytes)?;
-    let start = thread_cpu_time();
+    let start = sys::thread_cpu_time().context("could not read the CPU clock, so the CPU limit can't be enforced")?;
     let message = budget.cpu_message();
     let command = command.to_string();
     let warned = Cell::new(false);
     lua.set_global_hook(HookTriggers::new().every_nth_instruction(CHECK_EVERY), move |_, _| {
-        if thread_cpu_time().saturating_sub(start) < budget.cpu {
+        let within = sys::thread_cpu_time().is_some_and(|now| now.saturating_sub(start) < budget.cpu);
+        if within {
             return Ok(VmState::Continue);
         }
         if warned.replace(true) {
             crate::cli::report_error(&format!("command {command:?} failed: {message}"));
+            #[expect(clippy::exit, reason = "the script caught the CPU error, and nothing Lua can catch is left")]
             std::process::exit(1);
         }
         Err(mlua::Error::runtime(message.clone()))
     })?;
     Ok(())
-}
-
-/// CPU time the calling thread has used. Lua and its hook run on one thread, so
-/// other threads (and other tests) don't count.
-fn thread_cpu_time() -> Duration {
-    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: clock_gettime only writes the timespec it is given. It can't fail for
-    // this clock on macOS or Linux; if it did, the time would read as zero.
-    unsafe {
-        libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now);
-    }
-    Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
 }
 
 #[cfg(test)]

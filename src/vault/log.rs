@@ -1,10 +1,4 @@
-//! The key log: every time a key is requested, added, allowed, revoked, removed, used
-//! or refused, with when, by which command and from which programs. Never a value.
-//!
-//! Each entry goes to `$TOOLBOX_HOME/vault-log.jsonl` for `tb self vault log`, and
-//! to the system log. An agent with the user's shell can edit the file, but not the
-//! system log, which also records the path of the program that wrote each entry.
-
+use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -14,14 +8,14 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::platform;
 use super::store::TEST_VAULT_ENV;
-use crate::paths;
+use crate::cli::paths;
+use crate::sys;
 
 pub const LOG_FILE: &str = "vault-log.jsonl";
 const OLD_LOG_FILE: &str = "vault-log.1.jsonl";
-/// The file starts over past this size; the previous one is kept as `vault-log.1.jsonl`.
 const ROTATE_AT: u64 = 5 * 1024 * 1024;
-/// Prefix of every system log message, to find them with `log show`.
 const SYSTEM_PREFIX: &str = "vault ";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -37,7 +31,6 @@ pub enum Event {
     Refused { keys: Vec<String>, command: String, request: Request, reason: String },
 }
 
-/// Where a request carrying a key went. The query string is left out: it may hold the key.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Request {
     pub method: String,
@@ -57,10 +50,7 @@ struct Entry<'a> {
     time: String,
     #[serde(flatten)]
     event: &'a Event,
-    /// The programs that started this `tb`, nearest first, as paths like `/bin/zsh`.
-    /// Paths, not names: Claude Code's process is named after its version.
     by: Vec<String>,
-    /// Whether a person's terminal was attached.
     terminal: bool,
 }
 
@@ -76,19 +66,16 @@ impl<T: AuditLog + ?Sized> AuditLog for std::rc::Rc<T> {
 
 pub struct FileLog {
     pub path: PathBuf,
-    /// Also write to the system log. Off for the plain-text test vault.
     pub system: bool,
 }
 
-/// Recording never stops a command: the system log is the copy that counts, and a
-/// file an agent made unwritable must not turn into a way to break commands.
 impl AuditLog for FileLog {
     fn record(&self, event: Event) {
         let entry = Entry {
             time: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
             event: &event,
-            by: process::ancestors(),
-            terminal: process::has_terminal(),
+            by: platform::ancestors(),
+            terminal: has_terminal(),
         };
         let Ok(line) = serde_json::to_string(&entry) else { return };
         if self.system {
@@ -120,19 +107,24 @@ fn append(path: &Path, line: &str) -> Result<()> {
         .mode(0o600)
         .open(path)
         .with_context(|| format!("could not open {}", path.display()))?;
-    // One write per entry, so entries from commands running side by side don't mix.
     file.write_all(format!("{line}\n").as_bytes())?;
     Ok(())
 }
 
 fn system_log(line: &str) {
-    let Ok(message) = std::ffi::CString::new(format!("{SYSTEM_PREFIX}{line}")) else { return };
-    // SAFETY: a literal format with one %s, given one NUL-terminated string.
-    unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), message.as_ptr()) };
+    if let Ok(message) = CString::new(format!("{SYSTEM_PREFIX}{line}")) {
+        sys::syslog(&message);
+    }
 }
 
-/// What `tb self vault log` shows: entries from the file (and the one before it),
-/// newest first, optionally only for one key or one command.
+fn has_terminal() -> bool {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/tty")
+        .is_ok()
+}
+
 pub struct Filter<'a> {
     pub key: Option<&'a str>,
     pub command: Option<&'a str>,
@@ -159,73 +151,6 @@ fn matches(entry: &Value, filter: &Filter) -> bool {
     key_ok && command_ok
 }
 
-/// Who ran `tb`: the chain of parent programs, and whether a terminal was attached.
-mod process {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    /// Enough to see past shells and wrappers to the app that started them.
-    #[cfg(target_os = "macos")]
-    const MAX_ANCESTORS: usize = 8;
-
-    pub fn has_terminal() -> bool {
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOCTTY)
-            .open("/dev/tty")
-            .is_ok()
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn ancestors() -> Vec<String> {
-        let home = dirs::home_dir().map(|home| home.display().to_string());
-        // SAFETY: getppid takes no arguments and can't fail.
-        let mut pid = unsafe { libc::getppid() };
-        let mut found = Vec::new();
-        while pid > 1 && found.len() < MAX_ANCESTORS {
-            let Some((program, parent)) = info(pid) else { break };
-            let shown = match &home {
-                Some(home) if program.starts_with(&format!("{home}/")) => format!("~{}", &program[home.len()..]),
-                _ => program,
-            };
-            found.push(shown);
-            pid = parent;
-        }
-        found
-    }
-
-    /// The program's path (its name if the path can't be read) and its parent.
-    #[cfg(target_os = "macos")]
-    fn info(pid: libc::pid_t) -> Option<(String, libc::pid_t)> {
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: `info` is a proc_bsdinfo and `size` is its size, as PROC_PIDTBSDINFO expects.
-        let got = unsafe {
-            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size)
-        };
-        if got != size {
-            return None;
-        }
-        let mut path = [0 as libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-        // SAFETY: `path` is a buffer of the size passed in.
-        let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-        let program = if len > 0 { text(&path) } else { text(&info.pbi_comm) };
-        Some((program, info.pbi_ppid as libc::pid_t))
-    }
-
-    #[cfg(target_os = "macos")]
-    fn text(chars: &[libc::c_char]) -> String {
-        let bytes: Vec<u8> = chars.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
-        String::from_utf8_lossy(&bytes).into_owned()
-    }
-
-    /// Only macOS has a vault, so only it records this.
-    #[cfg(not(target_os = "macos"))]
-    pub fn ancestors() -> Vec<String> {
-        Vec::new()
-    }
-}
-
 #[cfg(test)]
 pub struct MemoryLog(pub std::cell::RefCell<Vec<Event>>);
 
@@ -245,6 +170,8 @@ impl AuditLog for MemoryLog {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     fn used(key: &str, command: &str) -> Event {
@@ -286,15 +213,13 @@ mod tests {
     fn the_file_is_private_and_rotates() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(LOG_FILE);
-        fs::write(&path, "x".repeat(ROTATE_AT as usize + 1)).unwrap();
+        fs::write(&path, "x".repeat(usize::try_from(ROTATE_AT).unwrap() + 1)).unwrap();
         let log = FileLog { path: path.clone(), system: false };
         log.record(Event::Removed { key: "old".into() });
 
         assert!(fs::metadata(&path).unwrap().len() < 1000);
         assert!(path.with_file_name(OLD_LOG_FILE).exists());
-        use std::os::unix::fs::PermissionsExt;
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        // The old file's lines aren't JSON here, so only the new entry reads back.
         assert_eq!(read(&path, &Filter { key: None, command: None, limit: 10 }).unwrap().len(), 1);
     }
 
@@ -303,13 +228,5 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let filter = Filter { key: None, command: None, limit: 10 };
         assert!(read(&tmp.path().join(LOG_FILE), &filter).unwrap().is_empty());
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn ancestors_name_the_programs_that_started_us() {
-        let names = process::ancestors();
-        assert!(!names.is_empty(), "the test runner has a parent");
-        assert!(names.iter().all(|name| !name.is_empty()));
     }
 }

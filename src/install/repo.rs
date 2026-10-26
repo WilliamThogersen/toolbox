@@ -1,18 +1,15 @@
-//! Finds the commands in a fetched repo: one at the repo root, or one per top-level folder.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::manifest::{Manifest, is_valid_name};
-use crate::registry::{self, CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
+use crate::command::manifest::{Manifest, is_valid_name};
+use crate::command::registry::{self, CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
 use crate::runtime;
-use crate::screen::one_line;
+use crate::cli::screen::one_line;
 
 const ROOT_LABEL: &str = "(repo root)";
 
-/// What a repo holds: the commands that passed every check, and the problems of the rest.
 #[derive(Debug, Default)]
 pub struct Scan {
     pub commands: Vec<CommandDef>,
@@ -24,7 +21,6 @@ impl Scan {
         self.commands.iter().find(|def| def.manifest.name == name)
     }
 
-    /// Every problem of the broken command `name`, joined; `None` when it isn't broken.
     pub fn problem_of(&self, name: &str) -> Option<String> {
         let problems: Vec<&str> = self
             .broken
@@ -42,13 +38,12 @@ impl Scan {
             .map(|def| def.manifest.name.as_str())
             .chain(self.broken.iter().map(|p| p.command.as_str()))
             .collect();
-        names.sort();
+        names.sort_unstable();
         names.dedup();
         names
     }
 }
 
-/// Checks every command in `checkout`. Fails only when there are none at all.
 pub fn scan(checkout: &Path) -> Result<Scan> {
     let found: Vec<std::result::Result<CommandDef, Vec<Problem>>> =
         if checkout.join(MANIFEST_FILE).symlink_metadata().is_ok() {
@@ -72,14 +67,12 @@ pub fn scan(checkout: &Path) -> Result<Scan> {
     }))
 }
 
-/// What to install: the commands in `names`, or every valid one (skipping the broken) when empty.
 #[derive(Debug)]
 pub struct Selection {
     pub chosen: Vec<CommandDef>,
     pub skipped: Vec<Problem>,
 }
 
-/// A named command must exist and be valid. Broken commands nobody asked for never block.
 pub fn select(scan: Scan, names: &[String]) -> Result<Selection> {
     if names.is_empty() {
         if scan.commands.is_empty() {
@@ -121,11 +114,10 @@ pub fn problem_lines(problems: &[Problem]) -> String {
         .join("\n")
 }
 
-/// Top-level folders holding a `command.json`. Hidden folders and symlinks are skipped.
 fn command_folders(checkout: &Path) -> Result<Vec<(PathBuf, String)>> {
     let mut folders: Vec<(PathBuf, String)> = fs::read_dir(checkout)
         .with_context(|| format!("could not read {}", checkout.display()))?
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|entry| {
             let folder = entry.file_name().to_str()?.to_string();
@@ -137,14 +129,12 @@ fn command_folders(checkout: &Path) -> Result<Vec<(PathBuf, String)>> {
     Ok(folders)
 }
 
-/// `folder` is `None` for a command at the repo root, which takes its name from the manifest.
 fn load_checked(dir: &Path, folder: Option<&str>) -> std::result::Result<CommandDef, Vec<Problem>> {
     let label = folder.unwrap_or(ROOT_LABEL);
     let problem = |message: String| Problem {
         command: label.to_string(),
         problem: message,
     };
-    // A symlink could point at any file on the installing machine. Check before reading.
     let not_regular: Vec<Problem> = [MANIFEST_FILE, SCRIPT_FILE]
         .into_iter()
         .filter(|file| dir.join(file).symlink_metadata().is_ok_and(|m| !m.is_file()))
@@ -184,7 +174,7 @@ mod tests {
     }
 
     fn picked(names: &[&str]) -> Vec<String> {
-        names.iter().map(|n| n.to_string()).collect()
+        names.iter().map(std::string::ToString::to_string).collect()
     }
 
     const OK: &str = "return function() end";

@@ -1,10 +1,5 @@
-//! Text from manifests, scripts and repos, made safe to show on a terminal.
+use crate::command::manifest::Permissions;
 
-use crate::manifest::Permissions;
-
-/// Escapes characters that could hide or reorder text on a terminal: ANSI
-/// escapes, carriage returns, bidi marks and overrides ("Trojan Source") and
-/// zero-width spaces.
 pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| {
@@ -27,8 +22,6 @@ pub fn printable(text: &str) -> String {
         .collect()
 }
 
-/// Only a script may span lines. A newline in a manifest field could print a
-/// fake line, like a second, harmless-looking `permissions:`.
 pub fn one_line(text: &str) -> String {
     text.replace('\n', "\\n").replace('\t', "\\t")
 }

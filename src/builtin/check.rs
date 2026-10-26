@@ -1,8 +1,6 @@
-//! `tb self check`: manifest problems plus Lua syntax errors, in one report.
-
 use serde::Serialize;
 
-use crate::registry::{Problem, Registry};
+use crate::command::registry::{Problem, Registry};
 use crate::runtime;
 
 #[derive(Debug, Serialize)]

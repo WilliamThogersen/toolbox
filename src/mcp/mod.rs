@@ -1,12 +1,8 @@
-//! `tb self mcp`: serves the user's commands as MCP tools over stdio
-//! (newline-delimited JSON-RPC 2.0). Built-ins under `tb self` are not exposed, and calls run
-//! without a terminal, so an MCP client gets no more than an agent's shell: it can run
-//! commands, never manage the vault.
-
+mod lines;
 mod running;
 mod tools;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread::{self, JoinHandle};
@@ -15,13 +11,12 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use lines::{Line, MAX_MESSAGE_BYTES, read_line};
 use running::Running;
 
-/// Newest first. A client asking for one of these gets it, anything else gets the newest.
-/// 2025-03-26 is left out: it requires JSON-RPC batches, which this server doesn't take.
-const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2024-11-05"];
+const PROTOCOL_VERSIONS: &[&str] = &[LATEST_PROTOCOL, "2025-06-18", "2024-11-05"];
+const LATEST_PROTOCOL: &str = "2025-11-25";
 
-/// How often the commands folder is checked, to tell the client when its tools changed.
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
 const INSTRUCTIONS: &str = "Each tool is one of the user's toolbox commands: a small sandboxed Lua script that \
@@ -50,7 +45,6 @@ impl RpcError {
 enum Incoming {
     Request { id: Value, method: String, params: Value },
     Notification { method: String, params: Value },
-    /// A response to a request we sent. We send none, so there is nothing to do.
     Response,
     Invalid { id: Value, error: RpcError },
 }
@@ -61,8 +55,6 @@ struct Server {
     running: Running,
 }
 
-/// Reads messages until the client closes stdin, then stops every call still running: nobody
-/// is left to read the results.
 pub fn serve(commands_dir: &Path) -> Result<ExitCode> {
     let server = Server { commands_dir: commands_dir.to_path_buf(), running: Running::default() };
     let mut calls = Vec::new();
@@ -75,46 +67,47 @@ pub fn serve(commands_dir: &Path) -> Result<ExitCode> {
 }
 
 impl Server {
-    /// Tool calls run on their own threads, so a slow command doesn't hold up pings or other
-    /// calls; replies may come back in any order.
     fn read_messages(&self, calls: &mut Vec<JoinHandle<()>>) -> Result<()> {
+        let mut input = io::stdin().lock();
         let mut watching = false;
-        for line in io::stdin().lock().lines() {
-            let line = match line {
-                Ok(line) => line,
-                Err(err) if err.kind() == io::ErrorKind::InvalidData => {
-                    send(&reply(Value::Null, Err(RpcError::new(PARSE_ERROR, "message is not UTF-8"))))?;
-                    continue;
+        while let Some(line) = read_line(&mut input)? {
+            match line {
+                Line::Text(text) if text.trim().is_empty() => {}
+                Line::Text(text) => self.dispatch(parse(&text), calls, &mut watching)?,
+                Line::NotUtf8 => send(&reply(&Value::Null, Err(RpcError::new(PARSE_ERROR, "message is not UTF-8"))))?,
+                Line::TooLong => {
+                    let message = format!("message is longer than {} MB", MAX_MESSAGE_BYTES >> 20);
+                    send(&reply(&Value::Null, Err(RpcError::new(INVALID_REQUEST, message))))?;
                 }
-                Err(err) => return Err(err.into()),
-            };
-            if line.trim().is_empty() {
-                continue;
             }
-            match parse(&line) {
-                Incoming::Request { id, method, params } if method == "tools/call" => {
-                    calls.retain(|call| !call.is_finished());
-                    calls.push(self.call_in_background(id, params));
-                }
-                Incoming::Request { id, method, params } => {
-                    let outcome = self.handle(&id, &method, &params);
-                    send(&reply(id, outcome))?;
-                }
-                Incoming::Notification { method, params } => match method.as_str() {
-                    "notifications/initialized" if !watching => {
-                        watching = true;
-                        watch(self.commands_dir.clone());
-                    }
-                    "notifications/cancelled" => {
-                        if let Some(id) = params.get("requestId") {
-                            self.running.cancel(&id.to_string());
-                        }
-                    }
-                    _ => {}
-                },
-                Incoming::Response => {}
-                Incoming::Invalid { id, error } => send(&reply(id, Err(error)))?,
+        }
+        Ok(())
+    }
+
+    fn dispatch(&self, incoming: Incoming, calls: &mut Vec<JoinHandle<()>>, watching: &mut bool) -> Result<()> {
+        match incoming {
+            Incoming::Request { id, method, params } if method == "tools/call" => {
+                calls.retain(|call| !call.is_finished());
+                calls.push(self.call_in_background(id, params));
             }
+            Incoming::Request { id, method, params } => {
+                let outcome = self.handle(&id, &method, &params);
+                send(&reply(&id, outcome))?;
+            }
+            Incoming::Notification { method, params } => match method.as_str() {
+                "notifications/initialized" if !*watching => {
+                    *watching = true;
+                    watch(self.commands_dir.clone());
+                }
+                "notifications/cancelled" => {
+                    if let Some(id) = params.get("requestId") {
+                        self.running.cancel(&id.to_string());
+                    }
+                }
+                _ => {}
+            },
+            Incoming::Response => {}
+            Incoming::Invalid { id, error } => send(&reply(&id, Err(error)))?,
         }
         Ok(())
     }
@@ -129,7 +122,6 @@ impl Server {
         }
     }
 
-    /// Replies when the call is done, unless the client cancelled it meanwhile.
     fn call_in_background(&self, id: Value, params: Value) -> JoinHandle<()> {
         let key = id.to_string();
         self.running.begin(&key);
@@ -137,8 +129,7 @@ impl Server {
         thread::spawn(move || {
             let outcome = server.handle(&id, "tools/call", &params);
             if server.running.finish(&key) {
-                // Stdout is gone only when the client is: nobody is left to tell.
-                let _ = send(&reply(id, outcome));
+                let _ = send(&reply(&id, outcome));
             }
         })
     }
@@ -148,7 +139,7 @@ fn initialize(params: &Value) -> Value {
     let asked = params.get("protocolVersion").and_then(Value::as_str);
     let version = asked
         .filter(|version| PROTOCOL_VERSIONS.contains(version))
-        .unwrap_or(PROTOCOL_VERSIONS[0]);
+        .unwrap_or(LATEST_PROTOCOL);
     json!({
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": true } },
@@ -170,7 +161,6 @@ fn parse(line: &str) -> Incoming {
         return Incoming::Response;
     }
     let id = fields.get("id").cloned();
-    // JSON-RPC ids are strings or numbers, and MCP forbids null.
     let usable_id = id.clone().filter(|id| id.is_string() || id.is_number());
     let reply_to = usable_id.clone().unwrap_or(Value::Null);
     if fields.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
@@ -185,15 +175,13 @@ fn parse(line: &str) -> Incoming {
     }
 }
 
-fn reply(id: Value, outcome: Result<Value, RpcError>) -> Value {
+fn reply(id: &Value, outcome: Result<Value, RpcError>) -> Value {
     match outcome {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err(err) => json!({ "jsonrpc": "2.0", "id": id, "error": { "code": err.code, "message": err.message } }),
     }
 }
 
-/// One message per line. Holding the stdout lock for the whole line keeps replies from
-/// different threads from interleaving.
 fn send(message: &Value) -> Result<()> {
     let line = serde_json::to_string(message)? + "\n";
     let mut stdout = io::stdout().lock();
@@ -202,11 +190,7 @@ fn send(message: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Tells the client to fetch the tool list again after a command is added, removed or its
-/// `command.json` changes, so a command an agent just wrote is usable right away.
 fn watch(commands_dir: PathBuf) {
-    // Taken before the next message is read: on the new thread it could miss a command
-    // added right after the handshake.
     let mut seen = tools::fingerprint(&commands_dir);
     thread::spawn(move || {
         loop {
@@ -232,9 +216,9 @@ mod tests {
         match parse(line) {
             Incoming::Request { id, method, params } => {
                 let outcome = server.handle(&id, &method, &params);
-                reply(id, outcome)
+                reply(&id, outcome)
             }
-            Incoming::Invalid { id, error } => reply(id, Err(error)),
+            Incoming::Invalid { id, error } => reply(&id, Err(error)),
             _ => panic!("not a request: {line}"),
         }
     }

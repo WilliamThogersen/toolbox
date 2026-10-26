@@ -1,12 +1,10 @@
-//! Finds command folders on disk and loads the valid ones.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::manifest::Manifest;
+use crate::command::manifest::Manifest;
 
 pub const MANIFEST_FILE: &str = "command.json";
 pub const SCRIPT_FILE: &str = "run.lua";
@@ -14,7 +12,6 @@ pub const SCRIPT_FILE: &str = "run.lua";
 #[derive(Debug, Clone)]
 pub struct CommandDef {
     pub manifest: Manifest,
-    /// The exact `command.json` text `manifest` was parsed from.
     pub manifest_source: String,
     pub dir: PathBuf,
 }
@@ -48,7 +45,6 @@ impl Registry {
     }
 }
 
-/// Loads every `<dir>/<name>/command.json`. Broken commands are reported, not loaded.
 pub fn load(dir: &Path) -> Result<Registry> {
     if !dir.exists() {
         return Ok(Registry::default());
@@ -81,7 +77,6 @@ fn load_one(dir: &Path) -> std::result::Result<CommandDef, Vec<Problem>> {
     load_command(dir, &folder)
 }
 
-/// Loads one command folder whose manifest `name` must equal `folder`.
 pub fn load_command(dir: &Path, folder: &str) -> std::result::Result<CommandDef, Vec<Problem>> {
     let problem = |message: String| Problem {
         command: folder.to_string(),

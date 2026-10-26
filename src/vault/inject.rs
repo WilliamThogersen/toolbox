@@ -1,6 +1,3 @@
-//! Placeholder handling: swapping `{{vault:name}}` for real values on the way
-//! out, and scrubbing real values from responses on the way back.
-
 use std::ops::Range;
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -16,12 +13,9 @@ const PREFIX: &str = "{{vault:";
 const SUFFIX: &str = "}}";
 const ENCODING_SEPARATOR: char = '|';
 
-/// How a secret is written into the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
-    /// As stored.
     Raw,
-    /// Standard base64, for `Authorization: Basic` with a stored `user:password`.
     Base64,
 }
 
@@ -59,7 +53,6 @@ pub fn mentions_vault(text: &str) -> bool {
     text.contains(PREFIX)
 }
 
-/// Placeholders are only honoured in header values and `query` parameters; anywhere else is an error.
 pub fn ensure_absent(location: &str, text: &str) -> Result<()> {
     ensure!(
         !mentions_vault(text),
@@ -68,8 +61,6 @@ pub fn ensure_absent(location: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The secrets `text` asks for. A malformed placeholder is left out here: filling
-/// it in fails later with a clear error.
 pub fn secret_names(text: &str) -> Vec<String> {
     parse(text)
         .map(|pieces| {
@@ -84,7 +75,6 @@ pub fn secret_names(text: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Splits `text` into literal pieces and placeholders, in order.
 fn parse(text: &str) -> Result<Vec<Piece<'_>>> {
     let mut pieces = Vec::new();
     let mut rest = text;
@@ -111,14 +101,12 @@ enum Piece<'a> {
     Secret(&'a str, Encoding),
 }
 
-/// Where in the request a placeholder sits.
 #[derive(Debug, Clone, Copy)]
 enum Place<'a> {
     Header,
     Query(&'a str),
 }
 
-/// Fills in the placeholders of one request, after checking every rule.
 pub struct Injector<'a> {
     pub vault: &'a VaultData,
     pub caller: &'a Caller,
@@ -136,7 +124,6 @@ impl<'a> Injector<'a> {
             .collect()
     }
 
-    /// `query = {...}` pairs, before they are URL-encoded.
     pub fn query(&self, pairs: &[(String, String)]) -> Result<Vec<(String, String)>> {
         pairs
             .iter()
@@ -159,8 +146,6 @@ impl<'a> Injector<'a> {
             .collect()
     }
 
-    /// Mistakes the script can fix come first, so the human is only asked to
-    /// approve a command once it does what it should.
     fn authorize(&self, name: &str, place: Place) -> Result<&'a SecretEntry> {
         ensure!(
             names::declared(&self.caller.declared, name),
@@ -210,7 +195,6 @@ fn check_place(name: &str, entry: &SecretEntry, place: Place) -> Result<()> {
     if entry.query_params.iter().any(|allowed| allowed == param) {
         return Ok(());
     }
-    // The name comes from the script: only a plain one may go into a command the human is asked to paste.
     if !hosts::is_query_param(param) {
         bail!("secret {name:?} can't be sent in the query parameter {param:?}");
     }
@@ -227,9 +211,6 @@ fn check_place(name: &str, entry: &SecretEntry, place: Place) -> Result<()> {
     )
 }
 
-/// The `vault request` line for a key that isn't stored yet, aimed at where the
-/// script just tried to send it (over https, or http to this computer: checked first). The URL and parameter name come from the script,
-/// so each goes in only if it passes the same checks as the CLI's.
 fn missing(name: &str, url: &Url, place: Place) -> anyhow::Error {
     let target = match (url.host_str(), url.port()) {
         (Some(host), Some(port)) => format!("{host}:{port}"),
@@ -246,8 +227,6 @@ fn missing(name: &str, url: &Url, place: Place) -> anyhow::Error {
     )
 }
 
-/// What an old port-less local rule should become: the same IPv4 address, or
-/// 127.0.0.1 for names like `localhost` that no longer work.
 fn local_replacement(rule: &str) -> String {
     match rule.parse::<std::net::Ipv4Addr>() {
         Ok(ip) if ip.is_loopback() => format!("{rule}:<port>"),
@@ -255,7 +234,6 @@ fn local_replacement(rule: &str) -> String {
     }
 }
 
-/// The `vault add` line that sets these rules. An empty value at its prompt keeps the key.
 fn add_command(name: &str, hosts: &[String], query_params: &[String]) -> String {
     let query = if query_params.is_empty() {
         String::new()
@@ -274,11 +252,8 @@ fn is_loopback(url: &Url) -> bool {
     }
 }
 
-/// How many layers of JSON escapes are undone when looking for a key: JSON in a JSON
-/// string in a JSON string is deeper than real responses go.
 const ESCAPE_LAYERS: usize = 3;
 
-/// Replaces any known secret value (and common encodings of it) in text.
 #[derive(Debug, Default)]
 pub struct Redactor {
     needles: Vec<(String, String)>,
@@ -297,13 +272,11 @@ impl Redactor {
                     .map(move |needle| (needle, label.clone()))
             })
             .collect();
-        // Longest first, so a secret that contains another is replaced whole.
         needles.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
         needles.dedup_by(|a, b| a.0 == b.0);
         Self { needles }
     }
 
-    /// Whether `text` holds a secret `redact` would replace.
     pub fn finds(&self, text: &str) -> bool {
         self.needles.iter().any(|(needle, _)| text.contains(needle.as_str()))
     }
@@ -316,9 +289,6 @@ impl Redactor {
         self.redact_escaped(exact)
     }
 
-    /// Keys written with JSON escapes, in any text and up to `ESCAPE_LAYERS` deep, are
-    /// found in the unescaped text and replaced where they sit in `text`. So neither
-    /// `json.decode` nor a script's own unescaping can turn them back into the key.
     fn redact_escaped(&self, text: String) -> String {
         if self.needles.is_empty() || !text.contains('\\') {
             return text;
@@ -328,9 +298,9 @@ impl Redactor {
             .iter()
             .enumerate()
             .flat_map(|(depth, layer)| {
-                let below = &layers[..=depth];
+                let below = layers.iter().take(depth + 1).rev();
                 self.matches(&layer.text).map(move |(range, label)| {
-                    let range = below.iter().rev().fold(range, |range, lower| lower.source_range(range));
+                    let range = below.clone().fold(range, |range, lower| lower.source_range(range));
                     (range, label)
                 })
             })
@@ -346,7 +316,6 @@ impl Redactor {
     }
 }
 
-/// `text` with each range replaced by its label. Overlapping ranges become one.
 fn splice(text: &str, hits: Vec<(Range<usize>, &str)>) -> String {
     let mut sorted = hits;
     sorted.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
@@ -365,8 +334,6 @@ fn splice(text: &str, hits: Vec<(Range<usize>, &str)>) -> String {
     out
 }
 
-/// The whole secret, plus the password of a `user:password` login (for Basic
-/// auth) when it is long enough to redact without mangling normal text.
 fn secret_parts(secret: &str) -> Vec<&str> {
     let password = secret
         .split_once(':')
@@ -375,7 +342,6 @@ fn secret_parts(secret: &str) -> Vec<&str> {
     std::iter::once(secret).chain(password).collect()
 }
 
-/// Every form the vault itself writes a secret in, and then some.
 fn encodings(secret: &str) -> Vec<String> {
     let percent = |text: &str| url::form_urlencoded::byte_serialize(text.as_bytes()).collect::<String>();
     let base64 = STANDARD.encode(secret);
@@ -403,8 +369,8 @@ mod tests {
     fn entry(hosts: &[&str], query_params: &[&str]) -> SecretEntry {
         SecretEntry {
             value: SecretValue::new(TOKEN.to_string()).unwrap(),
-            hosts: hosts.iter().map(|h| h.to_string()).collect(),
-            query_params: query_params.iter().map(|q| q.to_string()).collect(),
+            hosts: hosts.iter().map(std::string::ToString::to_string).collect(),
+            query_params: query_params.iter().map(std::string::ToString::to_string).collect(),
             commands: [("call".to_string(), FINGERPRINT.to_string())].into(),
         }
     }
@@ -416,7 +382,7 @@ mod tests {
     fn caller(declared: &[&str], fingerprint: &str) -> Caller {
         Caller {
             name: "call".to_string(),
-            declared: declared.iter().map(|d| d.to_string()).collect(),
+            declared: declared.iter().map(std::string::ToString::to_string).collect(),
             fingerprint: fingerprint.to_string(),
         }
     }
@@ -525,7 +491,7 @@ mod tests {
     #[test]
     fn a_pattern_still_needs_each_key_allowed() {
         let work = entry(&["api.github.com"], &[]);
-        let personal = SecretEntry { commands: Default::default(), ..work.clone() };
+        let personal = SecretEntry { commands: std::collections::BTreeMap::default(), ..work.clone() };
         let vault = VaultData::default()
             .with_secret("github/work", work)
             .with_secret("github/personal", personal);
@@ -654,9 +620,8 @@ mod tests {
         assert_eq!(clean.matches("[REDACTED:github]").count(), 3, "{clean}");
     }
 
-    /// Every character of `text` as a JSON `\uXXXX` escape.
     fn escaped(text: &str) -> String {
-        text.chars().map(|c| format!("\\u{:04x}", c as u32)).collect()
+        text.chars().map(|c| format!("\\u{:04x}", u32::from(c))).collect::<Vec<_>>().concat()
     }
 
     #[test]
@@ -674,7 +639,6 @@ mod tests {
         let jsonp = redactor.redact(&format!(r#"cb({{"a":"x{}y"}})"#, escaped(TOKEN)));
         assert_eq!(jsonp, format!(r#"cb({{"a":"x{label}y"}})"#));
 
-        // JSON inside a JSON string: the escapes are escaped once more.
         let nested = redactor.redact(&format!(r#"{{"inner":"{{\"a\":\"{}\"}}"}}"#, escaped(TOKEN).replace('\\', "\\\\")));
         let outer: serde_json::Value = serde_json::from_str(&nested).unwrap();
         let inner: serde_json::Value = serde_json::from_str(outer["inner"].as_str().unwrap()).unwrap();

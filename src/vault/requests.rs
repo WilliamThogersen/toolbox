@@ -1,10 +1,3 @@
-//! Keys an agent asked for. `tb self vault request` needs no terminal: it only
-//! writes `$TOOLBOX_HOME/vault-requests.json`, never the vault. `tb self vault setup`
-//! shows each request to the human, who pastes the key and confirms where it may go.
-//!
-//! An agent wrote this file, so nothing in it is trusted: every entry is checked
-//! again when it is read, and the human sees the hosts before the key is stored.
-
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -18,24 +11,20 @@ use super::VaultStore;
 use super::hosts::{normalize_host, normalize_query_param};
 use super::log::{AuditLog, Event};
 use super::names::{self, NAME_RULES, is_secret_name};
-use crate::paths;
-use crate::registry::Registry;
-use crate::screen::printable;
+use crate::cli::paths;
+use crate::command::registry::Registry;
+use crate::cli::screen::printable;
 
 pub const REQUESTS_FILE: &str = "vault-requests.json";
-/// Enough for any real setup. More would bury the human in prompts.
 const MAX_REQUESTS: usize = 20;
-/// Real APIs need one or two. A long list could hide one bad host among good ones.
 const MAX_HOSTS: usize = 5;
 const MAX_QUERY_PARAMS: usize = 5;
-/// For `why` and `note`: one line on the human's screen.
 const MAX_TEXT_LEN: usize = 200;
 
 pub fn default_path() -> Result<PathBuf> {
     Ok(paths::toolbox_home()?.join(REQUESTS_FILE))
 }
 
-/// A key an agent asked the human for, why, and where it says the key should go.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyRequest {
@@ -43,15 +32,12 @@ pub struct KeyRequest {
     pub hosts: Vec<String>,
     #[serde(default)]
     pub query_params: Vec<String>,
-    /// What the key is needed for, shown to the human.
     pub why: String,
-    /// Shown to the human too, like where to get the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
 impl KeyRequest {
-    /// Checks and normalizes everything the same way `tb self vault add` does.
     pub fn new(name: &str, hosts: &[String], query_params: &[String], why: &str, note: Option<&str>) -> Result<Self> {
         ensure!(is_secret_name(name), "{name:?} is not a valid key name ({NAME_RULES})");
         ensure!(!hosts.is_empty(), "give at least one --host the key may be sent to");
@@ -72,15 +58,11 @@ impl KeyRequest {
         })
     }
 
-    /// Checks an entry read from the file, which anyone could have edited.
     fn checked(&self) -> Result<Self> {
         Self::new(&self.name, &self.hosts, &self.query_params, &self.why, self.note.as_deref())
     }
 }
 
-/// `why` and `note` go on the human's screen as they are, so they may hold nothing
-/// a terminal would hide or reorder, and runs of spaces collapse so they can't fake
-/// extra lines.
 fn checked_text(flag: &str, raw: &str) -> Result<String> {
     ensure!(
         !raw.chars().any(char::is_control) && printable(raw) == raw,
@@ -91,7 +73,6 @@ fn checked_text(flag: &str, raw: &str) -> Result<String> {
     Ok(text)
 }
 
-/// Entries are read one by one, so one bad entry doesn't block the others.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFile {
@@ -103,16 +84,12 @@ struct FileOut<'a> {
     requests: &'a [KeyRequest],
 }
 
-/// What the requests file holds right now.
 #[derive(Debug, Default)]
 pub struct Waiting {
-    /// Valid requests, the first for each key, at most `MAX_REQUESTS`.
     pub requests: Vec<KeyRequest>,
-    /// Entries left out: broken, repeated or past the limit.
     pub ignored: usize,
 }
 
-/// The waiting requests. A missing file means none.
 pub fn load(path: &Path) -> Result<Waiting> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -130,14 +107,13 @@ pub fn load(path: &Path) -> Result<Waiting> {
     let requests: Vec<KeyRequest> = valid
         .iter()
         .enumerate()
-        .filter(|(i, entry)| !valid[..*i].iter().any(|earlier| earlier.name == entry.name))
+        .filter(|(i, entry)| !valid.iter().take(*i).any(|earlier| earlier.name == entry.name))
         .map(|(_, entry)| entry.clone())
         .take(MAX_REQUESTS)
         .collect();
     Ok(Waiting { ignored: file.requests.len() - requests.len(), requests })
 }
 
-/// Writes through a temporary file, so a reader never sees half a list.
 pub fn save(path: &Path, requests: &[KeyRequest]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -155,30 +131,23 @@ pub fn save(path: &Path, requests: &[KeyRequest]) -> Result<()> {
     fs::rename(&temp, path).with_context(|| format!("could not write {}", path.display()))
 }
 
-/// `requests` with `request` added, replacing an older request for the same key.
 pub fn with_request(requests: &[KeyRequest], request: KeyRequest) -> Vec<KeyRequest> {
-    requests
-        .iter()
-        .filter(|old| old.name != request.name)
-        .cloned()
-        .chain([request.clone()])
-        .collect()
+    let mut updated: Vec<KeyRequest> = requests.iter().filter(|old| old.name != request.name).cloned().collect();
+    updated.push(request);
+    updated
 }
 
-/// What `tb self vault request` prints for the agent.
 #[derive(Debug, Serialize)]
+#[expect(clippy::struct_field_names, reason = "the field names are the JSON the agent reads")]
 pub struct Requested {
     pub requested: String,
     pub hosts: Vec<String>,
     pub query_params: Vec<String>,
     pub why: String,
-    /// Commands whose `permissions.vault` covers the key.
     pub used_by: Vec<String>,
     pub next: String,
 }
 
-/// Files a request for a key that isn't in the vault yet. Needs no terminal: it
-/// changes nothing but the requests file, and the human checks it in `setup`.
 pub fn request(
     store: &dyn VaultStore,
     log: &dyn AuditLog,
@@ -229,7 +198,7 @@ mod tests {
     use crate::vault::{SecretEntry, SecretValue, VaultData};
 
     fn strings(items: &[&str]) -> Vec<String> {
-        items.iter().map(|item| item.to_string()).collect()
+        items.iter().map(std::string::ToString::to_string).collect()
     }
 
     fn wanted(name: &str) -> KeyRequest {
@@ -343,7 +312,7 @@ mod tests {
             value: SecretValue::new("fake_token_abcdefgh".into()).unwrap(),
             hosts: strings(&["api.example.com"]),
             query_params: vec![],
-            commands: Default::default(),
+            commands: std::collections::BTreeMap::default(),
         };
         let store = MemoryStore::new(VaultData::default().with_secret("maps", entry));
         let none = Registry::default();

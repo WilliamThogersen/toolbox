@@ -1,10 +1,18 @@
 //! End-to-end tests for `tb self mcp`: the real binary as an MCP server over stdio.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::needless_pass_by_value,
+    reason = "test code: a panic is a failed test, and helpers take `json!(...)` values as they are"
+)]
 
-use std::ffi::{CStr, CString};
+mod common;
+
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -13,6 +21,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+
+use pty::Pty;
 
 const WAIT: Duration = Duration::from_secs(15);
 const SECRET: &str = "fake_SUPERSECRET_value_123";
@@ -29,6 +39,7 @@ struct Server {
     _terminal: Option<Pty>,
 }
 
+#[derive(Clone, Copy)]
 enum Session {
     Detached,
     /// The way MCP clients start servers: in a session with a controlling terminal, with
@@ -36,48 +47,85 @@ enum Session {
     Terminal,
 }
 
-/// The controller side of a pseudo-terminal, and the path of its terminal side.
-struct Pty {
-    controller: libc::c_int,
-    path: CString,
-}
+/// A pseudo-terminal, to start the server the way MCP clients do.
+mod pty {
+    #![expect(unsafe_code, reason = "opening a pseudo-terminal and making it a child's terminal takes libc calls")]
 
-impl Pty {
-    fn open() -> Self {
-        unsafe {
-            let controller = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+    use std::ffi::{CStr, CString};
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    /// The controller side of a pseudo-terminal, and the path of its terminal side.
+    pub struct Pty {
+        controller: libc::c_int,
+        pub path: CString,
+    }
+
+    impl Pty {
+        pub fn open() -> Self {
+            // SAFETY: plain flags, no pointers.
+            let controller = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
             assert!(controller >= 0, "posix_openpt: {}", io::Error::last_os_error());
-            assert_eq!(libc::grantpt(controller), 0);
-            assert_eq!(libc::unlockpt(controller), 0);
-            let path = CStr::from_ptr(libc::ptsname(controller)).to_owned();
+            // SAFETY: `controller` is the descriptor posix_openpt just returned.
+            assert_eq!(unsafe { libc::grantpt(controller) }, 0);
+            // SAFETY: as above.
+            assert_eq!(unsafe { libc::unlockpt(controller) }, 0);
+            // SAFETY: as above. ptsname returns a NUL-terminated string that stays valid
+            // until the next call, and it is copied right away.
+            let name = unsafe { libc::ptsname(controller) };
+            assert!(!name.is_null(), "ptsname: {}", io::Error::last_os_error());
+            // SAFETY: checked for null just above.
+            let path = unsafe { CStr::from_ptr(name) }.to_owned();
             Self { controller, path }
         }
     }
-}
 
-impl Drop for Pty {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.controller) };
+    impl Drop for Pty {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor is ours and closed only here.
+            unsafe { libc::close(self.controller) };
+        }
     }
-}
 
-/// Runs in the child before exec: a new session whose controlling terminal is `path`, also
-/// used as stderr (clients let servers inherit theirs). Keeping it open keeps it the
-/// controlling terminal: macOS drops that when the last handle closes.
-fn take_terminal(path: &CStr) -> io::Result<()> {
-    unsafe {
-        if libc::setsid() < 0 {
+    /// Makes `cmd` start in a new session whose controlling terminal is `path`.
+    pub fn use_as_terminal(cmd: &mut Command, path: CString) {
+        // SAFETY: `take_terminal` only makes async-signal-safe calls, as code between fork
+        // and exec must, and allocates nothing.
+        unsafe { cmd.pre_exec(move || take_terminal(&path)) };
+    }
+
+    /// Runs in the child before exec: a new session whose controlling terminal is `path`, also
+    /// used as stderr (clients let servers inherit theirs). Keeping it open keeps it the
+    /// controlling terminal: macOS drops that when the last handle closes.
+    #[allow(
+        clippy::useless_conversion,
+        reason = "TIOCSCTTY is a u32 on macOS, which ioctl takes as a c_ulong; on Linux it already is one"
+    )]
+    fn take_terminal(path: &CStr) -> io::Result<()> {
+        // SAFETY: setsid takes no arguments.
+        if unsafe { libc::setsid() } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let fd = libc::open(path.as_ptr(), libc::O_RDWR);
-        if fd < 0 || libc::ioctl(fd, libc::TIOCSCTTY as _, 0) < 0 || libc::dup2(fd, 2) < 0 {
+        // SAFETY: `path` is a NUL-terminated string that outlives the call.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is open, and TIOCSCTTY takes no pointer.
+        if unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: both are open descriptors.
+        if unsafe { libc::dup2(fd, 2) } < 0 {
             return Err(io::Error::last_os_error());
         }
         if fd != 2 {
-            libc::close(fd);
+            // SAFETY: `fd` is ours, and stderr now holds its own copy.
+            unsafe { libc::close(fd) };
         }
+        Ok(())
     }
-    Ok(())
 }
 
 impl Server {
@@ -96,19 +144,12 @@ impl Server {
             .stderr(Stdio::null());
         let terminal = match session {
             Session::Detached => {
-                // No controlling terminal, like an AI agent's shell.
-                unsafe {
-                    cmd.pre_exec(|| {
-                        libc::setsid();
-                        Ok(())
-                    });
-                }
+                common::detach(&mut cmd);
                 None
             }
             Session::Terminal => {
                 let pty = Pty::open();
-                let path = pty.path.clone();
-                unsafe { cmd.pre_exec(move || take_terminal(&path)) };
+                pty::use_as_terminal(&mut cmd, pty.path.clone());
                 Some(pty)
             }
         };
@@ -215,7 +256,7 @@ fn fingerprint(manifest: &str, script: &str) -> String {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().concat()
 }
 
 /// Serves one request and echoes its Authorization header back as JSON. Sends the whole
@@ -402,6 +443,19 @@ fn a_cancelled_call_is_stopped_and_gets_no_reply() {
     assert!(!ran.exists(), "the cancelled call kept running");
     assert_eq!(server.request(2, "ping", json!({}))["result"], json!({}));
     assert!(server.unclaimed.iter().all(|m| m["id"] != 1), "a cancelled call was answered");
+}
+
+#[test]
+fn a_cancelled_call_also_ends_a_program_exec_runs_in_its_own_group() {
+    let mut server = Server::ready();
+    let pid_file = server.home.path().join("sleeper.pid");
+    server.add_command("nap", json!({}), &common::exec_sleeper_script(&pid_file), json!({ "exec": ["sh"] }));
+
+    server.send(1, "tools/call", json!({ "name": "nap" }));
+    let sleeper = common::read_pid(&pid_file);
+    server.write(json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } }));
+
+    assert!(common::ends_soon(sleeper), "sleep {sleeper} outlived the cancelled call");
 }
 
 #[test]

@@ -1,6 +1,3 @@
-//! `time.*` for scripts: the clock, formatting, parsing and sleeping. Times are
-//! seconds since 1970 (UTC) as numbers with millisecond precision.
-
 use std::fmt::Write;
 use std::thread;
 
@@ -45,11 +42,16 @@ fn now() -> f64 {
     to_seconds(Utc::now())
 }
 
+#[expect(clippy::cast_precision_loss, reason = "milliseconds since 1970 stay below 2^53 for 285,000 years")]
 fn to_seconds(t: DateTime<Utc>) -> f64 {
     t.timestamp_millis() as f64 / 1000.0
 }
 
-/// strftime-style `fmt` (default ISO 8601) in `"utc"` (default) or `"local"` time.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "`millis` is checked to be finite and inside i64's range before the cast"
+)]
 fn format(ts: f64, fmt: Option<&str>, zone: Option<&str>) -> Result<String> {
     let millis = (ts * 1000.0).round();
     let utc = (ts.is_finite() && millis.abs() < i64::MAX as f64)
@@ -66,8 +68,6 @@ fn format(ts: f64, fmt: Option<&str>, zone: Option<&str>) -> Result<String> {
     Ok(out)
 }
 
-/// Without `fmt`: RFC 3339 (`2026-10-22T09:30:00Z`), RFC 2822 (HTTP dates) or a plain
-/// `2026-10-22`. With `fmt`: strftime-style; a time without a zone is taken as UTC.
 fn parse(text: &str, fmt: Option<&str>) -> Result<f64> {
     let parsed = match fmt {
         Some(fmt) => parse_with(text, fmt),
@@ -125,10 +125,10 @@ mod tests {
 
     #[test]
     fn parses_common_shapes() {
-        assert_eq!(parse("2026-10-22", None).unwrap(), 1792627200.0);
-        assert_eq!(parse("Thu, 22 Oct 2026 00:00:00 GMT", None).unwrap(), 1792627200.0);
-        assert_eq!(parse("22.10.2026 01:00", Some("%d.%m.%Y %H:%M")).unwrap(), 1792630800.0);
-        assert_eq!(parse("2026-10-22T00:00:00.250Z", None).unwrap(), 1792627200.25);
+        assert_eq!(parse("2026-10-22", None).unwrap(), 1_792_627_200.0);
+        assert_eq!(parse("Thu, 22 Oct 2026 00:00:00 GMT", None).unwrap(), 1_792_627_200.0);
+        assert_eq!(parse("22.10.2026 01:00", Some("%d.%m.%Y %H:%M")).unwrap(), 1_792_630_800.0);
+        assert_eq!(parse("2026-10-22T00:00:00.250Z", None).unwrap(), 1_792_627_200.25);
         assert!(parse("yesterday", None).unwrap_err().to_string().contains("pass a format"));
     }
 
@@ -139,9 +139,9 @@ mod tests {
         assert!(zone.to_string().contains("\"utc\" or \"local\""), "{zone}");
         let fmt = lua.load(r#"time.format(0, "%Q")"#).exec().unwrap_err();
         assert!(fmt.to_string().contains("invalid time format"), "{fmt}");
-        let huge = lua.load(r#"time.format(1e300)"#).exec().unwrap_err();
+        let huge = lua.load(r"time.format(1e300)").exec().unwrap_err();
         assert!(huge.to_string().contains("not a time"), "{huge}");
-        let sleep = lua.load(r#"time.sleep(-1)"#).exec().unwrap_err();
+        let sleep = lua.load(r"time.sleep(-1)").exec().unwrap_err();
         assert!(sleep.to_string().contains("not a valid number of seconds"), "{sleep}");
     }
 

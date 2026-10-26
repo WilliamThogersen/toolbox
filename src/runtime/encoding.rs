@@ -1,5 +1,3 @@
-//! `base64.*`, `url.*` and `hash.*` for scripts. Pure functions: no permission needed.
-
 use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
@@ -15,12 +13,10 @@ use url::form_urlencoded;
 use super::lua_error;
 use crate::vault::inject::mentions_vault;
 
-/// Encodes with `=` padding, decodes with or without it.
 const STANDARD: GeneralPurpose = GeneralPurpose::new(
     &alphabet::STANDARD,
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
-/// URL-safe (`-_`), as in JWTs: encodes without padding, decodes either way.
 const URL_SAFE: GeneralPurpose = GeneralPurpose::new(
     &alphabet::URL_SAFE,
     GeneralPurposeConfig::new()
@@ -28,7 +24,6 @@ const URL_SAFE: GeneralPurpose = GeneralPurpose::new(
         .with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
-/// Everything but `A-Z a-z 0-9 - . _ ~` is escaped, so the result fits anywhere in a URL.
 const URL_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'.').remove(b'_').remove(b'~');
 
 pub fn install(lua: &Lua) -> mlua::Result<()> {
@@ -37,9 +32,6 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
     install_hash(lua)
 }
 
-/// The vault swaps placeholders in http header values and `query` parameters only.
-/// Anything computed from a placeholder here would hold the placeholder text, not
-/// the key, so it is refused.
 fn refuse_placeholder(what: &str, data: &[u8]) -> Result<()> {
     if mentions_vault(&String::from_utf8_lossy(data)) {
         bail!(
@@ -110,8 +102,6 @@ fn install_url(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set("url", table)
 }
 
-/// `{ q = "a b", tag = {"x", "y"} }` becomes `q=a b`, `tag=x`, `tag=y`, keys sorted.
-/// Used by `url.query` and by `http`'s `query` and `form` options.
 pub fn query_pairs(params: &BTreeMap<String, serde_json::Value>) -> Result<Vec<(String, String)>> {
     let mut pairs = Vec::new();
     for (key, value) in params {
@@ -165,10 +155,9 @@ fn install_hash(lua: &Lua) -> mlua::Result<()> {
     lua.globals().set("hash", table)
 }
 
-/// A digest as `"hex"` (default), `"base64"` or `"raw"` bytes.
 fn render(lua: &Lua, digest: &[u8], output: Option<&str>) -> mlua::Result<LuaString> {
     match output.unwrap_or("hex") {
-        "hex" => lua.create_string(digest.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        "hex" => lua.create_string(digest.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().concat()),
         "base64" => lua.create_string(STANDARD.encode(digest)),
         "raw" => lua.create_string(digest),
         other => Err(mlua::Error::runtime(format!(
@@ -215,7 +204,7 @@ mod tests {
             eval(r#"return url.query({ q = "a b&c", page = 2, tag = {"x", "y"}, on = true })"#),
             "on=true&page=2&q=a+b%26c&tag=x&tag=y"
         );
-        assert!(err(r#"url.query({ nested = { a = 1 } })"#).contains("must be a string"));
+        assert!(err(r"url.query({ nested = { a = 1 } })").contains("must be a string"));
     }
 
     #[test]

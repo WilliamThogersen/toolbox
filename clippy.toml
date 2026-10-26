@@ -1,0 +1,10 @@
+# Thresholds for the lints in Cargo.toml's [lints] table. See docs/code-rules.md.
+
+# A function fits on one printed page. Counts code lines, not blank or comment lines.
+too-many-lines-threshold = 60
+
+# Tests may panic: a failed unwrap there is a failed test, not a crash.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

@@ -1,7 +1,3 @@
-//! Which commands may use a secret. A human allows each command at a terminal,
-//! pinned to a fingerprint of its files, so any later edit (by hand, by an agent
-//! or by `tb self update`) needs a new approval.
-
 use std::collections::BTreeSet;
 
 use anyhow::{Result, bail};
@@ -11,20 +7,17 @@ use sha2::{Digest, Sha256};
 use super::commands::destination;
 use super::{SecretEntry, names};
 use crate::install::confirm;
-use crate::registry::{CommandDef, Registry};
-use crate::screen::{one_line, one_line_permissions, printable};
+use crate::command::registry::{CommandDef, Registry};
+use crate::cli::screen::{one_line, one_line_permissions, printable};
 
-/// The command asking to use secrets, as it is about to run.
 #[derive(Debug, Clone)]
 pub struct Caller {
     pub name: String,
-    /// The secrets (or patterns, like `github/*`) its manifest lists in `permissions.vault`.
     pub declared: Vec<String>,
     pub fingerprint: String,
 }
 
 impl Caller {
-    /// `script` must be the exact source that will run, so the approval covers what executes.
     pub fn new(def: &CommandDef, script: &str) -> Self {
         Self {
             name: def.manifest.name.clone(),
@@ -34,18 +27,15 @@ impl Caller {
     }
 }
 
-/// SHA-256 over `command.json` and `run.lua`, each prefixed with its length so
-/// bytes can't shift from one file to the other.
 pub fn fingerprint(manifest: &str, script: &str) -> String {
     let mut hasher = Sha256::new();
     for part in [manifest, script] {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().concat()
 }
 
-/// Fails unless the human allowed exactly this version of the command to use `secret`.
 pub fn check(secret: &str, entry: &SecretEntry, caller: &Caller) -> Result<()> {
     let name = &caller.name;
     match entry.commands.get(name) {
@@ -62,13 +52,9 @@ pub fn check(secret: &str, entry: &SecretEntry, caller: &Caller) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Access {
-    /// Allowed, and unchanged since.
     Allowed,
-    /// Allowed once, but its files changed since.
     Changed,
-    /// Lists the secret in `permissions.vault`, but was never allowed.
     NotAllowed,
-    /// Allowed once, but no longer installed (or broken).
     Missing,
 }
 
@@ -78,8 +64,6 @@ pub struct CommandAccess {
     pub access: Access,
 }
 
-/// Every command that lists `secret` (or a pattern covering it) or was allowed to
-/// use it, sorted by name.
 pub fn access(secret: &str, entry: &SecretEntry, registry: &Registry) -> Vec<CommandAccess> {
     let users = registry
         .commands
@@ -108,27 +92,18 @@ fn access_of(name: &str, entry: &SecretEntry, registry: &Registry) -> Access {
     }
 }
 
-/// What the human sees before allowing a command to use a key.
 pub struct Review {
-    /// The short screen: the command, its permissions, where the key may go, and
-    /// every line of the script that reaches outside it.
     pub summary: String,
-    /// The whole script with line numbers, for the pager.
     pub full: String,
     pub question: String,
 }
 
-/// Globals a script reaches the world through. `_G`, `_ENV` and `rawget` reach the
-/// same globals under another name, so lines using them are shown too.
 const REACHING: &[&str] = &["http", "exec", "fs", "env", "stdin", "vault", "_G", "_ENV", "rawget"];
 
-/// More than this and the short screen would be the long one again.
 const MAX_SHOWN: usize = 25;
 
-/// Built from the same text that gets fingerprinted, and escaped as a whole, since
-/// any manifest string or script line could carry terminal codes. `keys` must not be
-/// empty; the question asks about the first.
 pub fn review(def: &CommandDef, script: &str, keys: &[(&str, &SecretEntry)]) -> Review {
+    debug_assert!(!keys.is_empty(), "a review asks about at least one key");
     let manifest = &def.manifest;
     let perms = one_line_permissions(&manifest.permissions);
     let names: Vec<&str> = keys.iter().map(|(name, _)| *name).collect();
@@ -149,7 +124,10 @@ pub fn review(def: &CommandDef, script: &str, keys: &[(&str, &SecretEntry)]) -> 
         .collect();
     let shown = match reaching.len() {
         0 => "  (none)".to_string(),
-        n if n > MAX_SHOWN => format!("{}\n  ... and {} more", reaching[..MAX_SHOWN].join("\n"), n - MAX_SHOWN),
+        n if n > MAX_SHOWN => {
+            let first: Vec<&str> = reaching.iter().take(MAX_SHOWN).map(String::as_str).collect();
+            format!("{}\n  ... and {} more", first.join("\n"), n - MAX_SHOWN)
+        }
         _ => reaching.join("\n"),
     };
     let summary = format!(
@@ -168,7 +146,7 @@ pub fn review(def: &CommandDef, script: &str, keys: &[(&str, &SecretEntry)]) -> 
     Review {
         summary: printable(&summary),
         full: printable(&full),
-        question: printable(&format!("Allow {} to use {}?", manifest.name, names[0])),
+        question: printable(&format!("Allow {} to use {}?", manifest.name, names.first().copied().unwrap_or_default())),
     }
 }
 
@@ -176,7 +154,6 @@ fn numbered(number: usize, line: &str) -> String {
     format!("{number:>5}  {}", line.trim_end())
 }
 
-/// A line that calls out of the sandbox, or names a URL.
 fn reaches_out(line: &str) -> bool {
     line.contains("://") || REACHING.iter().any(|word| has_word(line, word))
 }
@@ -195,7 +172,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::manifest::Manifest;
+    use crate::command::manifest::Manifest;
     use crate::vault::SecretValue;
 
     fn entry(commands: &[(&str, &str)]) -> SecretEntry {

@@ -1,9 +1,5 @@
-//! `fs.*` for scripts: files inside the folders listed in `permissions.read` and
-//! `permissions.write`. Paths are checked after symlinks are resolved, so a link
-//! inside an allowed folder can't reach outside it.
-
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
@@ -12,10 +8,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use mlua::{FromLuaMulti, IntoLuaMulti, Lua, LuaSerdeExt, LuaString};
 use serde::Serialize;
 
-use super::{lua_error, ser_options};
-use crate::manifest::Permissions;
-
-const MAX_READ_BYTES: u64 = 20 * 1024 * 1024;
+use super::{lua_error, read_capped, ser_options};
+use crate::command::manifest::Permissions;
 
 #[derive(Debug, Clone, Copy)]
 enum Access {
@@ -28,7 +22,6 @@ pub struct FsGuard {
     write: Vec<String>,
 }
 
-/// An allowed folder, as written (made absolute) and with symlinks resolved.
 struct Root {
     absolute: PathBuf,
     real: PathBuf,
@@ -45,7 +38,6 @@ struct Entry {
 impl FsGuard {
     pub fn new(perms: &Permissions) -> Self {
         Self {
-            // A folder a command may write to, it may also read.
             read: perms.read.iter().chain(&perms.write).cloned().collect(),
             write: perms.write.clone(),
         }
@@ -56,7 +48,6 @@ impl FsGuard {
             Access::Read => ("read", &self.read),
             Access::Write => ("write", &self.write),
         };
-        // A folder that can't be resolved (say, a broken symlink) allows nothing.
         let roots = folders
             .iter()
             .filter_map(|folder| {
@@ -68,12 +59,10 @@ impl FsGuard {
         (kind, roots)
     }
 
-    /// The real location of `raw`, if it is inside a folder allowed for `access`.
     fn check(&self, raw: &str, access: Access) -> Result<PathBuf> {
         self.guarded(raw, access, real)
     }
 
-    /// Like `check`, but a symlink at `raw` is the entry itself, not where it points.
     fn check_entry(&self, raw: &str, access: Access) -> Result<PathBuf> {
         self.guarded(raw, access, |path| {
             let (Some(name), Some(parent)) = (path.file_name(), path.parent()) else {
@@ -83,9 +72,6 @@ impl FsGuard {
         })
     }
 
-    /// Resolves `raw` and allows it only inside a folder listed for `access`. A path
-    /// outside them gets the same denial whether it resolves or not, so error
-    /// messages can't tell a script which files exist there.
     fn guarded(
         &self,
         raw: &str,
@@ -110,12 +96,8 @@ impl FsGuard {
         let path = self.check(raw, Access::Read)?;
         let meta = fs::metadata(&path).with_context(|| format!("could not read {raw:?}"))?;
         ensure!(meta.is_file(), "{raw:?} is not a file");
-        ensure!(
-            meta.len() <= MAX_READ_BYTES,
-            "{raw:?} is larger than {} MB",
-            MAX_READ_BYTES / 1024 / 1024
-        );
-        fs::read(&path).with_context(|| format!("could not read {raw:?}"))
+        let file = File::open(&path).with_context(|| format!("could not read {raw:?}"))?;
+        read_capped(file, &format!("{raw:?}"))
     }
 
     fn write(&self, raw: &str, data: &[u8], append: bool) -> Result<()> {
@@ -151,7 +133,6 @@ impl FsGuard {
     }
 
     fn exists(&self, raw: &str) -> Result<bool> {
-        // A broken symlink can't be resolved, but the link itself exists.
         let path = self
             .check(raw, Access::Read)
             .or_else(|_| self.check_entry(raw, Access::Read))?;
@@ -163,7 +144,6 @@ impl FsGuard {
         fs::create_dir_all(&path).with_context(|| format!("could not create {raw:?}"))
     }
 
-    /// Removes a file, a symlink (not its target) or an empty folder.
     fn remove(&self, raw: &str) -> Result<()> {
         let path = self.check_entry(raw, Access::Write)?;
         let (_, roots) = self.roots(Access::Write);
@@ -181,8 +161,6 @@ impl FsGuard {
     }
 }
 
-/// Whether `path`, as written, sits in an allowed folder. It only decides if a
-/// resolve error may be shown, so `..` (which could point anywhere) never counts.
 fn written_inside(path: &Path, roots: &[Root]) -> bool {
     !path.components().any(|c| c == Component::ParentDir)
         && roots
@@ -203,7 +181,6 @@ fn kind_of(meta: &fs::Metadata) -> &'static str {
     }
 }
 
-/// `~` is the home folder. Relative paths start at the current folder.
 fn absolute(raw: &str) -> Result<PathBuf> {
     ensure!(!raw.is_empty(), "path must not be empty");
     let path = match raw.strip_prefix('~') {
@@ -222,60 +199,57 @@ fn home() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| anyhow!("could not find the home folder"))
 }
 
-/// Resolves symlinks in the part of `path` that exists. The missing rest is
-/// appended as is. It can't hold `..`, so it can't climb out of the resolved part.
 fn real(path: &Path) -> Result<PathBuf> {
-    let mut existing = path;
     let mut missing: Vec<&OsStr> = Vec::new();
-    loop {
+    for existing in path.ancestors() {
         match fs::symlink_metadata(existing) {
-            Ok(_) => break,
+            Ok(_) => {
+                let base = existing
+                    .canonicalize()
+                    .with_context(|| format!("could not resolve {}", existing.display()))?;
+                return Ok(missing.iter().rev().fold(base, |acc, name| acc.join(name)));
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| format!("could not resolve {}", existing.display())),
         }
-        let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
+        let Some(name) = existing.file_name() else {
             bail!("could not resolve {}: `..` must follow a folder that exists", path.display());
         };
         missing.push(name);
-        existing = parent;
     }
-    let base = existing
-        .canonicalize()
-        .with_context(|| format!("could not resolve {}", existing.display()))?;
-    Ok(missing.iter().rev().fold(base, |acc, name| acc.join(name)))
+    bail!("could not resolve {}: no part of it exists", path.display())
 }
 
-pub fn install(lua: &Lua, guard: Rc<FsGuard>) -> mlua::Result<()> {
+pub fn install(lua: &Lua, guard: &Rc<FsGuard>) -> mlua::Result<()> {
     let table = lua.create_table()?;
     table.set(
         "read",
-        bind(lua, &guard, |lua, g, path: String| Ok(lua.create_string(g.read(&path)?)?))?,
+        bind(lua, guard, |lua, g, path: String| Ok(lua.create_string(g.read(&path)?)?))?,
     )?;
     table.set(
         "write",
-        bind(lua, &guard, |_, g, (path, data): (String, LuaString)| {
+        bind(lua, guard, |_, g, (path, data): (String, LuaString)| {
             g.write(&path, &data.as_bytes(), false)
         })?,
     )?;
     table.set(
         "append",
-        bind(lua, &guard, |_, g, (path, data): (String, LuaString)| {
+        bind(lua, guard, |_, g, (path, data): (String, LuaString)| {
             g.write(&path, &data.as_bytes(), true)
         })?,
     )?;
     table.set(
         "list",
-        bind(lua, &guard, |lua, g, path: String| {
+        bind(lua, guard, |lua, g, path: String| {
             Ok(lua.to_value_with(&g.list(&path)?, ser_options())?)
         })?,
     )?;
-    table.set("exists", bind(lua, &guard, |_, g, path: String| g.exists(&path))?)?;
-    table.set("mkdir", bind(lua, &guard, |_, g, path: String| g.mkdir(&path))?)?;
-    table.set("remove", bind(lua, &guard, |_, g, path: String| g.remove(&path))?)?;
+    table.set("exists", bind(lua, guard, |_, g, path: String| g.exists(&path))?)?;
+    table.set("mkdir", bind(lua, guard, |_, g, path: String| g.mkdir(&path))?)?;
+    table.set("remove", bind(lua, guard, |_, g, path: String| g.remove(&path))?)?;
     lua.globals().set("fs", table)
 }
 
-/// A Lua function that calls `op` with the guard and turns its error into a Lua error.
 fn bind<A, R>(
     lua: &Lua,
     guard: &Rc<FsGuard>,
@@ -296,7 +270,6 @@ mod tests {
     use super::*;
     use crate::runtime::sandbox::new_lua;
 
-    /// A sandbox folder with `allowed/` (read+write), `readonly/` and `outside/`.
     struct Setup {
         dir: tempfile::TempDir,
         lua: Lua,
@@ -317,7 +290,7 @@ mod tests {
                 ..Permissions::default()
             };
             let lua = new_lua().unwrap();
-            install(&lua, Rc::new(FsGuard::new(&perms))).unwrap();
+            install(&lua, &Rc::new(FsGuard::new(&perms))).unwrap();
             lua.globals().set("root", dir.path().display().to_string()).unwrap();
             Self { dir, lua }
         }
@@ -388,7 +361,7 @@ mod tests {
         assert!(s.err(r#"fs.read(root .. "/outside/secret.txt")"#).contains("permissions.read"));
         assert!(s.err(r#"fs.read(root .. "/allowed/../outside/secret.txt")"#).contains("permissions.read"));
         assert!(s.err(r#"fs.write(root .. "/readonly/notes.txt", "x")"#).contains("permissions.write"));
-        assert!(s.err(r#"fs.list(root)"#).contains("permissions.read"));
+        assert!(s.err(r"fs.list(root)").contains("permissions.read"));
         assert!(s.err(r#"fs.exists("/etc/passwd")"#).contains("permissions.read"));
         assert!(s.err(r#"fs.remove(root .. "/readonly/notes.txt")"#).contains("permissions.write"));
         assert!(s.err(r#"fs.write(root .. "/allowed/missing/../../outside/x", "x")"#).contains("permissions.write"));
@@ -410,26 +383,32 @@ mod tests {
 
         assert!(s.eval::<bool>(r#"return fs.exists(root .. "/allowed/dangling")"#));
 
-        // Removing a link removes the link, never its target.
         s.lua.load(r#"fs.remove(root .. "/allowed/link-file")"#).exec().unwrap();
         assert!(s.path("outside/secret.txt").exists());
     }
 
     #[test]
+    fn named_pipes_are_refused_without_waiting_for_a_writer() {
+        let s = Setup::new();
+        let made = std::process::Command::new("mkfifo").arg(s.path("readonly/pipe")).status().unwrap();
+        assert!(made.success());
+        let err = s.err(r#"fs.read(root .. "/readonly/pipe")"#);
+        assert!(err.contains("is not a file"), "{err}");
+    }
+
+    #[test]
     fn errors_outside_the_folders_do_not_reveal_what_exists() {
         let s = Setup::new();
-        // A file used as a folder, a missing folder before `..`, a missing file: one answer.
         for path in ["/outside/secret.txt/x", "/nope/../x", "/outside/missing.txt", "/allowed/../outside/secret.txt/x"] {
             let err = s.err(&format!(r#"fs.exists(root .. "{path}")"#));
             assert!(err.contains("is not inside a folder listed"), "{path}: {err}");
         }
-        // Inside an allowed folder the real reason is useful and reveals nothing new.
         fs::write(s.path("allowed/file"), "x").unwrap();
         let inside = s.err(r#"fs.write(root .. "/allowed/file/x", "y")"#);
         assert!(inside.contains("could not"), "{inside}");
 
         let none = new_lua().unwrap();
-        install(&none, Rc::new(FsGuard::new(&Permissions::default()))).unwrap();
+        install(&none, &Rc::new(FsGuard::new(&Permissions::default()))).unwrap();
         let err = none.load(r#"fs.exists("/etc/passwd/x")"#).exec().unwrap_err().to_string();
         assert!(err.contains("permissions.read"), "{err}");
     }

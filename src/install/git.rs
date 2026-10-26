@@ -1,11 +1,8 @@
-//! Fetches one commit of a repo with the user's own `git`, so any host and their SSH keys work.
-
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
 
-/// A local repo path becomes absolute, so it works from any folder later. URLs stay as they are.
 pub fn resolve_url(url: &str) -> Result<String> {
     let path = Path::new(url);
     if !path.exists() {
@@ -15,8 +12,6 @@ pub fn resolve_url(url: &str) -> Result<String> {
     Ok(absolute.to_str().context("the repo path is not UTF-8")?.to_string())
 }
 
-/// Checks out `git_ref` (branch, tag or commit; default branch when `None`) into the new
-/// folder `dest` and returns the full commit hash.
 pub fn fetch(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<String> {
     ensure!(!url.trim().is_empty(), "the git URL is empty");
     ensure!(!url.starts_with('-'), "{url:?} is not a git URL");
@@ -39,7 +34,6 @@ pub fn fetch(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<String> {
 
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
     let mut cmd = Command::new("git");
-    // `ext::` URLs run shell commands. git blocks them by default; make sure.
     cmd.args(["-c", "protocol.ext.allow=never"]);
     if let Some(dir) = dir {
         cmd.arg("-C").arg(dir);
@@ -49,7 +43,8 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String> {
         .output()
         .context("could not run git. Install git, then try again")?;
     if !out.status.success() {
-        bail!("git {} failed: {}", args[0], String::from_utf8_lossy(&out.stderr).trim());
+        let action = args.first().copied().unwrap_or_default();
+        bail!("git {action} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
