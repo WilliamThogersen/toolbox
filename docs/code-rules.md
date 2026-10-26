@@ -17,9 +17,9 @@ with `#[expect(lint, reason = "...")]`, which says why and fails once the lint n
 | 5 | Check assumptions | Invariants the types can't hold are checked and turned into an error the caller handles (`ensure!`, `bail!`, `ok_or_else`), never a crash. `debug_assert!` documents a caller's promise in tests and debug builds | Review |
 | 6 | Smallest scope | Data lives in the function or struct that needs it. No global mutable state, with one exception: the atomic `EXEC_GROUP` in `src/sys/`, since a signal handler can reach nothing but statics | Review |
 | 7 | Check inputs and return values | Inputs are validated where they enter (manifests, key names, hosts, script values). A `Result` is never dropped silently: `let _ =` is the one way to drop one, and each use has its reason in `CLAUDE.md` | `unused_must_use` (rustc); the reasons by review |
-| 8 | Little preprocessor use | No `macro_rules!`. The only `#[cfg(target_os)]` switches are in `src/vault/platform/mod.rs` and the `macos` module of `src/sys/` | Review |
+| 8 | Little preprocessor use | No `macro_rules!`. The only `#[cfg(target_os)]` is the `compile_error!` in `src/sys/mod.rs` that stops a build outside macOS | Review |
 | 9 | Restricted pointer use | `unsafe` only in `src/sys/` (and two small test helpers), each block with a `// SAFETY:` comment (the only comments in `src/`) and one unsafe operation. Raw pointers never leave those functions. The one function pointer handed to C is the signal handler in `src/sys/` | `unsafe_code = "deny"`, `undocumented_unsafe_blocks`, `multiple_unsafe_ops_per_block` |
-| 10 | Strict warnings, zero of them, analysis daily | `clippy::pedantic` plus the lints above, 0 warnings on macOS and Linux. Dependencies are checked against security advisories every day | CI (`ci.yml`), `cargo deny` (`deny.yml`, daily) |
+| 10 | Strict warnings, zero of them, analysis daily | `clippy::pedantic` plus the lints above, 0 warnings. Dependencies are checked against security advisories every day | CI (`ci.yml`), `cargo deny` (`deny.yml`, daily) |
 
 ## Loops whose bound isn't in their condition (rule 2)
 

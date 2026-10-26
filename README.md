@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-f97316"></a>
-  <img alt="macOS and Linux" src="https://img.shields.io/badge/macOS%20%7C%20Linux-1c1917">
+  <img alt="macOS" src="https://img.shields.io/badge/macOS-1c1917">
   <img alt="MCP server" src="https://img.shields.io/badge/MCP-server-1c1917">
 </p>
 
@@ -63,8 +63,8 @@ Now that key sits in the chat log, the agent can print it, and nothing stops it 
 brew install WilliamThogersen/tap/toolbox
 ```
 
-Works on macOS (Apple Silicon and Intel) and Linux (x86_64 and arm64). You get `toolbox` and the short name `tb`.
-Update with `brew upgrade toolbox`. The key vault is **macOS only for now** ([why](docs/security.md#what-it-does-not-protect-against)).
+Works on macOS (Apple Silicon and Intel). You get `toolbox` and the short name `tb`.
+Update with `brew upgrade toolbox`.
 
 <sub>When a new version is out, `tb` says so on your terminal (at most once a day, only when a person is at the
 terminal; agents and pipes never see it). Set `TOOLBOX_NO_UPDATE_CHECK=1` to turn it off.</sub>

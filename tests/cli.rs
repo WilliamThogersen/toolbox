@@ -728,41 +728,6 @@ fn setup_with_nothing_waiting_needs_no_terminal() {
     assert_eq!(report, json!({ "added": [], "allowed": [], "declined": [], "skipped": [] }));
 }
 
-/// Outside macOS there is no vault: the system keyring there hands keys to any program,
-/// agents included. It says so, and commands that don't use keys still run.
-#[cfg(not(target_os = "macos"))]
-#[test]
-fn outside_macos_the_vault_is_off() {
-    let tb = Toolbox::new();
-    tb.add_command(
-        "call",
-        echo_manifest("call"),
-        r#"return function(args)
-            return http.get(args.url, { headers = { Authorization = vault("test") } }).status
-        end"#,
-    );
-    tb.add_command(
-        "plain",
-        json!({ "name": "plain", "description": "Uses no keys" }),
-        "return function() return 1 end",
-    );
-    let run = |args: &[&str]| {
-        tb.command(args)
-            .env_remove("TOOLBOX_INSECURE_TEST_VAULT")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap()
-    };
-    for args in [&["self", "vault", "list"][..], &["call", "--url", "https://127.0.0.1:9/"][..]] {
-        let out = run(args);
-        assert!(!out.status.success(), "{args:?} used a vault outside macOS");
-        let err = stderr(&out);
-        assert!(err.contains("the vault only works on macOS"), "{args:?}: {err}");
-    }
-    let plain = run(&["plain"]);
-    assert!(plain.status.success(), "{}", stderr(&plain));
-}
-
 #[test]
 fn key_use_is_logged_without_the_key() {
     let tb = Toolbox::new();

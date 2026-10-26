@@ -1,6 +1,8 @@
 #![expect(unsafe_code, reason = "this module wraps the C calls the rest of the crate makes safely")]
 
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "macos"))]
+compile_error!("toolbox runs on macOS only");
+
 pub mod macos;
 
 use std::ffi::CStr;

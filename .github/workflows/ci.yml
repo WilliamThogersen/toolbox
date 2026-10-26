@@ -1,4 +1,4 @@
-# Tests and lints every push to main and every pull request, on macOS and Linux.
+# Tests and lints every push to main and every pull request, on macOS.
 name: ci
 
 on:
@@ -20,11 +20,7 @@ defaults:
 
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

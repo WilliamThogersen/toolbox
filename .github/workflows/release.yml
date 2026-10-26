@@ -1,6 +1,6 @@
 # Runs when a version tag is pushed: git tag -a v0.2.0 -F notes.md && git push origin v0.2.0
-# Tests, builds a signed macOS binary and static Linux binaries (x86_64 and arm64), publishes
-# a GitHub release with all three and updates the Homebrew formula in
+# Tests, builds a signed universal macOS binary, publishes a GitHub release with it and
+# updates the Homebrew formula in
 # WilliamThogersen/homebrew-tap. The annotated tag's message becomes the release notes.
 name: release
 
@@ -69,55 +69,8 @@ jobs:
           path: dist/toolbox-macos.tar.gz
           if-no-files-found: error
 
-  linux:
-    needs: version
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            arch: x86_64
-            target: x86_64-unknown-linux-musl
-          - runner: ubuntu-24.04-arm
-            arch: arm64
-            target: aarch64-unknown-linux-musl
-    # Native runners for each architecture: no cross-compiling, and the tests run on the real thing.
-    runs-on: ${{ matrix.runner }}
-    env:
-      TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # musl gives one static binary: it runs on any distribution, whatever its glibc version.
-      - name: Install the musl target
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          cargo --version
-          rustup target add "$TARGET"
-
-      - name: Test
-        run: cargo test --locked --target "$TARGET"
-
-      - name: Build and package
-        run: |
-          cargo build --release --locked --target "$TARGET"
-          mkdir build dist
-          cp "target/$TARGET/release/toolbox" build/toolbox
-          if readelf --program-headers build/toolbox | grep -q INTERP; then
-            echo "::error::the binary is dynamically linked"
-            exit 1
-          fi
-          build/toolbox --version
-          tar -czf "dist/toolbox-linux-${{ matrix.arch }}.tar.gz" -C build toolbox
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: toolbox-linux-${{ matrix.arch }}
-          path: dist/toolbox-linux-${{ matrix.arch }}.tar.gz
-          if-no-files-found: error
-
   publish:
-    needs: [macos, linux]
+    needs: macos
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -132,12 +85,10 @@ jobs:
 
       - name: Checksums
         run: |
-          for asset in toolbox-macos toolbox-linux-x86_64 toolbox-linux-arm64; do
-            if [[ ! -f "dist/$asset.tar.gz" ]]; then
-              echo "::error::dist/$asset.tar.gz is missing"
-              exit 1
-            fi
-          done
+          if [[ ! -f dist/toolbox-macos.tar.gz ]]; then
+            echo "::error::dist/toolbox-macos.tar.gz is missing"
+            exit 1
+          fi
           (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
           cat dist/SHA256SUMS
 
@@ -163,8 +114,6 @@ jobs:
           mkdir -p tap/Formula
           sed -e "s/@VERSION@/$version/g" \
               -e "s/@SHA256_MACOS@/$(sha toolbox-macos)/g" \
-              -e "s/@SHA256_LINUX_ARM64@/$(sha toolbox-linux-arm64)/g" \
-              -e "s/@SHA256_LINUX_X86_64@/$(sha toolbox-linux-x86_64)/g" \
               .github/homebrew/toolbox.rb > tap/Formula/toolbox.rb
           if grep -n '@[A-Z0-9_]*@' tap/Formula/toolbox.rb; then
             echo "::error::the formula still has a placeholder"

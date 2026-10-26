@@ -5,37 +5,16 @@ class Toolbox < Formula
   homepage "https://github.com/WilliamThogersen/toolbox"
   license "MIT"
 
-  # `brew audit --strict` refuses url and sha256 directly in on_macos, so the universal
-  # macOS binary is listed once per architecture.
-  on_macos do
-    on_arm do
-      url "https://github.com/WilliamThogersen/toolbox/releases/download/v@VERSION@/toolbox-macos.tar.gz"
-      sha256 "@SHA256_MACOS@"
-    end
-    on_intel do
-      url "https://github.com/WilliamThogersen/toolbox/releases/download/v@VERSION@/toolbox-macos.tar.gz"
-      sha256 "@SHA256_MACOS@"
-    end
-  end
+  # One universal binary for Apple Silicon and Intel.
+  url "https://github.com/WilliamThogersen/toolbox/releases/download/v@VERSION@/toolbox-macos.tar.gz"
+  sha256 "@SHA256_MACOS@"
 
-  # Static binaries: they need no system libraries, whatever the distribution.
-  on_linux do
-    on_arm do
-      url "https://github.com/WilliamThogersen/toolbox/releases/download/v@VERSION@/toolbox-linux-arm64.tar.gz"
-      sha256 "@SHA256_LINUX_ARM64@"
-    end
-    on_intel do
-      url "https://github.com/WilliamThogersen/toolbox/releases/download/v@VERSION@/toolbox-linux-x86_64.tar.gz"
-      sha256 "@SHA256_LINUX_X86_64@"
-    end
-  end
+  depends_on :macos
 
   def install
     bin.install "toolbox"
-    if OS.mac?
-      # Keep Gatekeeper from blocking the binary if the download was quarantined. Fine if there is nothing to remove.
-      quiet_system "/usr/bin/xattr", "-d", "com.apple.quarantine", bin/"toolbox"
-    end
+    # Keep Gatekeeper from blocking the binary if the download was quarantined. Fine if there is nothing to remove.
+    quiet_system "/usr/bin/xattr", "-d", "com.apple.quarantine", bin/"toolbox"
     # A symlink, not a copy: the keychain sees one signed binary, so it only asks once.
     bin.install_symlink "toolbox" => "tb"
   end
