@@ -4,17 +4,17 @@ toolbox is made for AI agents to extend: a new command is two files, and the out
 
 ## Tell your agent about it
 
-Add this to your `CLAUDE.md` (or your agent's instructions file):
+For Claude Code, run once:
 
-```markdown
-## toolbox (tb)
-`tb` is my toolbox CLI. Run `tb` to list my commands and `tb self describe` for their args as JSON.
-To add a command, read `tb self guide`, then `tb self new <name>`, edit the files, and run `tb self check`.
-API keys live in the toolbox vault: use `vault("name")` in headers, never ask me for a key.
-If a key is missing, request it with `tb self vault request` and ask me to run `tb self vault setup`.
-Before writing a new command, check `tb self search <words>` for one in my marketplaces.
-Before `tb self install <source> --yes`, show me the permissions it lists and wait for my OK.
+```bash
+tb self init
 ```
+
+It writes [the instructions](agent-instructions.md) to `~/.claude/TOOLBOX.md` and adds `@TOOLBOX.md` to
+`~/.claude/CLAUDE.md`, so every session uses your commands first and writes new ones when one is missing. Run it
+again after upgrading toolbox to refresh the text. See [`tb self init`](commands/init.md).
+
+Other agents: copy [the instructions](agent-instructions.md) into their instructions file.
 
 ## Or give it the commands as tools
 
@@ -25,7 +25,7 @@ claude mcp add toolbox -- tb self mcp
 ```
 
 New commands show up as tools within a few seconds. See [`tb self mcp`](commands/mcp.md). Writing new commands
-still happens in the shell, so keep the snippet above too.
+still happens in the shell, so run `tb self init` too.
 
 ## Output rules
 
@@ -51,6 +51,7 @@ A closed stdout pipe (`tb ... | head`) is not an error.
 
 ## Where to start
 
-1. `tb self describe`: what exists, with args and permissions
-2. `tb self guide`: how to write a command
-3. `tb self search <words>`: what others already wrote
+1. `tb self init`: tell Claude Code about toolbox
+2. `tb self describe`: what exists, with args and permissions
+3. `tb self guide`: how to write a command
+4. `tb self search <words>`: what others already wrote
