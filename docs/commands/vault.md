@@ -2,10 +2,6 @@
 
 API keys that commands can use but never see. The keys live in the macOS Keychain.
 
-The vault is macOS only for now. On Linux the system keyring (GNOME Keyring, KWallet) hands stored keys to any program
-you run, an AI agent included, so there the vault commands and `vault()` refuse with an error that says so. Commands
-that don't use keys work everywhere. See [Security](../security.md#what-it-does-not-protect-against).
-
 ```
 tb self vault request <name> --host <host>... --why <text> [--query-param <param>...] [--method <method>...] [--path <path>...] [--note <text>]
 tb self vault setup [<command>]
@@ -197,7 +193,7 @@ allow each key on its own: allowing `github/work` doesn't give the command `gith
 [Writing commands](../writing-commands.md#several-accounts).
 
 The first time toolbox reads the vault, macOS asks if `toolbox` may use the keychain item `toolbox`. Click
-**Always Allow**. On Linux your keyring may ask for its password if it is locked.
+**Always Allow**.
 
 ### Keys for a server on this computer
 

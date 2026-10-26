@@ -1,5 +1,5 @@
-# Installs toolbox from the Homebrew tap on a clean Mac and a clean Linux runner, the way a user
-# would, and checks that it is the latest release. Runs after every release, every Monday, and on
+# Installs toolbox from the Homebrew tap on a clean Mac, the way a user would, and checks that
+# it is the latest release. Runs after every release, every Monday, and on
 # demand: gh workflow run brew-check.yml
 name: brew-check
 
@@ -59,70 +59,3 @@ jobs:
           tb self new hello --description "Says hello"
           tb hello --name ci
           tb self check
-
-  install-linux:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    steps:
-      # The Ubuntu images may ship Homebrew without putting it on PATH. Install it the way
-      # https://docs.brew.sh/Homebrew-on-Linux says when it isn't there.
-      - name: Set up Homebrew
-        run: |
-          prefix=/home/linuxbrew/.linuxbrew
-          if [[ ! -x "$prefix/bin/brew" ]]; then
-            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          fi
-          echo "$prefix/bin" >> "$GITHUB_PATH"
-          echo "$prefix/sbin" >> "$GITHUB_PATH"
-
-      - name: Install from the tap
-        run: brew install WilliamThogersen/tap/toolbox
-
-      - name: Check the tap has the latest release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
-          installed=$(tb --version | cut -d ' ' -f 2)
-          if [[ "v$installed" != "$latest" ]]; then
-            echo "::error::brew installed $installed but the latest release is $latest"
-            exit 1
-          fi
-          echo "brew installs $latest"
-
-      - name: Check the binary is static
-        run: |
-          if readelf --program-headers "$(brew --prefix)/bin/toolbox" | grep -q INTERP; then
-            echo "::error::the installed binary is dynamically linked"
-            exit 1
-          fi
-
-      - name: brew test and audit
-        run: |
-          brew test WilliamThogersen/tap/toolbox
-          brew audit --strict --online WilliamThogersen/tap/toolbox
-
-      - name: Run a command
-        run: |
-          export TOOLBOX_HOME="$RUNNER_TEMP/toolbox"
-          tb self new hello --description "Says hello"
-          tb hello --name ci
-          tb self check
-
-      # Outside macOS the vault is off: the Linux keyring hands keys to any program.
-      - name: Check the vault is off
-        run: |
-          export TOOLBOX_HOME="$RUNNER_TEMP/toolbox"
-          if out=$(tb self vault list 2>&1); then
-            echo "::error::tb self vault list worked on Linux: $out"
-            exit 1
-          fi
-          if [[ $out != *"only works on macOS"* ]]; then
-            echo "::error::unexpected vault error on Linux: $out"
-            exit 1
-          fi
-          echo "$out"

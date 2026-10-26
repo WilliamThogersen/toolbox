@@ -95,10 +95,10 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
   let the command gh-prs use the API key github". An agent can fake a terminal (`script`, `expect`), but it can't
   answer that dialog. The approval and install prompts escape terminal control codes and bidi characters, so a
   manifest or script can't hide lines from you.
-- **Other programs get asked (macOS).** The vault is one macOS Keychain item, so tools like the `security` CLI
-  trigger a permission prompt. Linux has no such prompt: see "Other programs on Linux" below.
-- **No injection.** macOS release binaries are signed with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and
-  debuggers can't get inside them. Linux release binaries are static, so `LD_PRELOAD` has nothing to load into.
+- **Other programs get asked.** The vault is one macOS Keychain item, so tools like the `security` CLI trigger a
+  permission prompt.
+- **No injection.** Release binaries are signed with the hardened runtime, so `DYLD_INSERT_LIBRARIES` and debuggers
+  can't get inside them.
 
 ### Seeing what happened
 
@@ -137,9 +137,6 @@ each. An agent can edit that file, but not the copy in the macOS system log.
 - **A local port someone else takes.** A key bound to `127.0.0.1:8080` goes to whatever listens there. While your
   server is stopped, any program can. If your server listens on all addresses (`0.0.0.0`), macOS lets another
   program of yours listen on `127.0.0.1` with the same port and take its connections, even while it runs.
-- **Linux: no vault yet.** The Linux keyring (the Secret Service: GNOME Keyring, KWallet) has no per-program
-  permission like the Keychain's. While your keyring is unlocked it hands stored items to any program running as you,
-  without asking, so an AI agent with a shell could read every key with a tool like `secret-tool`. Rather than
-  pretend, toolbox has no vault on Linux: vault commands and `vault()` fail with an error that says so. Commands that
-  don't use keys work.
-- **Other platforms.** Releases are for macOS and Linux (x86_64 and arm64). Windows isn't supported.
+- **Other platforms.** toolbox runs on macOS only (Apple Silicon and Intel). Linux keyrings (the Secret Service:
+  GNOME Keyring, KWallet) have no per-program permission like the Keychain's: while unlocked they hand stored items
+  to any program running as you, so an AI agent with a shell could read every key. Windows isn't supported either.

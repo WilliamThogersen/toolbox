@@ -1,6 +1,6 @@
 # Dependency checks: known security advisories (vulnerable, unmaintained or unsound crates), licenses
-# that can ship in an MIT binary, and crates only from crates.io. CI runs it once per shipped platform,
-# since a crate one platform pulls in for another (like keyring's Linux store) is never built:
+# that can ship in an MIT binary, and crates only from crates.io. CI runs it once per shipped target
+# (Apple Silicon and Intel), since a crate only another platform pulls in is never built:
 #   cargo deny --target <triple> check
 
 [graph]

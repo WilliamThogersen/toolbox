@@ -98,10 +98,6 @@ mod pty {
     /// Runs in the child before exec: a new session whose controlling terminal is `path`, also
     /// used as stderr (clients let servers inherit theirs). Keeping it open keeps it the
     /// controlling terminal: macOS drops that when the last handle closes.
-    #[allow(
-        clippy::useless_conversion,
-        reason = "TIOCSCTTY is a u32 on macOS, which ioctl takes as a c_ulong; on Linux it already is one"
-    )]
     fn take_terminal(path: &CStr) -> io::Result<()> {
         // SAFETY: setsid takes no arguments.
         if unsafe { libc::setsid() } < 0 {

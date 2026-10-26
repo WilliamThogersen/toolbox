@@ -26,8 +26,9 @@ tempfile = "3.27.0"
 ureq = "3"
 url = "2"
 
-# The vault is macOS only: it needs a store that asks before another program reads it, which
-# the Linux Secret Service doesn't. `v1` picks the Keychain and never falls back to another store.
+# toolbox runs on macOS only. These stay macOS-gated so a build elsewhere reaches the clear
+# `compile_error!` in src/sys/mod.rs instead of failing inside a dependency.
+# `v1` picks the Keychain and never falls back to another store.
 # The objc2 crates reach LocalAuthentication, for the Touch ID check before every vault change.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
