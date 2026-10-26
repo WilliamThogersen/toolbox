@@ -31,7 +31,8 @@ new commits. To move to another ref, install again with the new `--ref`.
 2. Decides per command: newer, up to date, or a problem.
 3. If anything is newer, it asks first, every time. New code needs a yes even when the permissions stay the same,
    so a hacked repo can't slip code in on a routine update.
-4. Replaces each updated command and its `.source.json`.
+4. Replaces each updated command and its `.source.json`, keeping the marketplace it came from. Local edits to an
+   updated command are replaced too.
 
 The prompt:
 

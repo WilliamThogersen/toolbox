@@ -2,7 +2,7 @@ pub mod confirm;
 mod git;
 pub mod market;
 mod repo;
-mod source;
+pub mod source;
 mod update;
 
 use std::fs;
@@ -13,6 +13,7 @@ use serde::Serialize;
 use tempfile::TempDir;
 
 use crate::command::manifest::{Permissions, is_valid_name};
+use crate::command::origin::files_fingerprint;
 use crate::command::registry::{CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
 use crate::cli::screen::{one_line, one_line_permissions, printable};
 
@@ -25,6 +26,7 @@ pub struct Request {
     pub url: String,
     pub git_ref: Option<String>,
     pub names: Vec<String>,
+    pub market: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +86,8 @@ pub fn install(commands_dir: &Path, request: &Request, confirm: &dyn Confirm) ->
         url: url.clone(),
         git_ref: request.git_ref.clone(),
         commit,
+        market: request.market.clone(),
+        fingerprint: None,
     };
     let question = match selection.chosen.len() {
         1 => "Install 1 command?".to_string(),
@@ -96,13 +100,13 @@ pub fn install(commands_dir: &Path, request: &Request, confirm: &dyn Confirm) ->
         .chosen
         .iter()
         .map(|def| {
-            let dir = staging.put(commands_dir, def, &source)?;
+            let (dir, source) = staging.put(commands_dir, def, &source)?;
             Ok(Installed {
                 name: def.manifest.name.clone(),
                 version: def.manifest.version.clone(),
                 permissions: def.manifest.permissions.clone(),
                 dir: dir.display().to_string(),
-                source: source.clone(),
+                source,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -228,14 +232,18 @@ impl Staging {
         Ok((commit, repo::scan(&checkout)?))
     }
 
-    fn put(&self, commands_dir: &Path, def: &CommandDef, source: &Source) -> Result<PathBuf> {
+    fn put(&self, commands_dir: &Path, def: &CommandDef, source: &Source) -> Result<(PathBuf, Source)> {
         let name = &def.manifest.name;
         let staged = self.path().join("new").join(name);
         fs::create_dir_all(&staged)?;
         for file in [MANIFEST_FILE, SCRIPT_FILE] {
             fs::copy(def.dir.join(file), staged.join(file)).with_context(|| format!("could not copy {file}"))?;
         }
-        source::write(&staged, source)?;
+        let source = Source {
+            fingerprint: Some(files_fingerprint(&staged)?),
+            ..source.clone()
+        };
+        source::write(&staged, &source)?;
 
         let target = commands_dir.join(name);
         let old = self.path().join("old").join(name);
@@ -251,7 +259,7 @@ impl Staging {
                 format!("could not move {name} into {}{}", commands_dir.display(), note.unwrap_or_default())
             });
         }
-        Ok(target)
+        Ok((target, source))
     }
 }
 
@@ -279,6 +287,7 @@ mod tests {
             url: url.to_string(),
             git_ref: None,
             names: Vec::new(),
+            market: None,
         }
     }
 

@@ -151,7 +151,7 @@ fn system_log(line: &str) {
     }
 }
 
-fn has_terminal() -> bool {
+pub fn has_terminal() -> bool {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOCTTY)

@@ -6,7 +6,14 @@ pub fn app() -> Command {
     group(NAMESPACE, "Manage toolbox: create, install and check commands, store API keys")
         .subcommand(new_app())
         .subcommand(Command::new("check").about("Validate every command; exits 1 if anything is broken"))
-        .subcommand(Command::new("describe").about("List every command, its args and permissions, as JSON"))
+        .subcommand(
+            Command::new("describe").about("List every command, its args and permissions, as JSON").arg(
+                Arg::new("origin")
+                    .long("origin")
+                    .action(ArgAction::SetTrue)
+                    .help("Also say where each command came from and whether it was edited since install"),
+            ),
+        )
         .subcommand(Command::new("guide").about("How to write new commands (manifest format and Lua API)"))
         .subcommand(install_app())
         .subcommand(

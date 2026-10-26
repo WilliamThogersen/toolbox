@@ -150,7 +150,9 @@ fn installs_every_folder_in_a_repo_and_runs_them() {
     assert_eq!(names(installed), vec!["hello", "stars"]);
     assert_eq!(installed[0]["version"], "1.0.0");
     assert_eq!(installed[1]["permissions"]["http"], json!(["api.github.com"]));
-    assert_eq!(installed[0]["source"], json!({ "url": repo.url(), "commit": commit }));
+    let fingerprint = installed[0]["source"]["fingerprint"].as_str().unwrap().to_string();
+    assert_eq!(fingerprint.len(), 64);
+    assert_eq!(installed[0]["source"], json!({ "url": repo.url(), "commit": commit, "fingerprint": fingerprint }));
 
     assert_eq!(tb.json(&["hello"]), json!("hi"));
     assert_eq!(tb.json(&["stars"]), json!("42"));
@@ -415,4 +417,59 @@ fn marketplaces_are_saved_searched_and_installed_by_name() {
     assert_eq!(tb.json(&["self", "market", "list"]).as_array().unwrap().len(), 1);
     assert_eq!(tb.json(&["stars"]), json!("42"), "removing a marketplace keeps its commands");
     assert_eq!(tb.json(&["self", "update"])["up_to_date"], json!(["stars", "weather"]));
+}
+
+#[test]
+fn describe_origin_says_where_each_command_came_from() {
+    let acme = Repo::new();
+    acme.write_command("stars", manifest("stars", Some("1.0.0"), json!({})), &says("42"));
+    acme.commit("acme");
+    let tb = Toolbox::new();
+    tb.json(&["self", "market", "add", "acme", &acme.url()]);
+    tb.json(&["self", "install", "acme/stars", "--yes"]);
+    tb.json(&["self", "new", "hello"]);
+    let by_hand = tb.commands_dir().join("by-hand");
+    fs::create_dir_all(&by_hand).unwrap();
+    fs::write(by_hand.join("command.json"), manifest("by-hand", None, json!({})).to_string()).unwrap();
+    fs::write(by_hand.join("run.lua"), says("hi")).unwrap();
+    let broken = tb.commands_dir().join("broken");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("command.json"), "{").unwrap();
+
+    assert!(tb.json(&["self", "describe"]).get("origins").is_none(), "plain describe stays as it was for agents");
+
+    let origins = tb.json(&["self", "describe", "--origin"])["origins"].clone();
+    let stars = &origins["stars"];
+    assert_eq!(stars["kind"], "installed");
+    assert_eq!(stars["market"], "acme");
+    assert_eq!(stars["url"], acme.url());
+    assert_eq!(stars["edited"], false);
+    assert_eq!(stars["fingerprint"].as_str().unwrap().len(), 64);
+    assert_eq!(origins["hello"]["kind"], "created");
+    assert!(!origins["hello"]["by"].as_array().unwrap().is_empty());
+    assert_eq!(origins["hello"]["terminal"], false, "the tests run without a terminal, like an agent");
+    assert_eq!(origins["by-hand"], json!({ "kind": "unknown" }));
+    assert_eq!(origins["broken"], json!({ "kind": "unknown" }), "broken commands still get an origin");
+
+    fs::write(tb.commands_dir().join("stars/run.lua"), says("43")).unwrap();
+    assert_eq!(tb.json(&["self", "describe", "--origin"])["origins"]["stars"]["edited"], true);
+}
+
+#[test]
+fn update_keeps_the_marketplace_and_takes_the_new_files_as_unedited() {
+    let acme = Repo::new();
+    acme.write_command("greet", manifest("greet", Some("1.0.0"), json!({})), &says("v1"));
+    acme.commit("v1");
+    let tb = Toolbox::new();
+    tb.json(&["self", "market", "add", "acme", &acme.url()]);
+    tb.json(&["self", "install", "acme/greet", "--yes"]);
+    fs::write(tb.commands_dir().join("greet/run.lua"), says("local edit")).unwrap();
+
+    acme.write_command("greet", manifest("greet", Some("1.1.0"), json!({})), &says("v1.1"));
+    acme.commit("v1.1");
+    tb.json(&["self", "update", "--yes"]);
+    let greet = &tb.json(&["self", "describe", "--origin"])["origins"]["greet"];
+    assert_eq!(greet["market"], "acme");
+    assert_eq!(greet["edited"], false);
+    assert_eq!(tb.json(&["greet"]), json!("v1.1"));
 }

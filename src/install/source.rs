@@ -1,9 +1,10 @@
 use std::fs;
-use std::io;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::command::origin::{MAX_RECORD_BYTES, read_plain};
 
 pub const SOURCE_FILE: &str = ".source.json";
 
@@ -14,6 +15,10 @@ pub struct Source {
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
     pub commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 impl Source {
@@ -29,13 +34,9 @@ pub fn repo_key(url: &str) -> &str {
 
 pub fn read(command_dir: &Path) -> Result<Option<Source>> {
     let path = command_dir.join(SOURCE_FILE);
-    match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw)
-            .map(Some)
-            .with_context(|| format!("invalid {}", path.display())),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("could not read {}", path.display())),
-    }
+    read_plain(&path, MAX_RECORD_BYTES)?
+        .map(|raw| serde_json::from_str(&raw).with_context(|| format!("invalid {}", path.display())))
+        .transpose()
 }
 
 pub fn write(command_dir: &Path, source: &Source) -> Result<()> {
@@ -56,9 +57,19 @@ mod tests {
             url: "https://gitlab.com/a/tools.git".into(),
             git_ref: Some("v1.0.0".into()),
             commit: "abc123".into(),
+            market: Some("acme".into()),
+            fingerprint: Some("f".repeat(64)),
         };
         write(tmp.path(), &source).unwrap();
         assert_eq!(read(tmp.path()).unwrap(), Some(source));
+    }
+
+    #[test]
+    fn files_from_older_versions_still_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(SOURCE_FILE), r#"{"url": "https://github.com/a/tools.git", "commit": "abc123"}"#).unwrap();
+        let source = read(tmp.path()).unwrap().unwrap();
+        assert_eq!((source.market, source.fingerprint), (None, None));
     }
 
     #[test]
@@ -67,6 +78,8 @@ mod tests {
             url: "https://github.com/a/tools.git".into(),
             git_ref: None,
             commit: String::new(),
+            market: None,
+            fingerprint: None,
         };
         assert!(source.same_repo("https://github.com/a/tools"));
         assert!(source.same_repo("https://github.com/a/tools/"));

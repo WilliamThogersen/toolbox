@@ -6,6 +6,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
 use crate::command::manifest::{ArgSpec, ArgType, Limits, Manifest, Permissions, RESERVED_NAMES, is_valid_name};
+use crate::command::origin::record_created;
 use crate::command::registry::{MANIFEST_FILE, SCRIPT_FILE};
 
 const FIRST_VERSION: &str = "0.1.0";
@@ -51,6 +52,7 @@ pub fn create(commands_dir: &Path, name: &str, description: &str) -> Result<Crea
     let script_path = dir.join(SCRIPT_FILE);
     fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)? + "\n")?;
     fs::write(&script_path, SCRIPT_TEMPLATE)?;
+    record_created(&dir)?;
 
     Ok(Created {
         dir: dir.display().to_string(),
@@ -65,6 +67,7 @@ pub fn create(commands_dir: &Path, name: &str, description: &str) -> Result<Crea
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::origin::{Origin, origin};
     use crate::command::registry;
 
     #[test]
@@ -74,6 +77,7 @@ mod tests {
         let loaded = registry::load(tmp.path()).unwrap();
         assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
         assert_eq!(loaded.commands[0].manifest.description, "Says hello");
+        assert!(matches!(origin(&tmp.path().join("hello")), Origin::Created(_)));
     }
 
     #[test]

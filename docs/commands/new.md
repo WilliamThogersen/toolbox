@@ -18,6 +18,9 @@ Creates `~/.toolbox/commands/<name>/` with two files:
 - `command.json`: the name, `"version": "0.1.0"`, the description, one optional `--name` string arg, and no permissions.
 - `run.lua`: returns `{ message = "hello " .. name }`.
 
+It also writes `.created.json`: the time and the programs that ran `tb` (your shell, or an AI app), so
+[`tb self describe --origin`](describe.md#origins) can tell who made the command.
+
 The command works right away, so you can run it before you change anything.
 
 ## Output
