@@ -3,14 +3,24 @@
 use crate::manifest::Permissions;
 
 /// Escapes characters that could hide or reorder text on a terminal: ANSI
-/// escapes, carriage returns and bidi overrides ("Trojan Source").
+/// escapes, carriage returns, bidi marks and overrides ("Trojan Source") and
+/// zero-width spaces.
 pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| {
             let hidden = (c.is_control() && c != '\n' && c != '\t')
                 || matches!(
                     c,
-                    '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'
+                    '\u{061c}'
+                        | '\u{200b}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{feff}'
                 );
             if hidden { c.escape_unicode().to_string() } else { c.to_string() }
         })
@@ -32,5 +42,18 @@ pub fn one_line_permissions(perms: &Permissions) -> Permissions {
         env: all(&perms.env),
         read: all(&perms.read),
         write: all(&perms.write),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printable_escapes_what_a_terminal_would_hide() {
+        for hidden in ['\u{1b}', '\r', '\u{202e}', '\u{2066}', '\u{061c}', '\u{200b}', '\u{2060}', '\u{feff}'] {
+            assert_eq!(printable(&format!("a{hidden}b")), format!("a{}b", hidden.escape_unicode()));
+        }
+        assert_eq!(printable("line\n\tnext ø ✓"), "line\n\tnext ø ✓");
     }
 }

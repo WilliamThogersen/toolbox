@@ -7,6 +7,8 @@ you run, an AI agent included, so there the vault commands and `vault()` refuse 
 that don't use keys work everywhere. See [Security](../security.md#what-it-does-not-protect-against).
 
 ```
+tb self vault request <name> --host <host>... --why <text> [--query-param <param>...] [--note <text>]
+tb self vault setup [<command>]
 tb self vault add <name> --host <host>... [--query-param <param>...]
 tb self vault list
 tb self vault allow <secret> <command>
@@ -23,7 +25,97 @@ A key is used only when three things line up:
 
 1. It goes to a host you set with `--host`.
 2. It goes in a header, or in a query parameter you named with `--query-param`.
-3. The command was allowed with `tb self vault allow`, and hasn't changed since.
+3. The command was allowed with `tb self vault setup` or `tb self vault allow`, and hasn't changed since.
+
+## The quick way
+
+Let your AI agent prepare everything. You only paste the key:
+
+1. The agent writes the command and runs `tb self vault request <name> --host <host> --why <text>`. That needs no
+   terminal and doesn't touch the vault.
+2. You run `tb self vault setup`. It shows each requested key and why it's needed, asks you to paste it, shows the
+   command's script and asks yes or no. One Touch ID saves it all.
+
+```console
+$ tb self vault setup
+
+Key pagespeed was requested
+  why: Run Lighthouse audits on your sites through Google's PageSpeed API
+  note: Get it at https://console.cloud.google.com/apis/credentials
+  used by lighthouse
+Hosts it may go to (Enter keeps www.googleapis.com, - skips this key):
+Query parameters it may go in (Enter keeps key, - for headers only):
+Paste the key for pagespeed (input is hidden, empty skips it):
+lighthouse wants to use your key pagespeed
+  ...
+Allow lighthouse to use pagespeed? [y/N, v = read the whole script] y
+{ "added": ["pagespeed"], "allowed": [{ "key": "pagespeed", "command": "lighthouse" }], "declined": [], "skipped": [] }
+```
+
+After an agent edits a command, run `tb self vault setup` again to review the changes.
+
+## tb self vault request
+
+Asks you for a key. Meant for AI agents: it needs no terminal, and it only writes a request to
+`~/.toolbox/vault-requests.json`. The key is stored when you run [`tb self vault setup`](#tb-self-vault-setup).
+
+| Argument | Meaning |
+|----------|---------|
+| `<name>` | The key's name, with the same rules as for [`add`](#tb-self-vault-add). |
+| `--host <host>` | Where the key should go, up to 5. You see them at `setup` and can change them. Same rules as for `add`. |
+| `--query-param <param>` | A query parameter the key should also go in, up to 5. Same rules as for `add`. |
+| `--why <text>` | Required. What the key is needed for, shown to you at `setup`. One line of plain text, up to 200 characters. |
+| `--note <text>` | Shown to you at `setup` too, like where to get the key. One line of plain text, up to 200 characters. |
+
+```json
+{
+  "requested": "pagespeed",
+  "hosts": ["www.googleapis.com"],
+  "query_params": ["key"],
+  "why": "Run Lighthouse audits on your sites through Google's PageSpeed API",
+  "used_by": ["lighthouse"],
+  "next": "Ask the user to run `tb self vault setup` in their own terminal. ..."
+}
+```
+
+`used_by` lists the commands whose `permissions.vault` covers the key. A request for a key that is already in the
+vault is refused: to change where an existing key may go, use [`add`](#tb-self-vault-add). A new request for the
+same name replaces the old one. At most 20 requests wait at a time. `setup` checks the file again, and leaves out
+entries that are broken, repeated or past the limit.
+
+**Read the hosts before you press Enter.** Whoever made the request picked them, and wrote the why. The Touch ID
+dialog names the hosts again.
+
+## tb self vault setup
+
+Everything waiting for you, in one go:
+
+1. **Requested keys.** For each one: why it's needed, then where it may go (Enter keeps what the request says, or type other hosts), then
+   the value at a hidden prompt. An empty value or `-` at the hosts prompt skips the key and keeps its request for
+   next time.
+2. **Commands waiting for a key.** Each command's review screen, the same one [`allow`](#tb-self-vault-allow) shows,
+   then one yes or no per key. A command waits when it lists a key by name and was never allowed, when a key was
+   just added for it, or when it changed since you allowed it.
+
+Nothing is saved until the end, so `Ctrl-C` changes nothing. Then one Touch ID covers every key added and every
+command allowed. The dialog names each change, starting with commands that get a key you already had. When you go
+through everything, a command whose `run.lua` can't be read is skipped with a note on stderr.
+
+| Argument | Meaning |
+|----------|---------|
+| `<command>` | Only this command. Also asks for keys it lists that nobody requested (with its host as the default, if it calls only one), and for keys a pattern like `github/*` covers. |
+
+```json
+{
+  "added": ["pagespeed"],
+  "allowed": [{ "key": "pagespeed", "command": "lighthouse" }],
+  "declined": [],
+  "skipped": []
+}
+```
+
+With nothing waiting it changes nothing, needs no terminal and prints all four lists empty. When `setup` left out
+entries of the requests file, it adds `"ignored_requests": <count>` and removes them from the file.
 
 ## tb self vault add
 
@@ -178,8 +270,8 @@ Deletes a key after asking for confirmation on the terminal.
 
 ## tb self vault log
 
-What happened to your keys, newest first: added, allowed, declined, revoked, removed, used and refused. Never
-values.
+What happened to your keys, newest first: requested, added, allowed, declined, revoked, removed, used and refused.
+Never values.
 
 | Flag | Meaning |
 |------|---------|
@@ -212,7 +304,7 @@ values.
 
 | Field | Meaning |
 |-------|---------|
-| `event` | `added`, `allowed`, `declined`, `revoked`, `removed`, `used` or `refused`. |
+| `event` | `requested`, `added`, `allowed`, `declined`, `revoked`, `removed`, `used` or `refused`. |
 | `request` | Where a key went: method, host and path. Never the query string, which can hold the key. |
 | `outcome` | `{ "status": 200 }`, or `{ "failed": "..." }` when no answer came back. |
 | `reason` | Why a key was refused, for `refused`. |
@@ -237,7 +329,8 @@ macOS keeps it for days to weeks, depending on disk space.
 
 1. Add `"vault": ["github"]` under `permissions` in `command.json`.
 2. Send it in a header: `Authorization = "Bearer " .. vault("github")`.
-3. Run `tb self vault allow github <command>` in your terminal.
+3. If the key isn't stored yet: `tb self vault request github --host api.github.com`.
+4. Run `tb self vault setup` in your terminal.
 
 The script only ever sees the placeholder `{{vault:github}}`. toolbox swaps in the real key while sending, and only
 to the hosts you set. See [Writing commands](../writing-commands.md#vault-api-keys-you-can-use-but-never-see).

@@ -321,7 +321,7 @@ fn vault_keys_need_approval_and_stay_redacted() {
 
     let refused = server.call(1, "call", json!({ "url": url }));
     assert_eq!(refused["result"]["isError"], true);
-    assert!(text(&refused, 0).contains("tb self vault allow test call"), "{refused}");
+    assert!(text(&refused, 0).contains("tb self vault setup call"), "{refused}");
 
     server.allow("test", "call");
     let reply = server.call(2, "call", json!({ "url": url }));

@@ -12,6 +12,8 @@ pub mod log;
 pub mod names;
 #[cfg(target_os = "macos")]
 mod presence;
+pub mod requests;
+pub mod setup;
 pub mod store;
 mod unescape;
 

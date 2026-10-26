@@ -626,7 +626,8 @@ mod tests {
                 ..RequestOptions::default()
             },
         ));
-        assert!(in_query.unwrap_err().to_string().contains("tb self vault add github"));
+        let err = in_query.unwrap_err().to_string();
+        assert!(err.contains("tb self vault request github --host x.example --query-param key"), "{err}");
         let in_form = c.send(spec(
             "https://x.example/",
             RequestOptions {
@@ -644,7 +645,7 @@ mod tests {
         let err = client(&["*"], &["github"])
             .send(spec("https://x.example/", RequestOptions { headers, ..RequestOptions::default() }))
             .unwrap_err();
-        assert!(err.to_string().contains("tb self vault add github"));
+        assert!(err.to_string().contains("tb self vault request github --host x.example --why"), "{err}");
     }
 
     #[test]

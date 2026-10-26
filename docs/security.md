@@ -41,7 +41,7 @@ An installed command runs someone else's code with every permission it asks for.
   send them anywhere it may call.
 - **`write`** can change or delete files there. Write access to `~` lets a command edit your shell startup files, which
   is as good as `exec`.
-- **`vault`** uses your keys once you allow the command with [`tb self vault allow`](commands/vault.md#tb-self-vault-allow).
+- **`vault`** uses your keys once you allow the command with [`tb self vault setup`](commands/vault.md#tb-self-vault-setup).
   They still only go to the hosts you bound them to, but the command decides what to do there: a GitHub key can
   delete repos.
 
@@ -89,8 +89,8 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
 
 ### Seeing what happened
 
-[`tb self vault log`](commands/vault.md#tb-self-vault-log) lists every time a key was added, allowed, revoked,
-removed, used or refused: when, by which command, to which host and path, and which programs started `tb` (your
+[`tb self vault log`](commands/vault.md#tb-self-vault-log) lists every time a key was requested, added, allowed,
+revoked, removed, used or refused: when, by which command, to which host and path, and which programs started `tb` (your
 shell, or an AI app like `claude`). An agent can edit that file, but not the copy in the macOS system log.
 
 ### What it does not protect against
@@ -98,6 +98,9 @@ shell, or an AI app like `claude`). An agent can edit that file, but not the cop
 - **A rebuilt toolbox.** If an AI edits the Rust source and rebuilds it, the new binary can do anything. macOS asks
   again before a changed binary reads the keychain: only click Allow right after you installed or upgraded toolbox
   yourself.
+- **Hosts you accept without reading.** An agent can [request a key](commands/vault.md#tb-self-vault-request) for
+  any host. `tb self vault setup` shows the hosts and lets you change them, and pressing Enter keeps them. Read them,
+  and the Touch ID sentence that names them again, before you paste a key.
 - **A Touch ID prompt you didn't expect.** An agent can start a vault change and make macOS ask you. Read the
   sentence in the dialog: if you didn't start that change, cancel it and look at
   [`tb self vault log`](commands/vault.md#tb-self-vault-log), which shows the programs that started it.

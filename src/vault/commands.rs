@@ -1,4 +1,5 @@
 //! `tb self vault add|list|allow|revoke|rm`. Every change needs a human at a terminal.
+//! `request` and `setup` live in their own modules.
 
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
@@ -16,6 +17,10 @@ use crate::registry::{CommandDef, Registry};
 /// Human input. The real one reads `/dev/tty`, which scripts and agents can't type into.
 pub trait Terminal {
     fn read_secret(&self, prompt: &str) -> Result<String>;
+    /// One line of plain text, trimmed.
+    fn ask(&self, prompt: &str) -> Result<String>;
+    /// Prints `text` on the terminal, never on stdout, which carries the JSON result.
+    fn show(&self, text: &str) -> Result<()>;
     fn confirm(&self, prompt: &str) -> Result<bool>;
     /// Shows `summary`, then asks `question`. Answering `v` shows `full` in a pager
     /// and asks again.
@@ -27,6 +32,15 @@ pub struct Tty;
 impl Terminal for Tty {
     fn read_secret(&self, prompt: &str) -> Result<String> {
         rpassword::prompt_password(prompt).map_err(no_tty)
+    }
+
+    fn ask(&self, prompt: &str) -> Result<String> {
+        ask(&open_tty()?, prompt)
+    }
+
+    fn show(&self, text: &str) -> Result<()> {
+        writeln!(open_tty()?, "{text}")?;
+        Ok(())
     }
 
     fn confirm(&self, prompt: &str) -> Result<bool> {
@@ -144,10 +158,6 @@ pub fn add(
 /// The Touch ID sentence for `add`. Moving an existing key to new hosts must read
 /// differently from adding one: with a faked terminal it is all the person sees.
 fn add_change(name: &str, existing: Option<&SecretEntry>, entry: &SecretEntry, new_value: bool) -> String {
-    let destination = |entry: &SecretEntry| match entry.query_params.as_slice() {
-        [] => entry.hosts.join(", "),
-        params => format!("{} (also as query parameter {})", entry.hosts.join(", "), params.join(", ")),
-    };
     let Some(old) = existing else {
         return format!("add the API key {name} for {}", destination(entry));
     };
@@ -166,6 +176,14 @@ fn add_change(name: &str, existing: Option<&SecretEntry>, entry: &SecretEntry, n
 
 pub fn list(store: &dyn VaultStore, registry: &Registry) -> Result<Vec<SecretSummary>> {
     Ok(store.load()?.summaries(registry))
+}
+
+/// Where a key may go, as the person reads it: `api.example.com (also as query parameter key)`.
+pub(super) fn destination(entry: &SecretEntry) -> String {
+    match entry.query_params.as_slice() {
+        [] => entry.hosts.join(", "),
+        params => format!("{} (also as query parameter {})", entry.hosts.join(", "), params.join(", ")),
+    }
 }
 
 /// Lets one command use a secret, after showing the human exactly what it runs.
@@ -191,7 +209,7 @@ pub fn allow(
     let script = def.read_script()?;
     let fingerprint = approval::fingerprint(&def.manifest_source, &script);
     let (key, name) = (secret.to_string(), command.to_string());
-    let review = approval::review(def, &script, secret, entry);
+    let review = approval::review(def, &script, &[(secret, entry)]);
     if !term.review(&review.summary, &review.full, &review.question)? {
         log.record(Event::Declined { key, command: name });
         return Ok(false);
@@ -202,7 +220,7 @@ pub fn allow(
     Ok(true)
 }
 
-fn find_command<'r>(registry: &'r Registry, name: &str) -> Result<&'r CommandDef> {
+pub(super) fn find_command<'r>(registry: &'r Registry, name: &str) -> Result<&'r CommandDef> {
     if let Some(def) = registry.find(name) {
         return Ok(def);
     }
@@ -285,6 +303,14 @@ mod tests {
         fn read_secret(&self, prompt: &str) -> Result<String> {
             self.prompts.borrow_mut().push(prompt.to_string());
             Ok(self.secret.to_string())
+        }
+        fn ask(&self, prompt: &str) -> Result<String> {
+            self.prompts.borrow_mut().push(prompt.to_string());
+            Ok(String::new())
+        }
+        fn show(&self, text: &str) -> Result<()> {
+            self.prompts.borrow_mut().push(text.to_string());
+            Ok(())
         }
         fn confirm(&self, prompt: &str) -> Result<bool> {
             self.prompts.borrow_mut().push(prompt.to_string());

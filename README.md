@@ -114,24 +114,35 @@ Every field and function is in [Writing commands](docs/writing-commands.md).
 
 ## 🔑 Use an API key without handing it over
 
-**1. Store the key once, at your own terminal**, and say where it may go:
-
-```console
-$ tb self vault add github --host api.github.com
-Value for github (input is hidden):
-```
-
-**2. Ask for it by name** in the script, and list it under `"vault": ["github"]` in `command.json`:
+**1. Your agent asks for it by name** in the script, lists it under `"vault": ["github"]` in `command.json`, and
+requests it. That needs no terminal and never touches the vault:
 
 ```lua
 headers = { Authorization = "Bearer " .. vault("github") }
 ```
 
-**3. Read the script, then allow it:**
+```console
+$ tb self vault request github --host api.github.com --why "Read star counts of your private GitHub repos" \
+    --note "Get it at https://github.com/settings/tokens"
+```
+
+**2. You paste the key and read the script, in one go:**
 
 ```console
-$ tb self vault allow github stars
+$ tb self vault setup
+
+Key github was requested
+  why: Read star counts of your private GitHub repos
+  note: Get it at https://github.com/settings/tokens
+  used by stars
+Hosts it may go to (Enter keeps api.github.com, - skips this key):
+Paste the key for github (input is hidden, empty skips it):
+stars wants to use your key github
+  ...
+Allow stars to use github? [y/N, v = read the whole script] y
 ```
+
+Rather type it all yourself? `tb self vault add github --host api.github.com`, then `tb self vault allow github stars`.
 
 The script only ever holds `{{vault:github}}`. toolbox swaps in the real key while sending, and any copy of it in the
 response comes back as `[REDACTED:github]`. Edit the script and the approval is gone until you allow it again.
@@ -148,8 +159,8 @@ sequenceDiagram
     participant tb as toolbox
     participant API as api.github.com
 
-    You->>tb: tb self vault add github --host api.github.com
-    You->>tb: tb self vault allow github gh-prs (after reading the script)
+    Agent->>tb: tb self vault request github --host api.github.com
+    You->>tb: tb self vault setup (paste the key, read the script)
     Agent->>tb: tb gh-prs
     tb->>Script: run
     Script->>tb: http.get with header "Bearer {{vault:github}}"
@@ -173,7 +184,7 @@ sequenceDiagram
 `tb` is my toolbox CLI. Run `tb` to list my commands and `tb self describe` for their args as JSON.
 To add a command, read `tb self guide`, then `tb self new <name>`, edit the files, and run `tb self check`.
 API keys live in the toolbox vault: use `vault("name")` in headers, never ask me for a key.
-If a key is missing or a command isn't allowed to use it, the error says what to ask me to run.
+If a key is missing, request it with `tb self vault request` and ask me to run `tb self vault setup`.
 Before writing a new command, check `tb self search <words>` for one in my marketplaces.
 Before `tb self install <source> --yes`, show me the permissions it lists and wait for my OK.
 ```
@@ -223,7 +234,7 @@ Plain `tb` lists only your own commands. Everything that manages toolbox lives u
 | [`tb self update [<name>]`](docs/commands/update.md) | Update installed commands to their newest version |
 | [`tb self uninstall <name>`](docs/commands/uninstall.md) | Remove an installed command |
 | [`tb self market`](docs/commands/market.md) | Save, list and remove marketplaces |
-| [`tb self vault`](docs/commands/vault.md) | Add API keys and choose which commands may use them |
+| [`tb self vault`](docs/commands/vault.md) | API keys: agents request them, you paste them and choose which commands may use them |
 | [`tb self mcp`](docs/commands/mcp.md) | Serve your commands as MCP tools for Claude Code and other AI apps |
 
 </details>

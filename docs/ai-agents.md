@@ -11,7 +11,7 @@ Add this to your `CLAUDE.md` (or your agent's instructions file):
 `tb` is my toolbox CLI. Run `tb` to list my commands and `tb self describe` for their args as JSON.
 To add a command, read `tb self guide`, then `tb self new <name>`, edit the files, and run `tb self check`.
 API keys live in the toolbox vault: use `vault("name")` in headers, never ask me for a key.
-If a key is missing or a command isn't allowed to use it, the error says what to ask me to run.
+If a key is missing, request it with `tb self vault request` and ask me to run `tb self vault setup`.
 Before writing a new command, check `tb self search <words>` for one in my marketplaces.
 Before `tb self install <source> --yes`, show me the permissions it lists and wait for my OK.
 ```
