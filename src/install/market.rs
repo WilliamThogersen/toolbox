@@ -124,6 +124,7 @@ pub fn resolve(markets: &Markets, source: &str, git_ref: Option<&str>, names: &[
         url: source.to_string(),
         git_ref: git_ref.map(str::to_string),
         names: names.to_vec(),
+        market: None,
     };
     if !is_valid_name(market_name) {
         return Ok(plain());
@@ -133,6 +134,7 @@ pub fn resolve(markets: &Markets, source: &str, git_ref: Option<&str>, names: &[
             url: market.url.clone(),
             git_ref: git_ref.map(str::to_string).or_else(|| market.git_ref.clone()),
             names: picked.map(str::to_string).into_iter().chain(names.iter().cloned()).collect(),
+            market: Some(market_name.to_string()),
         }),
         None if Path::new(source).exists() => Ok(plain()),
         None => bail!(
@@ -224,6 +226,7 @@ mod tests {
         assert_eq!(one.url, "https://github.com/acme/tb-market.git");
         assert_eq!(one.git_ref.as_deref(), Some("stable"));
         assert_eq!(one.names, strings(&["stars"]));
+        assert_eq!(one.market.as_deref(), Some("acme"));
 
         let many = resolve(&acme(), "acme", Some("v2"), &strings(&["a", "b"])).unwrap();
         assert_eq!(many.git_ref.as_deref(), Some("v2"), "--ref overrides the saved ref");
@@ -236,6 +239,7 @@ mod tests {
             let request = resolve(&acme(), source, None, &strings(&["x"])).unwrap();
             assert_eq!(request.url, source);
             assert_eq!(request.names, strings(&["x"]));
+            assert_eq!(request.market, None);
         }
     }
 

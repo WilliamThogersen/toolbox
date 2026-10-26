@@ -19,6 +19,7 @@ use std::fmt;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
+pub use platform::ancestors;
 pub use store::{VaultStore, default_store};
 
 use crate::command::registry::Registry;

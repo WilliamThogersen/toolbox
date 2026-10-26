@@ -35,7 +35,7 @@ pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Re
             print_json(&report)?;
             Ok(if report.ok { ExitCode::SUCCESS } else { ExitCode::FAILURE })
         }
-        Some(("describe", _)) => print_json(&describe::describe(registry, commands_dir)),
+        Some(("describe", m)) => print_json(&describe::describe(registry, commands_dir, flag(m, "origin")?)),
         Some(("guide", _)) => {
             ignore_closed_pipe(io::stdout().lock().write_all(describe::GUIDE.as_bytes()))?;
             Ok(ExitCode::SUCCESS)

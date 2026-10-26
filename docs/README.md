@@ -8,7 +8,7 @@ Plain `tb` lists only your own commands. Everything that manages toolbox lives u
 |---------|--------------|
 | [`tb self new <name>`](commands/new.md) | Create a command from a template |
 | [`tb self check`](commands/check.md) | Validate every command, exit 1 on problems |
-| [`tb self describe`](commands/describe.md) | Every command, its args and permissions, as JSON |
+| [`tb self describe`](commands/describe.md) | Every command, its args and permissions, as JSON; `--origin` adds where each came from |
 | [`tb self guide`](commands/guide.md) | Print the reference for writing commands |
 | [`tb self install <source>`](commands/install.md) | Install commands from a git repo or a saved marketplace |
 | [`tb self search [<text>]`](commands/search.md) | Search the commands in every saved marketplace |

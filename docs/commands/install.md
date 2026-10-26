@@ -35,7 +35,9 @@ A name like `acme` always means a saved marketplace. To use a local folder with 
    listed.
 4. Shows each command's permissions, marks the risky ones with `!`, and asks.
 5. Copies `command.json` and `run.lua` into `~/.toolbox/commands/<name>/`, plus a `.source.json` that records the
-   repo, ref and commit for [`tb self update`](update.md). Nothing else in the repo is copied.
+   repo, ref and commit for [`tb self update`](update.md), the marketplace when you named one, and a fingerprint of
+   the two files so [`tb self describe --origin`](describe.md#origins) can tell when they were edited. Nothing else in
+   the repo is copied.
 
 The prompt:
 
@@ -62,7 +64,7 @@ Installing again from the same repo replaces the installed copies. Use that to m
       "version": "1.0.0",
       "permissions": { "http": ["api.github.com"], "vault": [], "exec": [], "env": [] },
       "dir": "/Users/you/.toolbox/commands/stars",
-      "source": { "url": "https://gitlab.com/alice/tb-tools.git", "commit": "a1b2c3d4e5f6..." }
+      "source": { "url": "https://gitlab.com/alice/tb-tools.git", "commit": "a1b2c3d4e5f6...", "fingerprint": "9f86d081..." }
     }
   ],
   "skipped": [

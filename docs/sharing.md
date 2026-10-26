@@ -74,9 +74,13 @@ Each installed command is a normal folder in `~/.toolbox/commands/` plus a `.sou
 {
   "url": "https://github.com/acme/tb-market.git",
   "ref": "stable",
-  "commit": "a1b2c3d4e5f6..."
+  "commit": "a1b2c3d4e5f6...",
+  "market": "acme",
+  "fingerprint": "9f86d081884c7d65..."
 }
 ```
 
-`ref` is only there when the user installed with `--ref`. `tb self update` reads this file to know where to look.
+`ref` is only there when the user installed with `--ref`, `market` only when they installed through a marketplace.
+`fingerprint` covers `command.json` and `run.lua` as installed, so
+[`tb self describe --origin`](commands/describe.md#origins) can tell when someone edited them. `tb self update` reads this file to know where to look.
 [`tb self uninstall`](commands/uninstall.md) only removes folders that have it.

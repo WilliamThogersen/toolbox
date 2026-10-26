@@ -123,13 +123,17 @@ fn plan_repo(checkout: &Path, group: Vec<Local>) -> Vec<Outcome> {
             .map(|local| Outcome::Failed(Problem { command: local.name, problem: format!("{err:#}") }))
             .collect(),
         Ok((commit, scan)) => {
-            let source = Source { url, git_ref, commit };
+            let source = Source { url, git_ref, commit, market: None, fingerprint: None };
             group.into_iter().map(|local| plan_one(local, &source, &scan)).collect()
         }
     }
 }
 
-fn plan_one(local: Local, source: &Source, scan: &Scan) -> Outcome {
+fn plan_one(local: Local, fetched: &Source, scan: &Scan) -> Outcome {
+    let source = &Source {
+        market: local.source.market.clone(),
+        ..fetched.clone()
+    };
     let Some(def) = scan.find(&local.name) else {
         let problem = match scan.problem_of(&local.name) {
             Some(problem) => format!("broken in {}, so the installed copy stays: {problem}", source.url),
