@@ -1,13 +1,11 @@
-//! `tb self describe` (what exists) and `tb self guide` (how to build more).
-
 use std::path::Path;
 
 use serde::Serialize;
 
-use crate::manifest::Manifest;
-use crate::registry::{Problem, Registry};
+use crate::command::manifest::Manifest;
+use crate::command::registry::{Problem, Registry};
 
-pub const GUIDE: &str = include_str!("../docs/writing-commands.md");
+pub const GUIDE: &str = include_str!("../../docs/writing-commands.md");
 
 #[derive(Debug, Serialize)]
 pub struct Description<'a> {

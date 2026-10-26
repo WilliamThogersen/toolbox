@@ -1,17 +1,10 @@
-//! The vault: API keys that commands can use without ever seeing them.
-//!
-//! Scripts only get placeholders like `{{vault:github}}`. The HTTP layer swaps
-//! in the real value while sending, only to hosts the human allowed, and only
-//! for commands the human approved.
-
 pub mod approval;
 pub mod commands;
 pub mod hosts;
 pub mod inject;
 pub mod log;
 pub mod names;
-#[cfg(target_os = "macos")]
-mod presence;
+mod platform;
 pub mod requests;
 pub mod setup;
 pub mod store;
@@ -25,30 +18,23 @@ use serde::{Deserialize, Serialize};
 
 pub use store::{VaultStore, default_store};
 
-use crate::registry::Registry;
+use crate::command::registry::Registry;
 use approval::CommandAccess;
 
-/// Shorter values would make response redaction mangle normal text.
 pub(crate) const MIN_SECRET_LEN: usize = 8;
 
-/// The vault in memory. How it is stored is up to `store` (see `store::encode`).
 #[derive(Debug, Clone, Default)]
 pub struct VaultData {
     pub secrets: BTreeMap<String, SecretEntry>,
 }
 
-/// Everything here is set by the human at a terminal, never by scripts. Unknown
-/// fields are refused, so a newer toolbox's rules are never silently ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretEntry {
     pub value: SecretValue,
-    /// Where it may be sent: `api.github.com` (any port) or `localhost:8080`.
     pub hosts: Vec<String>,
-    /// Query parameters it may be sent in, like `key` for `?key=...`. Empty means headers only.
     #[serde(default)]
     pub query_params: Vec<String>,
-    /// Commands allowed to use it, each with the fingerprint of the files the human approved.
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
 }
@@ -86,7 +72,6 @@ impl SecretEntry {
     }
 }
 
-/// A secret string whose `Debug` output never shows the value.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SecretValue(String);
@@ -119,7 +104,6 @@ impl fmt::Debug for SecretValue {
     }
 }
 
-/// What may be shown about a secret: everything but its value.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SecretSummary {
     pub name: String,

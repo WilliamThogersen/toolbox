@@ -1,6 +1,3 @@
-//! `tb self vault add|list|allow|revoke|rm`. Every change needs a human at a terminal.
-//! `request` and `setup` live in their own modules.
-
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -12,18 +9,15 @@ use super::hosts::{normalize_host, normalize_query_param};
 use super::log::{AuditLog, Event};
 use super::names::{self, NAME_RULES, is_secret_name};
 use super::{SecretEntry, SecretSummary, SecretValue, VaultStore, approval};
-use crate::registry::{CommandDef, Registry};
+use crate::command::registry::{CommandDef, Registry};
 
-/// Human input. The real one reads `/dev/tty`, which scripts and agents can't type into.
+const MAX_VIEWS: usize = 10;
+
 pub trait Terminal {
     fn read_secret(&self, prompt: &str) -> Result<String>;
-    /// One line of plain text, trimmed.
     fn ask(&self, prompt: &str) -> Result<String>;
-    /// Prints `text` on the terminal, never on stdout, which carries the JSON result.
     fn show(&self, text: &str) -> Result<()>;
     fn confirm(&self, prompt: &str) -> Result<bool>;
-    /// Shows `summary`, then asks `question`. Answering `v` shows `full` in a pager
-    /// and asks again.
     fn review(&self, summary: &str, full: &str, question: &str) -> Result<bool>;
 }
 
@@ -51,13 +45,15 @@ impl Terminal for Tty {
     fn review(&self, summary: &str, full: &str, question: &str) -> Result<bool> {
         let mut tty = open_tty()?;
         writeln!(tty, "{summary}\n")?;
-        loop {
+        for _ in 0..MAX_VIEWS {
             match ask(&tty, &format!("{question} [y/N, v = read the whole script] "))?.as_str() {
                 "v" | "V" => page(&tty, full)?,
                 "y" | "Y" | "yes" => return Ok(true),
                 _ => return Ok(false),
             }
         }
+        writeln!(tty, "No answer after reading it {MAX_VIEWS} times, so no.")?;
+        Ok(false)
     }
 }
 
@@ -77,9 +73,6 @@ fn ask(mut tty: &File, prompt: &str) -> Result<String> {
     Ok(answer.trim().to_string())
 }
 
-/// Shows `text` in `less` on the terminal, never on stdout, which carries the JSON
-/// result. The system `less`, not whatever `less` is first in PATH. Without it, the
-/// text is printed.
 fn page(mut tty: &File, text: &str) -> Result<()> {
     let spawned = Command::new("/usr/bin/less")
         .stdin(Stdio::piped())
@@ -90,27 +83,25 @@ fn page(mut tty: &File, text: &str) -> Result<()> {
         return Ok(());
     };
     if let Some(mut input) = less.stdin.take() {
-        // Quitting before the end closes the pipe, which is fine.
         let _ = input.write_all(text.as_bytes());
     }
     less.wait()?;
     Ok(())
 }
 
+#[expect(clippy::needless_pass_by_value, reason = "made for `map_err`, which passes the error by value")]
 fn no_tty(err: io::Error) -> anyhow::Error {
     anyhow!(
         "this needs a human at an interactive terminal ({err}). Ask the user to run the command themselves in a terminal window"
     )
 }
 
-/// Where a secret may go, as given on the command line.
+#[derive(Clone, Copy)]
 pub struct Rules<'a> {
     pub hosts: &'a [String],
     pub query_params: &'a [String],
 }
 
-/// Adds a secret, or replaces its rules. For an existing secret an empty value
-/// keeps the stored one, and the commands allowed to use it stay allowed.
 pub fn add(
     store: &dyn VaultStore,
     log: &dyn AuditLog,
@@ -155,8 +146,6 @@ pub fn add(
     Ok(entry.summary(name, registry))
 }
 
-/// The Touch ID sentence for `add`. Moving an existing key to new hosts must read
-/// differently from adding one: with a faked terminal it is all the person sees.
 fn add_change(name: &str, existing: Option<&SecretEntry>, entry: &SecretEntry, new_value: bool) -> String {
     let Some(old) = existing else {
         return format!("add the API key {name} for {}", destination(entry));
@@ -178,7 +167,6 @@ pub fn list(store: &dyn VaultStore, registry: &Registry) -> Result<Vec<SecretSum
     Ok(store.load()?.summaries(registry))
 }
 
-/// Where a key may go, as the person reads it: `api.example.com (also as query parameter key)`.
 pub(super) fn destination(entry: &SecretEntry) -> String {
     match entry.query_params.as_slice() {
         [] => entry.hosts.join(", "),
@@ -186,8 +174,6 @@ pub(super) fn destination(entry: &SecretEntry) -> String {
     }
 }
 
-/// Lets one command use a secret, after showing the human exactly what it runs.
-/// Returns whether access was given (the human may decline).
 pub fn allow(
     store: &dyn VaultStore,
     log: &dyn AuditLog,
@@ -205,7 +191,6 @@ pub fn allow(
         names::declared(&def.manifest.permissions.vault, secret),
         "command {command:?} does not list {secret:?} (or a pattern covering it) in permissions.vault, so it could not use it anyway"
     );
-    // The prompt and the fingerprint come from the same text, so what was shown is what gets allowed.
     let script = def.read_script()?;
     let fingerprint = approval::fingerprint(&def.manifest_source, &script);
     let (key, name) = (secret.to_string(), command.to_string());
@@ -233,7 +218,6 @@ pub(super) fn find_command<'r>(registry: &'r Registry, name: &str) -> Result<&'r
     }
 }
 
-/// Takes a command's access away. Returns whether it was removed (the human may decline).
 pub fn revoke(
     store: &dyn VaultStore,
     log: &dyn AuditLog,
@@ -258,7 +242,6 @@ pub fn revoke(
     Ok(true)
 }
 
-/// Returns whether the secret was deleted (the human may decline).
 pub fn remove(store: &dyn VaultStore, log: &dyn AuditLog, term: &dyn Terminal, name: &str) -> Result<bool> {
     let vault = store.load()?;
     ensure!(vault.get(name).is_some(), "no secret named {name:?}");
@@ -277,7 +260,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::manifest::Manifest;
+    use crate::command::manifest::Manifest;
     use crate::vault::VaultData;
     use crate::vault::approval::Access;
     use crate::vault::log::MemoryLog;
@@ -331,7 +314,7 @@ mod tests {
     }
 
     fn add_simple(store: &MemoryStore, term: &FakeTerminal, hosts: &[&str]) -> Result<SecretSummary> {
-        let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        let hosts: Vec<String> = hosts.iter().map(std::string::ToString::to_string).collect();
         add(store, &*MemoryLog::new(), term, &Registry::default(), "stripe", rules(&hosts, &[]))
     }
 
@@ -465,7 +448,7 @@ mod tests {
         add_simple(&store, &term(), &["api.stripe.com"]).unwrap();
         let registry = Registry {
             commands: vec![command(tmp.path(), "other", &[])],
-            problems: vec![crate::registry::Problem {
+            problems: vec![crate::command::registry::Problem {
                 command: "broken".into(),
                 problem: "missing run.lua".into(),
             }],

@@ -1,8 +1,3 @@
-//! `tb self update`: fetch each installed command's repo again and take newer versions.
-//!
-//! With a `version` on both sides, only a higher version counts as newer, so authors can push
-//! work in progress without shipping it. Without one, any new commit counts.
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,9 +9,9 @@ use super::confirm::{self, Confirm};
 use super::source::{self, Source};
 use super::repo::{self, Scan};
 use super::{Staging, git, short};
-use crate::manifest::{Manifest, Permissions};
-use crate::registry::{CommandDef, MANIFEST_FILE, Problem};
-use crate::screen::{one_line, one_line_permissions, printable};
+use crate::command::manifest::{Manifest, Permissions};
+use crate::command::registry::{CommandDef, MANIFEST_FILE, Problem};
+use crate::cli::screen::{one_line, one_line_permissions, printable};
 
 #[derive(Debug, Default, Serialize)]
 pub struct UpdateReport {
@@ -28,12 +23,10 @@ pub struct UpdateReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct Change {
     pub name: String,
-    /// Version, or short commit when the command has no version.
     pub from: String,
     pub to: String,
 }
 
-/// An installed command as it is on disk now.
 struct Local {
     name: String,
     source: Source,
@@ -53,7 +46,6 @@ enum Outcome {
     Failed(Problem),
 }
 
-/// Updates every installed command, or only `only`.
 pub fn update(commands_dir: &Path, only: Option<&str>, confirm: &dyn Confirm) -> Result<UpdateReport> {
     let locals: Vec<Local> = installed(commands_dir)?
         .into_iter()
@@ -79,7 +71,6 @@ pub fn update(commands_dir: &Path, only: Option<&str>, confirm: &dyn Confirm) ->
             _ => None,
         })
         .collect();
-    // New code from someone else's repo always needs a yes, even with the same permissions.
     if !plans.is_empty() {
         let question = match plans.len() {
             1 => "Update 1 command?".to_string(),
@@ -95,7 +86,6 @@ pub fn update(commands_dir: &Path, only: Option<&str>, confirm: &dyn Confirm) ->
     Ok(report(outcomes))
 }
 
-/// Sorted by name, so the order doesn't depend on which repo was fetched first.
 fn report(outcomes: Vec<Outcome>) -> UpdateReport {
     let mut report = outcomes.into_iter().fold(UpdateReport::default(), |mut report, outcome| {
         match outcome {
@@ -111,7 +101,6 @@ fn report(outcomes: Vec<Outcome>) -> UpdateReport {
     report
 }
 
-/// Installed commands grouped by repo and ref, so each repo is fetched once.
 fn by_repo(locals: Vec<Local>) -> Vec<Vec<Local>> {
     let mut groups: BTreeMap<(String, Option<String>), Vec<Local>> = BTreeMap::new();
     for local in locals {
@@ -122,7 +111,9 @@ fn by_repo(locals: Vec<Local>) -> Vec<Vec<Local>> {
 }
 
 fn plan_repo(checkout: &Path, group: Vec<Local>) -> Vec<Outcome> {
-    let first = &group[0].source;
+    let Some(first) = group.first().map(|local| &local.source) else {
+        return Vec::new();
+    };
     let (url, git_ref) = (first.url.clone(), first.git_ref.clone());
     let fetched = git::fetch(&url, git_ref.as_deref(), checkout)
         .and_then(|commit| Ok((commit, repo::scan(checkout)?)));
@@ -178,7 +169,6 @@ fn version_or_commit(manifest: Option<&Manifest>, commit: &str) -> String {
         .unwrap_or_else(|| short(commit).to_string())
 }
 
-/// Each update, where it comes from (to review the code), and what it may touch afterwards.
 fn update_summary(plans: &[&Plan]) -> String {
     let lines: Vec<String> = plans
         .iter()
@@ -205,7 +195,6 @@ fn update_summary(plans: &[&Plan]) -> String {
     printable(&format!("Updates:\n{}", lines.join("\n")))
 }
 
-/// Every command folder that has a `.source.json`, sorted by name.
 fn installed(commands_dir: &Path) -> Result<Vec<Local>> {
     if !commands_dir.exists() {
         return Ok(Vec::new());
@@ -230,7 +219,6 @@ fn installed(commands_dir: &Path) -> Result<Vec<Local>> {
         .collect()
 }
 
-/// `None` when the local copy is broken: the update then replaces it.
 fn read_manifest(dir: &Path) -> Option<Manifest> {
     Manifest::parse(&fs::read_to_string(dir.join(MANIFEST_FILE)).ok()?).ok()
 }
@@ -246,7 +234,7 @@ mod tests {
             description: "x".into(),
             args: BTreeMap::new(),
             permissions: Permissions::default(),
-            limits: crate::manifest::Limits::default(),
+            limits: crate::command::manifest::Limits::default(),
         }
     }
 

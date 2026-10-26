@@ -1,11 +1,7 @@
-//! `tb self vault setup`: everything waiting for the human, in one go. Keys an agent
-//! requested get their value, commands that need a key get reviewed, and the whole
-//! batch is saved at once, so the Keychain asks for Touch ID only once.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use super::approval::{self, fingerprint};
@@ -15,25 +11,22 @@ use super::log::{AuditLog, Event};
 use super::names::{self, is_secret_name};
 use super::requests::{self, KeyRequest};
 use super::{SecretEntry, SecretValue, VaultData, VaultStore};
-use crate::registry::{CommandDef, Registry};
-use crate::screen::{one_line, printable};
+use crate::command::registry::{CommandDef, Registry};
+use crate::cli::screen::{one_line, printable};
 
-/// Wrong answers allowed at one prompt before setup stops without changing anything.
 const MAX_TRIES: usize = 3;
 
-/// What `tb self vault setup` prints when it's done.
 #[derive(Debug, Default, PartialEq, Serialize)]
 pub struct Report {
     pub added: Vec<String>,
     pub allowed: Vec<Grant>,
     pub declined: Vec<Grant>,
-    /// Keys left for later. Their requests stay.
     pub skipped: Vec<String>,
-    /// Entries of the requests file left out: broken, repeated or past the limit.
     #[serde(skip_serializing_if = "is_zero")]
     pub ignored_requests: usize,
 }
 
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde's skip_serializing_if passes a reference")]
 fn is_zero(count: &usize) -> bool {
     *count == 0
 }
@@ -50,24 +43,23 @@ pub struct Grant {
     pub command: String,
 }
 
-/// A key to ask the human for: one an agent requested, or one a named command
-/// lists that nobody requested.
 struct NewKey {
     request: KeyRequest,
     requested: bool,
-    /// Hosts the command calls, shown when there are too many to pick one.
     calls: Vec<String>,
 }
 
-/// A command's answer for one key, with the fingerprint of the files the human saw.
 struct Decision {
     grant: Grant,
     fingerprint: String,
     allowed: bool,
 }
 
-/// Adds the requested keys and reviews every command waiting for a key, or only
-/// `only`. Nothing is saved until the end, so stopping halfway changes nothing.
+struct NewKeys {
+    added: Vec<(String, SecretEntry)>,
+    skipped: Vec<String>,
+}
+
 pub fn setup(
     store: &dyn VaultStore,
     log: &dyn AuditLog,
@@ -80,60 +72,17 @@ pub fn setup(
     let vault = store.load()?;
     let requests::Waiting { requests: waiting, ignored } = requests::load(requests_path)?;
 
-    let answered = keys_to_add(&vault, &waiting, only)
-        .into_iter()
-        .map(|key| Ok((ask_new_key(term, registry, &key)?, key.request.name)))
-        .collect::<Result<Vec<_>>>()?;
-    let added: Vec<(String, SecretEntry)> = answered
-        .iter()
-        .filter_map(|(entry, name)| entry.clone().map(|entry| (name.clone(), entry)))
-        .collect();
-    let skipped: Vec<String> = answered
-        .iter()
-        .filter(|(entry, _)| entry.is_none())
-        .map(|(_, name)| name.clone())
-        .collect();
+    let NewKeys { added, skipped } = ask_keys(term, registry, keys_to_add(&vault, &waiting, only))?;
     let with_keys = added
         .iter()
         .fold(vault, |data, (name, entry)| data.with_secret(name, entry.clone()));
-
-    let new_names: BTreeSet<&str> = added.iter().map(|(name, _)| name.as_str()).collect();
-    let commands: Vec<&CommandDef> = match only {
-        Some(def) => vec![def],
-        None => registry.commands.iter().collect(),
-    };
-    let decisions: Vec<Decision> = commands
-        .into_iter()
-        .map(|def| review_command(term, def, &with_keys, &new_names, only.is_some()))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
-    let (yes, no): (Vec<Decision>, Vec<Decision>) = decisions.into_iter().partition(|d| d.allowed);
+    let (yes, no) = review_commands(term, registry, only, &with_keys, &added)?;
     for declined in &no {
         log.record(Event::Declined { key: declined.grant.key.clone(), command: declined.grant.command.clone() });
     }
-    let done = yes.iter().fold(with_keys, |data, d| {
-        let entry = data.get(&d.grant.key).expect("reviewed keys exist").with_command(&d.grant.command, d.fingerprint.clone());
-        data.with_secret(&d.grant.key, entry)
-    });
+    let done = grant(with_keys, &yes)?;
     let allowed: Vec<Grant> = yes.into_iter().map(|d| d.grant).collect();
-
-    if !added.is_empty() || !allowed.is_empty() {
-        store.save(&done, &change(&added, &allowed))?;
-        for (name, entry) in &added {
-            log.record(Event::Added {
-                key: name.clone(),
-                hosts: entry.hosts.clone(),
-                query_params: entry.query_params.clone(),
-                new_value: true,
-            });
-        }
-        for grant in &allowed {
-            log.record(Event::Allowed { key: grant.key.clone(), command: grant.command.clone() });
-        }
-    }
-    // The vault is saved by now: a file that can't be tidied must not hide that.
+    save(store, log, &done, &added, &allowed)?;
     if let Err(err) = forget_fulfilled(requests_path, &done) {
         eprintln!("toolbox: your changes are saved, but {} could not be updated: {err:#}", requests_path.display());
     }
@@ -146,8 +95,72 @@ pub fn setup(
     })
 }
 
-/// Requested keys not in the vault yet, and, for a named command, the keys it lists
-/// by exact name that nobody requested.
+fn ask_keys(term: &dyn Terminal, registry: &Registry, keys: Vec<NewKey>) -> Result<NewKeys> {
+    let answered = keys
+        .into_iter()
+        .map(|key| Ok((key.request.name.clone(), ask_new_key(term, registry, &key)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let (given, skipped): (Vec<_>, Vec<_>) = answered.into_iter().partition(|(_, entry)| entry.is_some());
+    Ok(NewKeys {
+        added: given.into_iter().filter_map(|(name, entry)| entry.map(|entry| (name, entry))).collect(),
+        skipped: skipped.into_iter().map(|(name, _)| name).collect(),
+    })
+}
+
+fn review_commands(
+    term: &dyn Terminal,
+    registry: &Registry,
+    only: Option<&CommandDef>,
+    vault: &VaultData,
+    added: &[(String, SecretEntry)],
+) -> Result<(Vec<Decision>, Vec<Decision>)> {
+    let new_names: BTreeSet<&str> = added.iter().map(|(name, _)| name.as_str()).collect();
+    let commands: Vec<&CommandDef> = match only {
+        Some(def) => vec![def],
+        None => registry.commands.iter().collect(),
+    };
+    let decisions = commands
+        .into_iter()
+        .map(|def| review_command(term, def, vault, &new_names, only.is_some()))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(decisions.into_iter().flatten().partition(|d| d.allowed))
+}
+
+fn grant(vault: VaultData, allowed: &[Decision]) -> Result<VaultData> {
+    allowed.iter().try_fold(vault, |data, d| {
+        let entry = data
+            .get(&d.grant.key)
+            .with_context(|| format!("the key {} disappeared during setup. Nothing was changed", d.grant.key))?
+            .with_command(&d.grant.command, d.fingerprint.clone());
+        Ok(data.with_secret(&d.grant.key, entry))
+    })
+}
+
+fn save(
+    store: &dyn VaultStore,
+    log: &dyn AuditLog,
+    done: &VaultData,
+    added: &[(String, SecretEntry)],
+    allowed: &[Grant],
+) -> Result<()> {
+    if added.is_empty() && allowed.is_empty() {
+        return Ok(());
+    }
+    store.save(done, &change(added, allowed))?;
+    for (name, entry) in added {
+        log.record(Event::Added {
+            key: name.clone(),
+            hosts: entry.hosts.clone(),
+            query_params: entry.query_params.clone(),
+            new_value: true,
+        });
+    }
+    for grant in allowed {
+        log.record(Event::Allowed { key: grant.key.clone(), command: grant.command.clone() });
+    }
+    Ok(())
+}
+
 fn keys_to_add(vault: &VaultData, waiting: &[KeyRequest], only: Option<&CommandDef>) -> Vec<NewKey> {
     let requested = waiting
         .iter()
@@ -171,7 +184,6 @@ fn keys_to_add(vault: &VaultData, waiting: &[KeyRequest], only: Option<&CommandD
             .filter(move |name| is_secret_name(name) && vault.get(name).is_none())
             .filter(move |name| !waiting.iter().any(|req| &req.name == *name))
             .map(move |name| NewKey {
-                // Only a command that calls one host gets it as the default.
                 request: KeyRequest {
                     name: name.clone(),
                     hosts: if calls.len() == 1 { calls.clone() } else { Vec::new() },
@@ -186,8 +198,6 @@ fn keys_to_add(vault: &VaultData, waiting: &[KeyRequest], only: Option<&CommandD
     requested.chain(unrequested).collect()
 }
 
-/// Shows what the key is for, then asks where it may go and for its value.
-/// `None` when the human skips it.
 fn ask_new_key(term: &dyn Terminal, registry: &Registry, key: &NewKey) -> Result<Option<SecretEntry>> {
     let req = &key.request;
     let users: Vec<&str> = registry
@@ -232,8 +242,6 @@ fn ask_new_key(term: &dyn Terminal, registry: &Registry, key: &NewKey) -> Result
     Ok(Some(SecretEntry { value, hosts, query_params, commands: BTreeMap::new() }))
 }
 
-/// A comma-separated list where every item passes `check`. Enter takes `default`
-/// and `-` means none.
 fn ask_list(term: &dyn Terminal, prompt: &str, default: &[String], check: fn(&str) -> Result<String>) -> Result<Vec<String>> {
     for _ in 0..MAX_TRIES {
         let typed = term.ask(prompt)?;
@@ -264,9 +272,6 @@ fn ask_value(term: &dyn Terminal, name: &str) -> Result<Option<SecretValue>> {
     bail!("stopped after {MAX_TRIES} values that didn't work. Nothing was changed")
 }
 
-/// Shows the command once, then asks about each key it is waiting for: keys it
-/// was allowed but changed since, keys added just now, keys it lists by exact
-/// name, and, when the human named the command, keys a pattern of its covers.
 fn review_command(
     term: &dyn Terminal,
     def: &CommandDef,
@@ -278,8 +283,6 @@ fn review_command(
     if !vault.secrets.keys().any(|key| names::declared(declared, key)) {
         return Ok(Vec::new());
     }
-    // The review and the fingerprint come from the same text, so what was shown is what gets allowed.
-    // In a sweep, one unreadable command must not throw away the keys already pasted.
     let script = match def.read_script() {
         Ok(script) => script,
         Err(err) if !named => {
@@ -321,10 +324,6 @@ fn review_command(
         .collect())
 }
 
-/// The Touch ID sentence: every key added and every command allowed, in one line.
-/// Commands getting a key you already had come first: with a faked terminal this
-/// sentence is all the person reads, and a long list of new keys must not push the
-/// one that matters out of sight.
 fn change(added: &[(String, SecretEntry)], allowed: &[Grant]) -> String {
     let is_new = |grant: &&Grant| added.iter().any(|(name, _)| *name == grant.key);
     let (to_new, to_old): (Vec<&Grant>, Vec<&Grant>) = allowed.iter().partition(is_new);
@@ -334,7 +333,6 @@ fn change(added: &[(String, SecretEntry)], allowed: &[Grant]) -> String {
     lets(&to_old).into_iter().chain(adds).chain(lets(&to_new)).collect::<Vec<_>>().join("; ")
 }
 
-/// One "let the command ... use ..." per command, in order of name.
 fn lets(grants: &[&Grant]) -> Vec<String> {
     let commands: BTreeSet<&str> = grants.iter().map(|grant| grant.command.as_str()).collect();
     commands
@@ -351,8 +349,6 @@ fn lets(grants: &[&Grant]) -> Vec<String> {
         .collect()
 }
 
-/// Drops requests whose key is in the vault now, however it got there, and
-/// entries `load` left out. Read again, so a request filed meanwhile stays.
 fn forget_fulfilled(path: &Path, vault: &VaultData) -> Result<()> {
     let now = requests::load(path)?;
     let remaining: Vec<KeyRequest> = now
@@ -376,7 +372,7 @@ mod tests {
     use anyhow::anyhow;
 
     use super::*;
-    use crate::manifest::Manifest;
+    use crate::command::manifest::Manifest;
     use crate::vault::approval::Access;
     use crate::vault::log::MemoryLog;
     use crate::vault::requests::{REQUESTS_FILE, with_request};
@@ -384,7 +380,6 @@ mod tests {
 
     const VALUE: &str = "fake_maps_0123456789";
 
-    /// Answers prompts in order and fails when it runs out, like a human who stopped.
     struct Script {
         answers: RefCell<VecDeque<&'static str>>,
         seen: RefCell<Vec<String>>,
@@ -450,7 +445,7 @@ mod tests {
         }
 
         fn request(&self, name: &str, hosts: &[&str], params: &[&str]) {
-            let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let strings = |items: &[&str]| items.iter().map(std::string::ToString::to_string).collect::<Vec<_>>();
             let note = Some("Get it at https://example.com");
             let req = KeyRequest::new(name, &strings(hosts), &strings(params), "Run audits", note).unwrap();
             let waiting = requests::load(&self.requests()).unwrap().requests;

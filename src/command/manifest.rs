@@ -1,5 +1,3 @@
-//! `command.json`: the declarative half of a command (name, args, permissions).
-
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
@@ -9,12 +7,10 @@ use serde_json::Value;
 
 use crate::vault::names::{NAME_RULES, is_secret_pattern};
 
-/// Top-level names owned by toolbox itself (built-ins live under `self`).
 pub const RESERVED_NAMES: &[&str] = &["self", "help"];
 
 const MAX_NAME_LEN: usize = 64;
 
-/// The most a command can ask for in `limits`: a day of CPU time, 64 GB of memory.
 pub const MAX_CPU_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 pub const MAX_MEMORY_MB: u64 = 64 * 1024;
 
@@ -22,7 +18,6 @@ pub const MAX_MEMORY_MB: u64 = 64 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub name: String,
-    /// Semver like `1.2.0`. `tb self update` only replaces an installed copy with a higher one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub description: String,
@@ -30,12 +25,10 @@ pub struct Manifest {
     pub args: BTreeMap<String, ArgSpec>,
     #[serde(default)]
     pub permissions: Permissions,
-    /// More CPU time or memory than the defaults, for a command that needs it.
     #[serde(default, skip_serializing_if = "Limits::is_default")]
     pub limits: Limits,
 }
 
-/// What a command may use. Unset means the default (60 seconds of CPU, 512 MB).
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
@@ -85,26 +78,19 @@ pub enum ArgType {
     Boolean,
 }
 
-/// What a command's script is allowed to touch.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Permissions {
-    /// Hosts the script may call. `"*"` allows any host.
     #[serde(default)]
     pub http: Vec<String>,
-    /// Vault secret names the script may reference. `github/*` covers every key one level under `github`.
     #[serde(default)]
     pub vault: Vec<String>,
-    /// Programs the script may run with `exec`.
     #[serde(default)]
     pub exec: Vec<String>,
-    /// Environment variables the script may read.
     #[serde(default)]
     pub env: Vec<String>,
-    /// Folders the script may read with `fs`. `~` is home, relative paths start at the current folder.
     #[serde(default)]
     pub read: Vec<String>,
-    /// Folders the script may write to (and read) with `fs`.
     #[serde(default)]
     pub write: Vec<String>,
 }
@@ -114,12 +100,10 @@ impl Manifest {
         serde_json::from_str(json).context("invalid command.json")
     }
 
-    /// `None` when there is no version or it is not valid semver.
     pub fn semver(&self) -> Option<Version> {
         self.version.as_deref().and_then(|v| Version::parse(v).ok())
     }
 
-    /// Returns every problem found; an empty list means the manifest is usable.
     pub fn validate(&self, dir_name: &str) -> Vec<String> {
         let mut problems = Vec::new();
         if !is_valid_name(&self.name) {
@@ -206,7 +190,6 @@ fn default_matches(kind: ArgType, value: &Value) -> bool {
     }
 }
 
-/// Names for commands, args and each part of a secret name: lowercase, digits, '-' and '_'.
 pub fn is_valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     let starts_ok = chars

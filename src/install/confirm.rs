@@ -1,17 +1,13 @@
-//! Asking before code from someone else's repo lands in the toolbox.
-
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use anyhow::{Result, bail};
 
-use crate::manifest::{Manifest, Permissions};
+use crate::command::manifest::{Manifest, Permissions};
 
 pub trait Confirm {
-    /// Shows `summary`, then asks `question`. `Ok(false)` means the human said no.
     fn confirm(&self, summary: &str, question: &str) -> Result<bool>;
 }
 
-/// Asks on the terminal. Without one (an agent's shell, a pipe) it fails and points at `--yes`.
 pub struct Prompt;
 
 impl Confirm for Prompt {
@@ -30,7 +26,6 @@ impl Confirm for Prompt {
     }
 }
 
-/// `--yes`: the caller already reviewed what gets installed.
 pub struct Yes;
 
 impl Confirm for Yes {
@@ -39,7 +34,6 @@ impl Confirm for Yes {
     }
 }
 
-/// `stars 1.2.0`, or just `stars` without a version.
 pub fn label(manifest: &Manifest) -> String {
     match &manifest.version {
         Some(version) => format!("{} {version}", manifest.name),
@@ -47,7 +41,6 @@ pub fn label(manifest: &Manifest) -> String {
     }
 }
 
-/// `http: api.github.com; vault: github`, or `no permissions`.
 pub fn permissions(perms: &Permissions) -> String {
     let parts: Vec<String> = [
         ("http", &perms.http),
@@ -68,7 +61,6 @@ pub fn permissions(perms: &Permissions) -> String {
     }
 }
 
-/// Plain-words warnings for the permissions that can hurt, one line each.
 pub fn warnings(perms: &Permissions) -> Vec<String> {
     let mut lines = Vec::new();
     if !perms.exec.is_empty() {
@@ -101,9 +93,8 @@ pub fn warnings(perms: &Permissions) -> Vec<String> {
     lines
 }
 
-/// The warnings as indented `! ...` lines, ready to append under a command's line.
 pub fn warning_lines(perms: &Permissions) -> String {
-    warnings(perms).iter().map(|w| format!("\n    ! {w}")).collect()
+    warnings(perms).iter().map(|w| format!("\n    ! {w}")).collect::<Vec<_>>().concat()
 }
 
 #[cfg(test)]

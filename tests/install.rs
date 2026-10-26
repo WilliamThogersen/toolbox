@@ -1,7 +1,16 @@
 //! End-to-end tests for `tb self install|update|uninstall` against local git repos.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::needless_pass_by_value,
+    reason = "test code: a panic is a failed test, and helpers take `json!(...)` values as they are"
+)]
+
+mod common;
 
 use std::fs;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
@@ -40,14 +49,7 @@ impl Toolbox {
             .env("TOOLBOX_HOME", self.home.path())
             .env("TOOLBOX_INSECURE_TEST_VAULT", self.home.path().join("test-vault.json"))
             .stdin(Stdio::null());
-        // Detach from any controlling terminal, like an AI agent's shell.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-        cmd.output().unwrap()
+        common::detach(&mut cmd).output().unwrap()
     }
 
     fn json(&self, args: &[&str]) -> Value {

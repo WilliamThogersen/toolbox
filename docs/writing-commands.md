@@ -99,7 +99,8 @@ local res = http.request{ method = "POST", url = url, headers = {...}, json = {.
 
 The response is `{ status = 200, headers = {...}, body = "raw text", json = table or nil }`.
 Header names are lowercase. `json` is set when the body is JSON. A 4xx or 5xx
-status is not an error: check `res.status`. Network failures and timeouts raise an error.
+status is not an error: check `res.status`. Network failures, timeouts and bodies over
+20 MB raise an error.
 Up to 10 redirects are followed, each only to a host in `permissions.http`: a redirect to
 any other host raises an error, so list every host the API sends you to.
 
@@ -118,12 +119,13 @@ local out = exec("jq", { ".name" }, {
   stdin = json.encode(data),  -- text sent to the program's stdin
   cwd = "/path/to/repo",      -- folder it runs in
   env = { NO_COLOR = "1" },   -- extra environment variables (see below for what's refused)
-  timeout = 10,               -- seconds; then it and all it started are killed, and exec raises an error
+  timeout = 10,               -- seconds (default 600); then it and all it started are killed, and exec raises an error
 })
 ```
 
 No shell: pass args as a list. The program must be in `permissions.exec`. A
-non-zero exit is not an error: check `out.ok`. toolbox finds the program with its
+non-zero exit is not an error: check `out.ok`. Output over 20 MB on stdout or stderr
+is an error. toolbox finds the program with its
 own `PATH` (a path like `./tool` means the folder `tb` runs in), so `cwd` and `env`
 can't swap in another one. `env` can't set `PATH`, `LD_*`, `DYLD_*`, `BASH_ENV`, `ENV`,
 `SHELLOPTS`, `BASHOPTS` or `PS4`, since they change which code runs, and names must
@@ -156,7 +158,7 @@ check, so a link can't lead outside. `fs.write` does not create folders: call
 ### stdin
 
 `stdin.read()` returns everything piped into the command (`cat data.csv | tb import`),
-or `nil` when stdin is a terminal. No permission needed.
+or `nil` when stdin is a terminal. More than 20 MB is an error. No permission needed.
 
 ### time
 

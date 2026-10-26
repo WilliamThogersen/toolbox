@@ -1,22 +1,20 @@
 mod builtin;
-mod check;
 mod cli;
-mod describe;
-mod init;
+mod command;
 mod install;
-mod manifest;
 mod mcp;
-mod paths;
-mod registry;
 mod runtime;
-mod scaffold;
-mod screen;
-mod update;
+mod sys;
 mod vault;
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    std::panic::set_hook(Box::new(|info| cli::report_error(&format!("internal error, please report it: {info}"))));
+    if let Err(err) = sys::stop_children_on_termination() {
+        cli::report_error(&format!("could not set up signal handling: {err}"));
+        return ExitCode::FAILURE;
+    }
     let code = match cli::run() {
         Ok(code) => code,
         Err(err) => {
@@ -24,6 +22,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    update::notify();
+    cli::notice::notify();
     code
 }

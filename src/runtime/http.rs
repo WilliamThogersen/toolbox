@@ -1,7 +1,5 @@
-//! `http.*` for scripts, with vault injection and response redaction.
-
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -14,7 +12,7 @@ use url::{Url, form_urlencoded};
 
 use super::encoding::query_pairs;
 use super::{seconds, ser_options};
-use crate::manifest::Permissions;
+use crate::command::manifest::Permissions;
 use crate::vault::approval::Caller;
 use crate::vault::inject::{Injector, Redactor, ensure_absent, mentions_vault, secret_names};
 use crate::vault::log::{self as key_log, AuditLog, Event, Outcome};
@@ -32,7 +30,6 @@ pub struct RequestSpec {
     pub options: RequestOptions,
 }
 
-/// The table passed to `http.request{...}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRequest {
@@ -79,13 +76,10 @@ pub struct RequestOptions {
     pub body: Option<String>,
     #[serde(default)]
     pub json: Option<serde_json::Value>,
-    /// Sent as `application/x-www-form-urlencoded`.
     #[serde(default)]
     pub form: Option<BTreeMap<String, serde_json::Value>>,
-    /// Appended to the URL's query string.
     #[serde(default)]
     pub query: BTreeMap<String, serde_json::Value>,
-    /// Seconds, instead of the default `TIMEOUT`.
     #[serde(default)]
     pub timeout: Option<f64>,
 }
@@ -103,7 +97,6 @@ pub struct ResponseData {
     pub json: Option<serde_json::Value>,
 }
 
-/// Loads the vault on first use, so commands that never use a secret never touch the keychain.
 struct LazyVault {
     store: Box<dyn VaultStore>,
     loaded: RefCell<Option<Rc<VaultData>>>,
@@ -132,16 +125,11 @@ pub struct HttpClient {
     allowed_hosts: Vec<String>,
     caller: Caller,
     vault: LazyVault,
-    /// Used without a secret. Redirects are followed by `follow`, which checks each host.
     plain: Agent,
-    /// Used whenever a secret is attached. No redirects (they could carry the
-    /// secret elsewhere) and no env proxy (HTTP_PROXY could point at an attacker).
     secret_safe: Agent,
-    /// Records every request that carries a secret, or was refused one.
     log: Box<dyn AuditLog>,
 }
 
-/// One request on the way to a response: the script's own, or a redirect being followed.
 #[derive(Debug)]
 struct Hop {
     method: String,
@@ -150,7 +138,53 @@ struct Hop {
     body: Vec<u8>,
 }
 
-/// Request headers a redirect leaves behind, as ureq does.
+type Pairs = Vec<(String, String)>;
+
+struct Outgoing {
+    method: String,
+    url: Url,
+    headers: Pairs,
+    query: Pairs,
+    body: Vec<u8>,
+    timeout: Option<Duration>,
+}
+
+impl Outgoing {
+    fn new(spec: RequestSpec, url: Url) -> Result<Self> {
+        ensure_absent("url", &spec.url)?;
+        let query = query_pairs(&spec.options.query)?;
+        let timeout = spec.options.timeout.map(seconds).transpose()?;
+        let (body, content_type) = encode_body(&spec.options)?;
+        ensure_absent("body", &String::from_utf8_lossy(&body))?;
+        let has_type = spec.options.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
+        let added = content_type
+            .filter(|_| !has_type)
+            .map(|ct| ("content-type".to_string(), ct.to_string()));
+        let headers = spec.options.headers.into_iter().chain(added).collect();
+        Ok(Self { method: spec.method, url, headers, query, body, timeout })
+    }
+
+    fn pairs(&self) -> impl Iterator<Item = &(String, String)> {
+        self.headers.iter().chain(&self.query)
+    }
+
+    fn uses_vault(&self) -> bool {
+        self.pairs().any(|(k, v)| mentions_vault(k) || mentions_vault(v))
+    }
+
+    fn keys(&self) -> Vec<String> {
+        let names: BTreeSet<String> = self.pairs().flat_map(|(_, value)| secret_names(value)).collect();
+        names.into_iter().collect()
+    }
+
+    fn into_hop(self, filled: Option<(Pairs, Pairs)>) -> Hop {
+        let (headers, query) = filled.unwrap_or((self.headers, self.query));
+        let mut url = self.url;
+        append_query(&mut url, &query);
+        Hop { method: self.method, url, headers, body: self.body }
+    }
+}
+
 const DROPPED_ON_REDIRECT: &[&str] = &["authorization", "cookie", "content-length"];
 
 impl HttpClient {
@@ -169,81 +203,52 @@ impl HttpClient {
     }
 
     pub fn send(&self, spec: RequestSpec) -> Result<ResponseData> {
-        let mut url = Url::parse(&spec.url).with_context(|| format!("invalid url {:?}", spec.url))?;
+        let url = Url::parse(&spec.url).with_context(|| format!("invalid url {:?}", spec.url))?;
         self.check_host(&url)?;
-        ensure_absent("url", &spec.url)?;
-        let query = query_pairs(&spec.options.query)?;
-        let timeout = spec.options.timeout.map(seconds).transpose()?;
-        let (body, content_type) = encode_body(&spec.options)?;
-        ensure_absent("body", &String::from_utf8_lossy(&body))?;
-
-        let mut headers: Vec<(String, String)> = spec.options.headers.into_iter().collect();
-        if let Some(ct) = content_type
-            && !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        {
-            headers.push(("content-type".to_string(), ct.to_string()));
+        let outgoing = Outgoing::new(spec, url)?;
+        if outgoing.uses_vault() {
+            return self.send_with_secrets(outgoing);
         }
-        let uses_vault = headers
-            .iter()
-            .chain(&query)
-            .any(|(k, v)| mentions_vault(k) || mentions_vault(v));
-        let keys: Vec<String> = headers
-            .iter()
-            .chain(&query)
-            .flat_map(|(_, value)| secret_names(value))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let request = logged_request(&spec.method, &url);
-        let (headers, query) = if uses_vault {
-            let vault = self.vault.get()?;
-            let injector = Injector {
-                vault: &vault,
-                caller: &self.caller,
-                url: &url,
-            };
-            match injector.headers(&headers).and_then(|h| Ok((h, injector.query(&query)?))) {
-                Ok(filled) => filled,
-                Err(err) => {
-                    self.log.record(Event::Refused {
-                        keys,
-                        command: self.caller.name.clone(),
-                        request,
-                        reason: format!("{err:#}"),
-                    });
-                    return Err(err);
-                }
-            }
-        } else {
-            (headers, query)
-        };
-        append_query(&mut url, &query);
-
-        let hop = Hop {
-            method: spec.method,
-            url,
-            headers,
-            body,
-        };
+        let timeout = outgoing.timeout;
         let redactor = self.vault.redactor();
-        let response = if uses_vault {
-            execute(&self.secret_safe, &hop, timeout)
-        } else {
-            self.follow(hop, timeout)
-        }
-        .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))));
-        if uses_vault {
-            let outcome = match &response {
-                Ok(done) => Outcome::Status(done.status),
-                Err(err) => Outcome::Failed(err.to_string()),
-            };
-            self.log.record(Event::Used { keys, command: self.caller.name.clone(), request, outcome });
-        }
+        let response = self
+            .follow(outgoing.into_hop(None), timeout)
+            .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))))?;
+        Ok(redact_response(&redactor, response))
+    }
+
+    fn send_with_secrets(&self, outgoing: Outgoing) -> Result<ResponseData> {
+        let keys = outgoing.keys();
+        let request = logged_request(&outgoing.method, &outgoing.url);
+        let vault = self.vault.get()?;
+        let injector = Injector {
+            vault: &vault,
+            caller: &self.caller,
+            url: &outgoing.url,
+        };
+        let filled = injector
+            .headers(&outgoing.headers)
+            .and_then(|headers| Ok((headers, injector.query(&outgoing.query)?)));
+        let filled = match filled {
+            Ok(filled) => filled,
+            Err(err) => {
+                let reason = format!("{err:#}");
+                self.log.record(Event::Refused { keys, command: self.caller.name.clone(), request, reason });
+                return Err(err);
+            }
+        };
+        let timeout = outgoing.timeout;
+        let redactor = self.vault.redactor();
+        let response = execute(&self.secret_safe, &outgoing.into_hop(Some(filled)), timeout)
+            .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))));
+        let outcome = match &response {
+            Ok(done) => Outcome::Status(done.status),
+            Err(err) => Outcome::Failed(err.to_string()),
+        };
+        self.log.record(Event::Used { keys, command: self.caller.name.clone(), request, outcome });
         Ok(redact_response(&redactor, response?))
     }
 
-    /// Sends `hop` and follows its redirects, each only to a host in `permissions.http`.
-    /// `timeout` covers the whole chain, as ureq's own redirects did.
     fn follow(&self, mut hop: Hop, timeout: Option<Duration>) -> Result<ResponseData> {
         let deadline = Instant::now() + timeout.unwrap_or(TIMEOUT);
         for _ in 0..=MAX_REDIRECTS {
@@ -271,7 +276,6 @@ impl HttpClient {
     }
 }
 
-/// Where a request goes, for the key log: no query string, which may hold the key.
 fn logged_request(method: &str, url: &Url) -> key_log::Request {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     key_log::Request {
@@ -284,7 +288,6 @@ fn logged_request(method: &str, url: &Url) -> key_log::Request {
     }
 }
 
-/// ureq never follows redirects itself: it would not check the new host.
 fn agent(proxy: Option<Proxy>) -> Agent {
     Agent::config_builder()
         .http_status_as_error(false)
@@ -308,7 +311,6 @@ fn encode_body(options: &RequestOptions) -> Result<(Vec<u8>, Option<&'static str
     }
 }
 
-/// Appends `query = {...}` pairs (secrets already filled in) to whatever query the URL has.
 fn append_query(url: &mut Url, pairs: &[(String, String)]) {
     if !pairs.is_empty() {
         let encoded = form_urlencoded::Serializer::new(String::new())
@@ -322,7 +324,6 @@ fn append_query(url: &mut Url, pairs: &[(String, String)]) {
     }
 }
 
-/// Placeholders are checked before encoding: once escaped they would no longer be recognised.
 fn encode_pairs(location: &str, params: &BTreeMap<String, serde_json::Value>) -> Result<String> {
     let pairs = query_pairs(params)?;
     for (key, value) in &pairs {
@@ -334,9 +335,6 @@ fn encode_pairs(location: &str, params: &BTreeMap<String, serde_json::Value>) ->
         .finish())
 }
 
-/// The request to send next when `response` redirects `hop`, by ureq's (and curl's)
-/// rules: 307 and 308 repeat the method but are not followed for POST, PUT, PATCH or
-/// DELETE, the others continue as GET (HEAD stays HEAD). The body never comes along.
 fn redirect(hop: &Hop, response: &ResponseData) -> Result<Option<Hop>> {
     let Some(location) = response.headers.get("location") else {
         return Ok(None);
@@ -418,10 +416,6 @@ fn run<S: AsSendBody>(
     agent.run(request)
 }
 
-/// Scrubs secrets first, then parses JSON from the scrubbed text. A key written with
-/// JSON escapes (`token`, `a\/b`) only shows up once parsed, so then the parsed
-/// strings are scrubbed too and the body is rewritten from them: neither `res.json`
-/// nor `json.decode(res.body)` can hand the script the key.
 fn redact_response(redactor: &Redactor, response: ResponseData) -> ResponseData {
     let body = redactor.redact(&response.body);
     let headers = response
@@ -445,29 +439,40 @@ fn redact_response(redactor: &Redactor, response: ResponseData) -> ResponseData 
 }
 
 fn json_has_secret(redactor: &Redactor, value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(text) => redactor.finds(text),
-        serde_json::Value::Array(items) => items.iter().any(|item| json_has_secret(redactor, item)),
-        serde_json::Value::Object(map) => map
-            .iter()
-            .any(|(key, item)| redactor.finds(key) || json_has_secret(redactor, item)),
-        _ => false,
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::String(text) if redactor.finds(text) => return true,
+            serde_json::Value::Array(items) => pending.extend(items),
+            serde_json::Value::Object(map) => {
+                if map.keys().any(|key| redactor.finds(key)) {
+                    return true;
+                }
+                pending.extend(map.values());
+            }
+            _ => {}
+        }
     }
+    false
 }
 
-fn redact_json(redactor: &Redactor, value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(text) => serde_json::Value::String(redactor.redact(&text)),
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(|item| redact_json(redactor, item)).collect())
+fn redact_json(redactor: &Redactor, mut root: serde_json::Value) -> serde_json::Value {
+    let mut pending = vec![&mut root];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::String(text) => *text = redactor.redact(text),
+            serde_json::Value::Array(items) => pending.extend(items),
+            serde_json::Value::Object(map) => {
+                *map = std::mem::take(map)
+                    .into_iter()
+                    .map(|(key, item)| (redactor.redact(&key), item))
+                    .collect();
+                pending.extend(map.values_mut());
+            }
+            _ => {}
         }
-        serde_json::Value::Object(map) => serde_json::Value::Object(
-            map.into_iter()
-                .map(|(key, item)| (redactor.redact(&key), redact_json(redactor, item)))
-                .collect(),
-        ),
-        other => other,
     }
+    root
 }
 
 fn parse_json(body: &str) -> Option<serde_json::Value> {
@@ -479,9 +484,9 @@ fn parse_json(body: &str) -> Option<serde_json::Value> {
     }
 }
 
-pub fn install(lua: &Lua, client: Rc<HttpClient>) -> mlua::Result<()> {
+pub fn install(lua: &Lua, client: &Rc<HttpClient>) -> mlua::Result<()> {
     let http: Table = lua.create_table()?;
-    let request_client = Rc::clone(&client);
+    let request_client = Rc::clone(client);
     http.set(
         "request",
         lua.create_function(move |lua, spec: Value| {
@@ -490,7 +495,7 @@ pub fn install(lua: &Lua, client: Rc<HttpClient>) -> mlua::Result<()> {
         })?,
     )?;
     for method in SUGAR_METHODS {
-        let method_client = Rc::clone(&client);
+        let method_client = Rc::clone(client);
         let verb = method.to_ascii_uppercase();
         http.set(
             *method,
@@ -524,8 +529,8 @@ mod tests {
 
     fn client(http: &[&str], vault: &[&str]) -> HttpClient {
         let perms = Permissions {
-            http: http.iter().map(|s| s.to_string()).collect(),
-            vault: vault.iter().map(|s| s.to_string()).collect(),
+            http: http.iter().map(std::string::ToString::to_string).collect(),
+            vault: vault.iter().map(std::string::ToString::to_string).collect(),
             ..Permissions::default()
         };
         let caller = Caller {
@@ -650,7 +655,6 @@ mod tests {
 
     #[test]
     fn timeout_option_limits_the_wait() {
-        // Accepts connections into the backlog but never answers.
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://127.0.0.1:{}/", silent.local_addr().unwrap().port());
         let started = std::time::Instant::now();
@@ -698,7 +702,6 @@ mod tests {
         let get = redirect(&hop("GET", &[]), &response(307, Some("/x"))).unwrap().unwrap();
         assert_eq!(get.method, "GET");
 
-        // Not followed: the script gets the response itself.
         for (method, status, location) in [
             ("POST", 307, Some("/x")),
             ("DELETE", 308, Some("/x")),
@@ -756,11 +759,20 @@ mod tests {
     #[test]
     fn keys_in_json_escapes_are_redacted_in_json_and_body() {
         let redactor = redactor_for("abcd/efgh_1234");
-        // PHP escapes every `/`, and any character may be written as \uXXXX.
         let clean = redact_response(&redactor, with_body(r#"{"a":"abcd\/efgh_1234","b":"\u0061bcd/efgh_1234","n":1}"#));
         let expected = serde_json::json!({ "a": "[REDACTED:k]", "b": "[REDACTED:k]", "n": 1 });
         assert_eq!(clean.json.as_ref(), Some(&expected));
         assert_eq!(serde_json::from_str::<serde_json::Value>(&clean.body).unwrap(), expected, "{}", clean.body);
+    }
+
+    #[test]
+    fn keys_hidden_deep_in_arrays_and_object_keys_are_redacted() {
+        let redactor = redactor_for("abcd/efgh_1234");
+        let body = r#"[{"x":[1,{"abcd\/efgh_1234":["abcd\/efgh_1234",null]}]},"plain"]"#;
+        let clean = redact_response(&redactor, with_body(body));
+        let expected = serde_json::json!([{ "x": [1, { "[REDACTED:k]": ["[REDACTED:k]", null] }] }, "plain"]);
+        assert_eq!(clean.json, Some(expected));
+        assert!(!json_has_secret(&redactor, clean.json.as_ref().unwrap()));
     }
 
     #[test]

@@ -1,6 +1,3 @@
-//! Where a secret may go: host rules like `api.github.com` or `127.0.0.1:8080`,
-//! and the query parameters it may be sent in.
-
 use std::net::Ipv4Addr;
 
 use anyhow::{Result, anyhow, ensure};
@@ -9,9 +6,6 @@ use url::{Host, Url};
 const MAX_QUERY_PARAM_LEN: usize = 64;
 const IPV6_LOOPBACK: &str = "[::1]";
 
-/// Accepts `api.github.com` (any port) or `host:port` and returns it lowercased,
-/// with IPv4 addresses written the usual way. This computer must be named by the
-/// address the server listens on, with a port: `127.0.0.1:8080` or `[::1]:8080`.
 pub fn normalize_host(raw: &str) -> Result<String> {
     let invalid = || {
         anyhow!(
@@ -36,7 +30,6 @@ pub fn normalize_host(raw: &str) -> Result<String> {
     Ok(format!("{name}:{port}"))
 }
 
-/// `host` or `host:port`, where host may be a bracketed IPv6 address. `None` when malformed.
 fn split_port(text: &str) -> Option<(&str, Option<u16>)> {
     let name_end = if text.starts_with('[') {
         text.find(']')? + 1
@@ -51,8 +44,6 @@ fn split_port(text: &str) -> Option<(&str, Option<u16>)> {
     Some((name, Some(port)))
 }
 
-/// Domains as they are, IPv4 in dotted form (`127.1` is `127.0.0.1`), and only the
-/// IPv6 loopback, as `[::1]`. `None` for anything else.
 fn canonical(name: &str) -> Option<String> {
     if name.starts_with('[') {
         return match Host::parse(name).ok()? {
@@ -73,8 +64,6 @@ fn canonical(name: &str) -> Option<String> {
     }
 }
 
-/// Names and addresses that reach this computer: `localhost`, `*.localhost`,
-/// `127.x.x.x`, `0.0.0.0` and `[::1]`.
 pub fn is_local(host: &str) -> bool {
     host == "localhost"
         || host.ends_with(".localhost")
@@ -84,15 +73,10 @@ pub fn is_local(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
 }
 
-/// The only local hosts a rule may name: one exact address, so nothing can answer
-/// for it on the other address family.
 fn is_loopback_ip(host: &str) -> bool {
     host == IPV6_LOOPBACK || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Whether the rule lets a request to `url` through. A local rule only works as a
-/// loopback address with a port; any other local rule (stored before these rules
-/// existed) lets nothing through.
 pub fn allows(rule: &str, url: &Url) -> bool {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     match split_port(rule) {
@@ -106,12 +90,10 @@ pub fn allows(rule: &str, url: &Url) -> bool {
     }
 }
 
-/// The host part of a rule, without its port.
 pub fn rule_host(rule: &str) -> &str {
     split_port(rule).map_or(rule, |(name, _)| name)
 }
 
-/// A warning for rules that point at this computer, shown when the human adds them.
 pub fn local_note(rules: &[String]) -> Option<String> {
     let local: Vec<&str> = rules
         .iter()
@@ -126,7 +108,6 @@ pub fn local_note(rules: &[String]) -> Option<String> {
     })
 }
 
-/// Accepts a query parameter name like `key` or `api_key`. Case is kept: servers differ.
 pub fn normalize_query_param(raw: &str) -> Result<String> {
     let name = raw.trim();
     ensure!(

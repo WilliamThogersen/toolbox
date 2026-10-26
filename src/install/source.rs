@@ -1,5 +1,3 @@
-//! `.source.json`: where an installed command came from, so `tb self update` can fetch it again.
-
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -13,14 +11,12 @@ pub const SOURCE_FILE: &str = ".source.json";
 #[serde(deny_unknown_fields)]
 pub struct Source {
     pub url: String,
-    /// Branch, tag or commit given to `--ref`. `None` follows the repo's default branch.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
     pub commit: String,
 }
 
 impl Source {
-    /// The same repo, ignoring a trailing `/` or `.git`.
     pub fn same_repo(&self, url: &str) -> bool {
         repo_key(&self.url) == repo_key(url)
     }
@@ -31,7 +27,6 @@ pub fn repo_key(url: &str) -> &str {
     url.strip_suffix(".git").unwrap_or(url)
 }
 
-/// `None` means the command was made locally, not installed.
 pub fn read(command_dir: &Path) -> Result<Option<Source>> {
     let path = command_dir.join(SOURCE_FILE);
     match fs::read_to_string(&path) {

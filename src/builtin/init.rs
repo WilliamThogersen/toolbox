@@ -1,7 +1,3 @@
-//! `tb self init`: tells Claude Code about toolbox. The instructions go in their own `TOOLBOX.md` next to
-//! `CLAUDE.md`, which imports it with an `@TOOLBOX.md` line, so running it again refreshes the text without
-//! touching anything the user wrote in `CLAUDE.md`.
-
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -9,30 +5,26 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-/// What Claude reads. Compiled in, so it always matches this toolbox version.
-pub const INSTRUCTIONS: &str = include_str!("../docs/agent-instructions.md");
+pub const INSTRUCTIONS: &str = include_str!("../../docs/agent-instructions.md");
 
 const CLAUDE_MD: &str = "CLAUDE.md";
 const FILE_NAME: &str = "TOOLBOX.md";
 const IMPORT: &str = "@TOOLBOX.md";
-/// Starts every `TOOLBOX.md` this command writes. Only such files are replaced or deleted.
 const MARKER: &str = "<!-- Written by `tb self init`.";
-/// Heading of the snippet the docs used to tell people to paste into `CLAUDE.md`.
 const PASTED_HEADING: &str = "## toolbox (tb)";
 
 #[derive(Debug, Serialize)]
 pub struct Installed {
     pub claude_md: String,
     pub instructions: String,
-    /// The `@TOOLBOX.md` line was added (false: it was already there).
     pub imported: bool,
-    /// `TOOLBOX.md` was created or its text changed.
     pub updated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
+#[expect(clippy::struct_field_names, reason = "the field names are the JSON `tb self init --remove` prints")]
 pub struct Removed {
     pub claude_md: String,
     pub instructions: String,
@@ -54,7 +46,6 @@ pub fn install(claude_dir: &Path) -> Result<Installed> {
         fs::write(&file, INSTRUCTIONS).with_context(|| format!("could not write {}", file.display()))?;
     }
 
-    // The instructions exist before CLAUDE.md points at them.
     let claude_md = claude_dir.join(CLAUDE_MD);
     let text = read_optional(&claude_md)?.unwrap_or_default();
     let imported = !has_import(&text);
@@ -81,7 +72,6 @@ pub fn remove(claude_dir: &Path) -> Result<Removed> {
         fs::write(&claude_md, without_import(&text)).with_context(|| format!("could not write {}", claude_md.display()))?;
     }
 
-    // A TOOLBOX.md toolbox didn't write is the user's, so it stays.
     let file = claude_dir.join(FILE_NAME);
     let deleted = read_optional(&file)?.is_some_and(|text| text.starts_with(MARKER));
     if deleted {
@@ -107,7 +97,6 @@ fn has_import(text: &str) -> bool {
     text.lines().any(|line| line.trim() == IMPORT)
 }
 
-/// Appends the import as its own paragraph.
 fn with_import(text: &str) -> String {
     let gap = match text {
         "" => "",
@@ -117,7 +106,6 @@ fn with_import(text: &str) -> String {
     format!("{text}{gap}{IMPORT}\n")
 }
 
-/// Drops every import line and the blank lines `with_import` left at the end.
 fn without_import(text: &str) -> String {
     let kept: Vec<&str> = text.lines().filter(|line| line.trim() != IMPORT).collect();
     let body = kept.join("\n");

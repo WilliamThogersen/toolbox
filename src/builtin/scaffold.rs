@@ -1,5 +1,3 @@
-//! `tb self new <name>`: writes a working starter command.
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -7,8 +5,8 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-use crate::manifest::{ArgSpec, ArgType, Limits, Manifest, Permissions, RESERVED_NAMES, is_valid_name};
-use crate::registry::{MANIFEST_FILE, SCRIPT_FILE};
+use crate::command::manifest::{ArgSpec, ArgType, Limits, Manifest, Permissions, RESERVED_NAMES, is_valid_name};
+use crate::command::registry::{MANIFEST_FILE, SCRIPT_FILE};
 
 const FIRST_VERSION: &str = "0.1.0";
 
@@ -67,7 +65,7 @@ pub fn create(commands_dir: &Path, name: &str, description: &str) -> Result<Crea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry;
+    use crate::command::registry;
 
     #[test]
     fn created_command_loads_cleanly() {

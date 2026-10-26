@@ -1,11 +1,3 @@
-//! `tb self install|update|uninstall|market|search`: commands shared through git repos.
-//!
-//! An installed command is a normal command folder plus `.source.json`, which records the
-//! repo it came from. Only `command.json` and `run.lua` are copied: scripts can't read
-//! other files, so nothing else in the repo matters. A repo can hold one command or a
-//! whole marketplace of them; `market` saves such repos by name so commands can be
-//! searched and installed as `<market>/<command>`.
-
 pub mod confirm;
 mod git;
 pub mod market;
@@ -20,15 +12,14 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use tempfile::TempDir;
 
-use crate::manifest::{Permissions, is_valid_name};
-use crate::registry::{CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
-use crate::screen::{one_line, one_line_permissions, printable};
+use crate::command::manifest::{Permissions, is_valid_name};
+use crate::command::registry::{CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
+use crate::cli::screen::{one_line, one_line_permissions, printable};
 
 pub use confirm::{Confirm, Prompt, Yes};
 pub use source::Source;
 pub use update::update;
 
-/// Which repo to install from, and which of its commands (all of them when `names` is empty).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
     pub url: String,
@@ -39,7 +30,6 @@ pub struct Request {
 #[derive(Debug, Serialize)]
 pub struct InstallReport {
     pub installed: Vec<Installed>,
-    /// Broken commands left out when installing everything in a repo.
     pub skipped: Vec<Problem>,
 }
 
@@ -53,7 +43,6 @@ pub struct Installed {
     pub source: Source,
 }
 
-/// One command as a repo offers it, for `--list` and `search`.
 #[derive(Debug, Clone, Serialize)]
 pub struct Listing {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,7 +52,6 @@ pub struct Listing {
     pub version: Option<String>,
     pub description: String,
     pub permissions: Permissions,
-    /// Already installed from this repo.
     pub installed: bool,
 }
 
@@ -75,7 +63,6 @@ pub struct RepoListing {
     pub broken: Vec<Problem>,
 }
 
-/// Installs the requested commands, or none of them.
 pub fn install(commands_dir: &Path, request: &Request, confirm: &dyn Confirm) -> Result<InstallReport> {
     let url = &git::resolve_url(&request.url)?;
     let staging = Staging::new(commands_dir)?;
@@ -94,7 +81,7 @@ pub fn install(commands_dir: &Path, request: &Request, confirm: &dyn Confirm) ->
     }
 
     let source = Source {
-        url: url.to_string(),
+        url: url.clone(),
         git_ref: request.git_ref.clone(),
         commit,
     };
@@ -125,7 +112,6 @@ pub fn install(commands_dir: &Path, request: &Request, confirm: &dyn Confirm) ->
     })
 }
 
-/// What a repo offers, without installing anything.
 pub fn list(commands_dir: &Path, url: &str, git_ref: Option<&str>) -> Result<RepoListing> {
     let url = git::resolve_url(url)?;
     let staging = Staging::new(commands_dir)?;
@@ -157,7 +143,6 @@ fn installed_from(commands_dir: &Path, name: &str, url: &str) -> bool {
         .is_some_and(|existing| existing.same_repo(url))
 }
 
-/// Removes a command that `install` put there. Local commands are left alone.
 pub fn uninstall(commands_dir: &Path, name: &str) -> Result<()> {
     ensure!(is_valid_name(name), "{name:?} is not a valid command name");
     let dir = commands_dir.join(name);
@@ -170,7 +155,6 @@ pub fn uninstall(commands_dir: &Path, name: &str) -> Result<()> {
     fs::remove_dir_all(&dir).with_context(|| format!("could not delete {}", dir.display()))
 }
 
-/// Reinstalling from the same repo replaces the old copy. Any other existing folder is a conflict.
 fn conflict(commands_dir: &Path, url: &str, name: &str) -> Result<Option<String>> {
     let dir = commands_dir.join(name);
     if dir.symlink_metadata().is_err() {
@@ -218,7 +202,6 @@ pub fn short(commit: &str) -> &str {
     &commit[..commit.len().min(7)]
 }
 
-/// Scratch space next to `commands/`, so moving a finished command into place is a rename.
 struct Staging {
     dir: TempDir,
 }
@@ -239,14 +222,12 @@ impl Staging {
         self.dir.path()
     }
 
-    /// Fetches the repo into this staging folder and checks every command in it.
     fn fetch(&self, url: &str, git_ref: Option<&str>) -> Result<(String, repo::Scan)> {
         let checkout = self.path().join("checkout");
         let commit = git::fetch(url, git_ref, &checkout)?;
         Ok((commit, repo::scan(&checkout)?))
     }
 
-    /// Copies the command's two files plus `.source.json` into `commands_dir`, replacing an older copy.
     fn put(&self, commands_dir: &Path, def: &CommandDef, source: &Source) -> Result<PathBuf> {
         let name = &def.manifest.name;
         let staged = self.path().join("new").join(name);
@@ -281,7 +262,6 @@ mod tests {
 
     use super::*;
 
-    /// Answers the prompt and remembers what it was shown.
     struct Answer {
         yes: bool,
         shown: RefCell<String>,
@@ -348,7 +328,6 @@ mod tests {
 
     #[test]
     fn manifest_text_cannot_rewrite_the_prompt() {
-        // Cursor up and erase line would hide the exec warning above; the newline fakes a calm line.
         let manifest = r#"{"name":"pr","description":"x","permissions":{"exec":["git"],"http":["a.com\u001b[1A\u001b[2K\n  pr  no permissions"]}}"#;
         let repo = repo_with("pr", manifest);
         let home = tempfile::tempdir().unwrap();

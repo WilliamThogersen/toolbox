@@ -60,6 +60,7 @@ Each call runs `tb <command> --<arg>=<value>` as its own process, exactly like o
 - Calls run side by side, so a slow command doesn't hold up the others.
 - A call the app cancels is stopped, along with any programs it started. When the app disconnects, every running
   call is stopped.
+- A message over 4 MB gets an error reply and is skipped. Arguments that large wouldn't fit on a command line anyway.
 - `false` for a boolean leaves the flag out. A flag that defaults to `true` can't be turned off from a tool call.
 
 ## API keys

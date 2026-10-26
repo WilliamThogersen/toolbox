@@ -28,3 +28,4 @@ Your own commands run as `tb <name> --<arg> <value>`. Add `--help` to see their 
 - [Security](security.md): what commands can touch, the risks of installing, what the vault protects.
 - [AI agents](ai-agents.md): `tb self init`, output rules, what agents can and can't do.
 - [Development](development.md): build, test, release, project layout.
+- [Code rules](code-rules.md): the "Power of 10" rules in Rust, and the lints that enforce them.

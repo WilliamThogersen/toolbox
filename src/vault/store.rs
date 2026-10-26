@@ -1,31 +1,16 @@
-//! Where the vault lives: the macOS Keychain. Other systems have no vault (see `Unsupported`).
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use super::{SecretEntry, SecretValue, VaultData};
+use super::{SecretEntry, SecretValue, VaultData, platform};
 
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "toolbox";
-#[cfg(target_os = "macos")]
-const KEYCHAIN_ACCOUNT: &str = "vault";
-
-/// Points toolbox at a plain-text vault file. Only for automated tests.
 pub const TEST_VAULT_ENV: &str = "TOOLBOX_INSECURE_TEST_VAULT";
 
-/// The stored shape. Version 2 keeps keys under `keys` where version 1 had
-/// `secrets`, so toolbox 0.3.0, which knows nothing of command approvals or port
-/// rules, reads an empty vault instead of using keys without them. Version 3 has the
-/// same shape, but 0.4.0 to 0.6.0 only open version 2, and they would change the
-/// vault without asking for Touch ID. Unknown fields and versions are refused, so a
-/// newer toolbox's vault fails closed here too.
 const FORMAT: u32 = 3;
 
-/// Older versions this one still opens. The next save writes `FORMAT`.
 const READABLE_FORMATS: [u32; 2] = [2, FORMAT];
 
 #[derive(Serialize, Deserialize)]
@@ -35,8 +20,6 @@ struct Stored {
     keys: BTreeMap<String, SecretEntry>,
 }
 
-/// Version 1, written by toolbox 0.3.0 and older. Its approvals can't exist, so
-/// every command needs a new one.
 #[derive(Deserialize)]
 struct StoredV1 {
     #[serde(default)]
@@ -89,8 +72,6 @@ pub fn decode(raw: &str) -> Result<VaultData> {
 
 pub trait VaultStore {
     fn load(&self) -> Result<VaultData>;
-    /// `change` says what the person approves, like `delete the API key github`. The
-    /// Keychain store shows it in the Touch ID dialog it needs before every write.
     fn save(&self, data: &VaultData, change: &str) -> Result<()>;
 }
 
@@ -99,86 +80,10 @@ pub fn default_store() -> Box<dyn VaultStore> {
         Some(path) => Box::new(FileStore {
             path: PathBuf::from(path),
         }),
-        None => os_store(),
+        None => platform::store(),
     }
 }
 
-#[cfg(target_os = "macos")]
-fn os_store() -> Box<dyn VaultStore> {
-    Box::new(KeychainStore)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn os_store() -> Box<dyn VaultStore> {
-    Box::new(Unsupported)
-}
-
-/// The whole vault as one Keychain item, so its host bindings can't be edited
-/// from outside without the Keychain's permission prompt.
-///
-/// keyring's `v1` store has no fallback: if the Keychain can't be reached, every
-/// call fails. Keep it that way: a store that forgets keys, or keeps them in a
-/// plain file, would break the vault.
-#[cfg(target_os = "macos")]
-pub struct KeychainStore;
-
-#[cfg(target_os = "macos")]
-impl KeychainStore {
-    fn entry() -> Result<keyring::Entry> {
-        let unavailable = |e: &keyring::Error| anyhow!("the macOS Keychain is not available: {e}");
-        // keyring connects once and keeps why that failed. `Entry::new` would
-        // only say that no store is set.
-        if let Err(e) = keyring::Entry::store_status() {
-            return Err(unavailable(e));
-        }
-        keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT).map_err(|e| unavailable(&e))
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl VaultStore for KeychainStore {
-    fn load(&self) -> Result<VaultData> {
-        match Self::entry()?.get_password() {
-            Ok(raw) => decode(&raw).context("could not read the vault in the macOS Keychain"),
-            Err(keyring::Error::NoEntry) => Ok(VaultData::default()),
-            Err(e) => Err(anyhow!("could not read the vault from the macOS Keychain: {e}")),
-        }
-    }
-
-    fn save(&self, data: &VaultData, change: &str) -> Result<()> {
-        let raw = encode(data)?;
-        // Asked here, in the store, so no way of changing the real vault skips it.
-        super::presence::confirm(change)?;
-        Self::entry()?
-            .set_password(&raw)
-            .map_err(|e| anyhow!("could not write the vault to the macOS Keychain: {e}"))
-    }
-}
-
-/// Outside macOS there is no vault. Linux's Secret Service (GNOME Keyring, KWallet)
-/// has no per-program permission like the Keychain's: while unlocked it hands the
-/// item to any program running as the user, an agent's shell included. A vault
-/// there would only pretend to keep keys from agents.
-#[cfg(not(target_os = "macos"))]
-struct Unsupported;
-
-#[cfg(not(target_os = "macos"))]
-const UNSUPPORTED: &str = "the vault only works on macOS for now. Here the system keyring hands stored keys to \
-     any program you run, an AI agent included, which is what the vault exists to prevent. Commands that don't use \
-     keys still work";
-
-#[cfg(not(target_os = "macos"))]
-impl VaultStore for Unsupported {
-    fn load(&self) -> Result<VaultData> {
-        Err(anyhow!(UNSUPPORTED))
-    }
-
-    fn save(&self, _data: &VaultData, _change: &str) -> Result<()> {
-        Err(anyhow!(UNSUPPORTED))
-    }
-}
-
-/// Plain JSON file, which never asks for Touch ID. Never use for real keys.
 pub struct FileStore {
     pub path: PathBuf,
 }
@@ -202,7 +107,6 @@ impl VaultStore for FileStore {
 #[cfg(test)]
 pub struct MemoryStore {
     pub data: std::cell::RefCell<VaultData>,
-    /// What each save said it changes, in order.
     pub changes: std::cell::RefCell<Vec<String>>,
 }
 
@@ -251,7 +155,7 @@ mod tests {
             },
         );
         store.save(&data, "test").unwrap();
-        let none = crate::registry::Registry::default();
+        let none = crate::command::registry::Registry::default();
         assert_eq!(store.load().unwrap().summaries(&none), data.summaries(&none));
     }
 
@@ -279,18 +183,9 @@ mod tests {
             },
         );
         let raw: serde_json::Value = serde_json::from_str(&encode(&data).unwrap()).unwrap();
-        // 0.4.0 to 0.6.0 only open format 2 and save without asking for Touch ID.
         assert_eq!(raw["format"], 3);
         assert!(raw.get("secrets").is_none(), "0.3.0 reads `secrets`: {raw}");
         assert!(raw["keys"]["gh"].is_object());
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn outside_macos_the_vault_refuses_to_keep_keys() {
-        let err = os_store().load().unwrap_err().to_string();
-        assert!(err.starts_with("the vault only works on macOS"), "{err}");
-        assert!(os_store().save(&VaultData::default(), "test").is_err());
     }
 
     #[test]

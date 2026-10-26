@@ -1,0 +1,34 @@
+# Dependency checks: known security advisories (vulnerable, unmaintained or unsound crates), licenses
+# that can ship in an MIT binary, and crates only from crates.io. CI runs it once per shipped platform,
+# since a crate one platform pulls in for another (like keyring's Linux store) is never built:
+#   cargo deny --target <triple> check
+
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+
+[advisories]
+ignore = []
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

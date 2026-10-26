@@ -1,11 +1,9 @@
-//! Globals for scripts: json, log/print, env, vault, stdin.
-
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal};
 
 use mlua::{Lua, LuaSerdeExt, Result, Value, Variadic};
 
-use super::{lua_error, ser_options};
-use crate::manifest::Permissions;
+use super::{lua_error, read_capped, ser_options};
+use crate::command::manifest::Permissions;
 use crate::vault::inject::{Encoding, placeholder};
 use crate::vault::names::{self, NAME_RULES};
 
@@ -44,12 +42,11 @@ fn install_json(lua: &Lua) -> Result<()> {
     lua.globals().set("json", json)
 }
 
-/// `print` and `log` go to stderr: stdout is reserved for the JSON result.
 fn install_log(lua: &Lua) -> Result<()> {
     let log = lua.create_function(|_, values: Variadic<Value>| {
         let parts = values
             .iter()
-            .map(|v| v.to_string())
+            .map(mlua::Value::to_string)
             .collect::<Result<Vec<_>>>()?;
         eprintln!("{}", parts.join("\t"));
         Ok(())
@@ -72,9 +69,6 @@ fn install_env(lua: &Lua, allowed: Vec<String>) -> Result<()> {
     lua.globals().set("env", env)
 }
 
-/// `vault(name)` returns a placeholder, never the value. `vault(name, "base64")`
-/// asks for the value base64-encoded, for Basic auth. `name` may be built at run
-/// time, like `"github/" .. args.account`, when a pattern in `declared` covers it.
 fn install_vault(lua: &Lua, declared: Vec<String>) -> Result<()> {
     let vault = lua.create_function(move |_, (name, encoding): (String, Option<String>)| {
         if !names::is_secret_name(&name) {
@@ -94,21 +88,16 @@ fn install_vault(lua: &Lua, declared: Vec<String>) -> Result<()> {
     lua.globals().set("vault", vault)
 }
 
-/// `stdin.read()` returns what was piped in, or `nil` when stdin is a terminal
-/// (reading would wait for typing that never comes).
 fn install_stdin(lua: &Lua) -> Result<()> {
     let stdin = lua.create_table()?;
     stdin.set(
         "read",
         lua.create_function(|lua, ()| {
-            let mut input = io::stdin().lock();
+            let input = io::stdin().lock();
             if input.is_terminal() {
                 return Ok(None);
             }
-            let mut bytes = Vec::new();
-            input
-                .read_to_end(&mut bytes)
-                .map_err(|e| mlua::Error::runtime(format!("could not read stdin: {e}")))?;
+            let bytes = read_capped(input, "stdin").map_err(lua_error)?;
             lua.create_string(bytes).map(Some)
         })?,
     )?;
@@ -120,6 +109,7 @@ mod tests {
     use super::*;
     use crate::runtime::sandbox::new_lua;
 
+    #[expect(clippy::needless_pass_by_value, reason = "tests build the permissions in the call")]
     fn lua_with(perms: Permissions) -> Lua {
         let lua = new_lua().unwrap();
         install(&lua, &perms).unwrap();

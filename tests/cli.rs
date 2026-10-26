@@ -1,9 +1,18 @@
-//! End-to-end tests: run the real `tb` binary against a temp TOOLBOX_HOME.
+//! End-to-end tests: run the real `tb` binary against a temp `TOOLBOX_HOME`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::needless_pass_by_value,
+    reason = "test code: a panic is a failed test, and helpers take `json!(...)` values as they are"
+)]
+
+mod common;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,13 +95,7 @@ impl Toolbox {
         cmd.args(args)
             .env("TOOLBOX_HOME", self.home.path())
             .env("TOOLBOX_INSECURE_TEST_VAULT", self.vault_file());
-        // Detach from any controlling terminal, like an AI agent's shell.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
+        common::detach(&mut cmd);
         cmd
     }
 
@@ -123,9 +126,7 @@ impl Toolbox {
     }
 
     fn edit_vault(&self, change: impl FnOnce(&mut Value)) {
-        let mut vault: Value = fs::read(self.vault_file())
-            .map(|bytes| serde_json::from_slice(&bytes).unwrap())
-            .unwrap_or_else(|_| json!({ "format": 2, "keys": {} }));
+        let mut vault: Value = fs::read(self.vault_file()).map_or_else(|_| json!({ "format": 2, "keys": {} }), |bytes| serde_json::from_slice(&bytes).unwrap());
         change(&mut vault);
         fs::write(self.vault_file(), vault.to_string()).unwrap();
     }
@@ -142,7 +143,7 @@ fn fingerprint(manifest: &str, script: &str) -> String {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().concat()
 }
 
 /// `127.0.0.1:1234` from `http://127.0.0.1:1234/`, as a `--host` rule.
@@ -190,7 +191,7 @@ fn bare_string_echo_server() -> (String, mpsc::Receiver<String>) {
 }
 
 fn json_escaped(text: &str) -> String {
-    text.chars().map(|c| format!("\\u{:04x}", c as u32)).collect()
+    text.chars().map(|c| format!("\\u{:04x}", u32::from(c))).collect::<Vec<_>>().concat()
 }
 
 /// Serves one request, answering with `body(authorization header, path)`.
@@ -1054,10 +1055,10 @@ fn redirects_only_reach_listed_hosts() {
             "args": { "url": { "type": "string", "required": true } },
             "permissions": { "http": ["127.0.0.1"] }
         }),
-        r#"return function(args)
+        r"return function(args)
             local res = http.get(args.url, { timeout = 5 })
             return { status = res.status, path = res.json and res.json.path }
-        end"#,
+        end",
     );
 
     let (echo, _received) = echo_server();
@@ -1075,4 +1076,46 @@ fn redirects_only_reach_listed_hosts() {
     let err = stderr(&out);
     assert!(err.contains("redirected") && err.contains("permissions.http"), "{err}");
     assert!(!contacted.load(Ordering::SeqCst), "a redirect reached a host not in permissions.http");
+}
+
+/// Runs `nap`, whose `exec` program sits in a process group of its own, and returns `tb` and that program's pid.
+fn start_exec_sleeper(tb: &Toolbox, detached: bool) -> (std::process::Child, u32) {
+    let pid_file = tb.home.path().join("sleeper.pid");
+    let manifest = json!({ "name": "nap", "description": "Sleeps through exec", "permissions": { "exec": ["sh"] } });
+    tb.add_command("nap", manifest, &common::exec_sleeper_script(&pid_file));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_toolbox"));
+    cmd.arg("nap")
+        .env("TOOLBOX_HOME", tb.home.path())
+        .env("TOOLBOX_INSECURE_TEST_VAULT", tb.vault_file())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if detached {
+        common::detach(&mut cmd);
+    }
+    let child = cmd.spawn().unwrap();
+    (child, common::read_pid(&pid_file))
+}
+
+fn send_signal(pid: u32, signal: &str) {
+    assert!(Command::new("kill").args([&format!("-{signal}"), &pid.to_string()]).status().unwrap().success());
+}
+
+#[test]
+fn ctrl_c_also_ends_a_program_exec_runs_in_its_own_group() {
+    let tb = Toolbox::new();
+    // Not detached: `tb` shares the test runner's process group, like a command typed in a shell.
+    let (mut child, sleeper) = start_exec_sleeper(&tb, false);
+    send_signal(child.id(), "INT");
+    assert!(!child.wait().unwrap().success());
+    assert!(common::ends_soon(sleeper), "sleep {sleeper} outlived tb");
+}
+
+#[test]
+fn terminating_a_session_leading_tb_ends_everything_it_started() {
+    let tb = Toolbox::new();
+    let (mut child, sleeper) = start_exec_sleeper(&tb, true);
+    send_signal(child.id(), "TERM");
+    assert!(!child.wait().unwrap().success());
+    assert!(common::ends_soon(sleeper), "sleep {sleeper} outlived tb");
 }

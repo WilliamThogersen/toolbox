@@ -1,5 +1,3 @@
-//! Runs a command's `run.lua` in a sandbox with the toolbox API installed.
-
 mod api;
 mod encoding;
 mod exec;
@@ -9,34 +7,44 @@ mod limits;
 mod sandbox;
 mod time;
 
+use std::io::Read;
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use mlua::serde::SerializeOptions;
 use mlua::{Function, Lua, LuaSerdeExt, Value};
 
-use crate::registry::CommandDef;
+use crate::command::registry::CommandDef;
 use crate::vault::VaultStore;
 use crate::vault::log::AuditLog;
 use crate::vault::approval::Caller;
 
-/// JSON `null` becomes Lua `nil`, so `if res.json.field then` behaves as expected.
 pub fn ser_options() -> SerializeOptions {
     SerializeOptions::new()
         .serialize_none_to_null(false)
         .serialize_unit_to_null(false)
 }
 
-/// Keeps the whole cause chain (`could not read x: permission denied`) in the Lua error.
+#[expect(clippy::needless_pass_by_value, reason = "made for `map_err`, which passes the error by value")]
 fn lua_error(err: anyhow::Error) -> mlua::Error {
     mlua::Error::runtime(format!("{err:#}"))
 }
 
-/// The longest timeout or sleep a script can ask for. Also keeps `Instant + duration` from overflowing.
+const MAX_INPUT_BYTES: usize = 20 * 1024 * 1024;
+
+fn read_capped(source: impl Read, what: &str) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    source
+        .take(MAX_INPUT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("could not read {what}"))?;
+    ensure!(bytes.len() <= MAX_INPUT_BYTES, "{what} is larger than {} MB", MAX_INPUT_BYTES >> 20);
+    Ok(bytes)
+}
+
 const MAX_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 
-/// Seconds from a script (`timeout = 2.5`) as a `Duration`.
 fn seconds(secs: f64) -> Result<Duration> {
     if !(0.0..=MAX_SECONDS).contains(&secs) {
         bail!("{secs} is not a valid number of seconds (0 to {MAX_SECONDS})");
@@ -50,7 +58,6 @@ pub fn run(
     store: Box<dyn VaultStore>,
     log: Box<dyn AuditLog>,
 ) -> Result<serde_json::Value> {
-    // Read once: the vault approves this exact source, so it must also be what runs.
     let script = def.read_script()?;
     let lua = sandbox::new_lua()?;
     let budget = limits::Budget::for_command(&def.manifest.limits)?;
@@ -60,9 +67,9 @@ pub fn run(
     encoding::install(&lua)?;
     time::install(&lua)?;
     exec::install(&lua, perms.exec.clone(), perms.env.clone())?;
-    fs::install(&lua, Rc::new(fs::FsGuard::new(perms)))?;
+    fs::install(&lua, &Rc::new(fs::FsGuard::new(perms)))?;
     let caller = Caller::new(def, &script);
-    http::install(&lua, Rc::new(http::HttpClient::new(perms, caller, store, log)))?;
+    http::install(&lua, &Rc::new(http::HttpClient::new(perms, caller, store, log)))?;
     let entry = load_entry(&lua, def, &script, &budget)?;
     let result: Value = entry
         .call(lua.to_value_with(args, ser_options())?)
@@ -71,12 +78,10 @@ pub fn run(
         .context("the command returned a value that cannot be turned into JSON")
 }
 
-/// Compiles `run.lua` without running it.
 pub fn check_syntax(def: &CommandDef) -> Result<()> {
     compile(def, chunk_name(def))
 }
 
-/// Like `check_syntax`, but errors call the script `label`, e.g. its path inside a repo.
 pub fn check_syntax_as(def: &CommandDef, label: &str) -> Result<()> {
     compile(def, format!("@{label}"))
 }
@@ -101,7 +106,6 @@ fn load_entry(lua: &Lua, def: &CommandDef, script: &str, budget: &limits::Budget
     }
 }
 
-/// Lua's "not enough memory" means the script hit its memory limit, so it says which.
 fn explain(err: &mlua::Error, budget: &limits::Budget) -> anyhow::Error {
     if err.to_string().contains("not enough memory") {
         anyhow!(budget.memory_message())
@@ -110,10 +114,6 @@ fn explain(err: &mlua::Error, budget: &limits::Budget) -> anyhow::Error {
     }
 }
 
-/// Lua errors end with a stack traceback, which buries the message. Keeps the
-/// message, calls the script `run.lua` instead of its whole path (the command's
-/// name is already in the error), and says where in it things failed when the
-/// message doesn't, like errors from `http` or `vault`.
 fn tidy(err: &mlua::Error) -> anyhow::Error {
     let text = err.to_string();
     let (message, trace) = text.split_once("\nstack traceback:").unwrap_or((&text, ""));
@@ -128,7 +128,6 @@ fn tidy(err: &mlua::Error) -> anyhow::Error {
     }
 }
 
-/// `/Users/me/.toolbox/commands/x/run.lua:12:` (or Lua's `...ds/x/run.lua:12:`) becomes `run.lua:12:`.
 fn short_paths(text: &str) -> String {
     text.split(' ')
         .map(|word| match word.find("run.lua:") {
@@ -146,7 +145,7 @@ fn chunk_name(def: &CommandDef) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::Manifest;
+    use crate::command::manifest::Manifest;
     use crate::vault::VaultData;
     use crate::vault::store::MemoryStore;
 
@@ -162,6 +161,15 @@ mod tests {
         (tmp, def)
     }
 
+    #[test]
+    fn reads_stop_one_byte_past_the_limit() {
+        let at = read_capped(std::io::repeat(b'x').take(MAX_INPUT_BYTES as u64), "x").unwrap();
+        assert_eq!(at.len(), MAX_INPUT_BYTES);
+        let err = read_capped(std::io::repeat(b'x'), "stdin").unwrap_err();
+        assert_eq!(err.to_string(), "stdin is larger than 20 MB");
+    }
+
+    #[expect(clippy::needless_pass_by_value, reason = "tests pass `json!(...)` values as they are")]
     fn run_script(script: &str, args: serde_json::Value) -> Result<serde_json::Value> {
         let (_tmp, def) = command(script);
         let log = Box::new(crate::vault::log::MemoryLog::new());

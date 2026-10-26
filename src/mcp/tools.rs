@@ -1,8 +1,3 @@
-//! Commands as MCP tools: an input schema from each manifest, and every call run as
-//! `tb <command> --<arg>=<value>` in a child process.
-
-use std::io;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -10,8 +5,9 @@ use serde_json::{Map, Value, json};
 
 use super::running::Running;
 use super::{INTERNAL_ERROR, INVALID_PARAMS, RpcError};
-use crate::manifest::{ArgSpec, ArgType, Manifest};
-use crate::registry::{self, Registry};
+use crate::command::manifest::{ArgSpec, ArgType, Manifest};
+use crate::command::registry::{self, Registry};
+use crate::sys;
 
 pub fn list(commands_dir: &Path) -> Result<Value, RpcError> {
     let registry = load(commands_dir)?;
@@ -19,8 +15,6 @@ pub fn list(commands_dir: &Path) -> Result<Value, RpcError> {
     Ok(json!({ "tools": tools }))
 }
 
-/// Unknown tools are protocol errors. Bad arguments and failed runs are tool results with
-/// `isError`, so the model sees the message and can fix its call.
 pub fn call(commands_dir: &Path, params: &Value, running: &Running, id: &str) -> Result<Value, RpcError> {
     let name = params
         .get("name")
@@ -42,8 +36,6 @@ pub fn call(commands_dir: &Path, params: &Value, running: &Running, id: &str) ->
     })
 }
 
-/// What `tools/list` shows for a set of commands. Changes when a command is added, removed,
-/// or its `command.json` is edited.
 pub fn fingerprint(commands_dir: &Path) -> Option<Vec<String>> {
     let registry = registry::load(commands_dir).ok()?;
     Some(registry.commands.into_iter().map(|def| def.manifest_source).collect())
@@ -108,7 +100,6 @@ fn a_type(kind: ArgType) -> &'static str {
     }
 }
 
-/// The flags for `tb <command>`. Always `--name=value`, so a value starting with `-` stays a value.
 fn cli_args(manifest: &Manifest, arguments: &Map<String, Value>) -> Result<Vec<String>, String> {
     if let Some(unknown) = arguments.keys().find(|name| !manifest.args.contains_key(*name)) {
         let known: Vec<&String> = manifest.args.keys().collect();
@@ -144,11 +135,6 @@ fn flag(name: &str, spec: &ArgSpec, value: &Value) -> Result<Option<String>, Str
     }
 }
 
-/// Runs the command exactly as the CLI would, with two differences. Its stdin is empty, so a
-/// script that reads stdin can't consume the MCP messages. And it gets a session of its own,
-/// with no controlling terminal: MCP clients start servers on their terminal, and the vault
-/// only changes when a person answers on one, so nothing a script starts (like `tb self vault
-/// allow` through `exec`) may reach it.
 fn run(name: &str, args: &[String], running: &Running, id: &str) -> Value {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -161,21 +147,12 @@ fn run(name: &str, args: &[String], running: &Running, id: &str) -> Value {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // SAFETY: setsid is async-signal-safe, as code between fork and exec must be.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    sys::start_new_session(&mut command);
     let child = match command.spawn() {
         Ok(child) => child,
         Err(err) => return failure(&format!("could not start {name}: {err}")),
     };
-    // A session leader's process group id is its pid.
-    running.started(id, child.id() as libc::pid_t);
+    running.started(id, child.id());
     match child.wait_with_output() {
         Ok(output) => outcome(&output),
         Err(err) => failure(&format!("could not run {name}: {err}")),
@@ -189,20 +166,20 @@ fn outcome(output: &Output) -> Value {
     if output.status.success() {
         return result(false, stdout.trim_end(), &lines);
     }
-    let reported = lines.last().and_then(|line| error_message(line));
+    let reported = lines
+        .split_last()
+        .and_then(|(last, logs)| Some((error_message(last)?, logs)));
     match reported {
-        Some(message) => result(true, &message, &lines[..lines.len() - 1]),
+        Some((message, logs)) => result(true, &message, logs),
         None => result(true, &format!("the command failed ({})", output.status), &lines),
     }
 }
 
-/// The message from the `{"error": "..."}` line toolbox writes when a run fails.
 fn error_message(line: &str) -> Option<String> {
     let parsed: Value = serde_json::from_str(line).ok()?;
     parsed.get("error")?.as_str().map(str::to_string)
 }
 
-/// The command's own `print`/`log` lines follow the main text as a second block.
 fn result(is_error: bool, text: &str, logs: &[&str]) -> Value {
     let log_block = (!logs.is_empty()).then(|| format!("Log output:\n{}", logs.join("\n")));
     let content: Vec<Value> = [Some(text.to_string()), log_block]
@@ -238,6 +215,7 @@ mod tests {
         .unwrap()
     }
 
+    #[expect(clippy::needless_pass_by_value, reason = "tests pass `json!(...)` values as they are")]
     fn args(value: Value) -> Result<Vec<String>, String> {
         cli_args(&manifest(), value.as_object().unwrap())
     }

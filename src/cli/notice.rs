@@ -1,7 +1,3 @@
-//! Tells a human at the terminal when a newer release is out.
-//! Checks GitHub at most once a day, and never when stderr is not a terminal,
-//! so agents and pipes never see the notice or wait for the request.
-
 use std::fmt;
 use std::fs;
 use std::io::IsTerminal;
@@ -11,18 +7,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::paths;
+use crate::cli::paths;
 
-/// Set to anything to turn the check off.
 const OPT_OUT_ENV: &str = "TOOLBOX_NO_UPDATE_CHECK";
 const LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/WilliamThogersen/toolbox/releases/latest";
 const CACHE_FILE: &str = "update-check.json";
-const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+const CHECK_EVERY: Duration = Duration::from_hours(24);
 const TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BODY_BYTES: u64 = 256 * 1024;
 
-/// Prints a one-line notice to stderr when a newer release is out. Never fails the run.
 pub fn notify() {
     if !std::io::stderr().is_terminal() || std::env::var_os(OPT_OUT_ENV).is_some() {
         return;
@@ -40,7 +34,6 @@ pub fn notify() {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Cache {
-    /// Unix seconds of the last check.
     checked_at: u64,
     latest: Option<String>,
 }
@@ -49,7 +42,6 @@ struct Cache {
 struct Version([u64; 3]);
 
 impl Version {
-    /// Accepts `1.2.3` or `v1.2.3`. Anything else (pre-releases, junk) is `None`.
     fn parse(text: &str) -> Option<Self> {
         let mut parts = text.strip_prefix('v').unwrap_or(text).split('.');
         let mut next = || parts.next()?.parse::<u64>().ok();
@@ -65,8 +57,6 @@ impl fmt::Display for Version {
     }
 }
 
-/// The release to tell the user about, if it is newer than `current`.
-/// Refreshes the cached answer with `fetch` once it is a day old.
 fn newer_release(
     cache_path: &Path,
     now: u64,
@@ -74,14 +64,11 @@ fn newer_release(
     fetch: impl FnOnce() -> Result<String>,
 ) -> Option<Version> {
     let cache = read_cache(cache_path);
-    // A timestamp in the future is as good as none.
     let stale = now
         .checked_sub(cache.checked_at)
         .is_none_or(|age| age >= CHECK_EVERY.as_secs());
     let latest = if stale {
-        // Keep the last answer when offline, and still wait a day before asking again.
         let latest = fetch().ok().or(cache.latest);
-        // Ignored on purpose: an unwritable cache only means asking again on the next run.
         let _ = write_cache(
             cache_path,
             &Cache {
