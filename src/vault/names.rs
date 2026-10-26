@@ -1,6 +1,6 @@
 //! Key names with folders: `github`, `github/work`, `github/work/token`. A command
 //! may list a pattern like `github/*` in `permissions.vault`, so one command can
-//! serve several accounts. Each key still needs its own `tb self vault allow`.
+//! serve several accounts. Each key is still allowed on its own.
 
 use crate::manifest::is_valid_name;
 

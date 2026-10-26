@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::commands::destination;
 use super::{SecretEntry, names};
 use crate::install::confirm;
 use crate::registry::{CommandDef, Registry};
@@ -50,10 +51,10 @@ pub fn check(secret: &str, entry: &SecretEntry, caller: &Caller) -> Result<()> {
     match entry.commands.get(name) {
         Some(approved) if *approved == caller.fingerprint => Ok(()),
         Some(_) => bail!(
-            "command {name:?} changed since the user allowed it to use secret {secret:?}. Ask the user to review it and run `tb self vault allow {secret} {name}` again in their own terminal"
+            "command {name:?} changed since the user allowed it to use secret {secret:?}. Ask the user to review it with `tb self vault setup {name}` in their own terminal"
         ),
         None => bail!(
-            "command {name:?} is not allowed to use secret {secret:?} yet. Ask the user to run `tb self vault allow {secret} {name}` in their own terminal"
+            "command {name:?} is not allowed to use secret {secret:?} yet. Ask the user to run `tb self vault setup {name}` in their own terminal"
         ),
     }
 }
@@ -125,15 +126,20 @@ const REACHING: &[&str] = &["http", "exec", "fs", "env", "stdin", "vault", "_G",
 const MAX_SHOWN: usize = 25;
 
 /// Built from the same text that gets fingerprinted, and escaped as a whole, since
-/// any manifest string or script line could carry terminal codes.
-pub fn review(def: &CommandDef, script: &str, secret: &str, entry: &SecretEntry) -> Review {
+/// any manifest string or script line could carry terminal codes. `keys` must not be
+/// empty; the question asks about the first.
+pub fn review(def: &CommandDef, script: &str, keys: &[(&str, &SecretEntry)]) -> Review {
     let manifest = &def.manifest;
     let perms = one_line_permissions(&manifest.permissions);
-    let query = if entry.query_params.is_empty() {
-        String::new()
-    } else {
-        format!(" (also as query parameter {})", entry.query_params.join(", "))
+    let names: Vec<&str> = keys.iter().map(|(name, _)| *name).collect();
+    let (wants, what) = match names.as_slice() {
+        [one] => (format!("your key {one}"), "the key allows"),
+        many => (format!("your keys {}", many.join(", ")), "these keys allow"),
     };
+    let destinations: Vec<String> = keys
+        .iter()
+        .map(|(name, entry)| format!("  {name} may be sent to {}", destination(entry)))
+        .collect();
     let lines: Vec<&str> = script.lines().collect();
     let reaching: Vec<String> = lines
         .iter()
@@ -147,15 +153,14 @@ pub fn review(def: &CommandDef, script: &str, secret: &str, entry: &SecretEntry)
         _ => reaching.join("\n"),
     };
     let summary = format!(
-        "{name} wants to use your key {secret}\n  {description}\n  permissions: {perms}{warnings}\n  \
-         {secret} may be sent to {hosts}{query}\n\n\
+        "{name} wants to use {wants}\n  {description}\n  permissions: {perms}{warnings}\n{destinations}\n\n\
          Lines of its run.lua ({count} in all) that reach outside the script:\n{shown}\n\n\
-         Once allowed, this exact version can do anything the key allows on those hosts.",
+         Once allowed, this exact version can do anything {what} on those hosts.",
         name = manifest.name,
         description = one_line(&manifest.description),
         perms = confirm::permissions(&perms),
         warnings = confirm::warning_lines(&perms),
-        hosts = entry.hosts.join(", "),
+        destinations = destinations.join("\n"),
         count = lines.len(),
     );
     let all: Vec<String> = lines.iter().enumerate().map(|(i, line)| numbered(i + 1, line)).collect();
@@ -163,7 +168,7 @@ pub fn review(def: &CommandDef, script: &str, secret: &str, entry: &SecretEntry)
     Review {
         summary: printable(&summary),
         full: printable(&full),
-        question: printable(&format!("Allow {} to use {secret}?", manifest.name)),
+        question: printable(&format!("Allow {} to use {}?", manifest.name, names[0])),
     }
 }
 
@@ -240,7 +245,7 @@ mod tests {
         let who = caller(&def);
 
         let err = check("github", &entry(&[]), &who).unwrap_err().to_string();
-        assert!(err.contains("tb self vault allow github stars"), "{err}");
+        assert!(err.contains("tb self vault setup stars"), "{err}");
 
         assert!(check("github", &entry(&[("stars", &who.fingerprint)]), &who).is_ok());
 
@@ -286,7 +291,7 @@ mod tests {
         let script = "local API = \"https://api.github.com\"\nlocal n = 1\nreturn function()\n  \
                       local res = http.get(API) -- \u{1b}[2Khidden\u{202e}x\rcover\n  local httpish = 2\nend\n";
         let def = command(tmp.path(), "stars", &["github"], script);
-        let review = review(&def, script, "github", &entry(&[]));
+        let review = review(&def, script, &[("github", &entry(&[]))]);
         let summary = &review.summary;
         assert!(summary.starts_with("stars wants to use your key github\n"), "{summary}");
         assert!(summary.contains("    1  local API = \"https://api.github.com\""), "{summary}");
@@ -306,6 +311,20 @@ mod tests {
     }
 
     #[test]
+    fn review_lists_where_each_key_may_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let def = command(tmp.path(), "both", &["github/*"], "return function() end");
+        let maps = SecretEntry { query_params: vec!["key".into()], ..entry(&[]) };
+        let review = review(&def, "return function() end", &[("github/work", &entry(&[])), ("github/maps", &maps)]);
+        let summary = &review.summary;
+        assert!(summary.starts_with("both wants to use your keys github/work, github/maps\n"), "{summary}");
+        assert!(summary.contains("  github/work may be sent to api.github.com\n"), "{summary}");
+        assert!(summary.contains("  github/maps may be sent to api.github.com (also as query parameter key)\n"), "{summary}");
+        assert!(summary.contains("anything these keys allow"), "{summary}");
+        assert_eq!(review.question, "Allow both to use github/work?");
+    }
+
+    #[test]
     fn reaching_out_means_whole_words() {
         for line in ["http.get(x)", "local f = fs", "exec(\"git\")", "x = _G[\"ht\" .. \"tp\"]", "rawget(_ENV, k)", "u = 'http://x'", "vault('k')"] {
             assert!(reaches_out(line), "{line}");
@@ -320,7 +339,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let script = "http.get(1)\n".repeat(MAX_SHOWN + 3);
         let def = command(tmp.path(), "many", &["github"], &script);
-        let review = review(&def, &script, "github", &entry(&[]));
+        let review = review(&def, &script, &[("github", &entry(&[]))]);
         assert!(review.summary.contains("... and 3 more"), "{}", review.summary);
         assert_eq!(review.full.matches("http.get(1)").count(), MAX_SHOWN + 3);
     }

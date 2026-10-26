@@ -490,7 +490,7 @@ fn one_command_serves_every_account_in_a_folder() {
     assert_eq!(result["you_sent"], "Bearer [REDACTED:svc/work]");
 
     let refused = [
-        ("personal", "tb self vault allow svc/personal call"),
+        ("personal", "tb self vault setup call"),
         ("work/token", "permissions.vault"),
         ("*", "not a valid vault key name"),
         ("../work", "not a valid vault key name"),
@@ -516,7 +516,7 @@ fn one_command_serves_every_account_in_a_folder() {
     tb.allow("svc/work", "forge");
     let out = tb.run(&["forge", "--url", &url]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("tb self vault allow svc/personal forge"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("tb self vault setup forge"), "{}", stderr(&out));
 
     let listed = tb.json(&["self", "vault", "list"]);
     let access: Vec<(&str, &str)> = listed
@@ -619,6 +619,81 @@ fn vault_add_and_rm_need_a_human_terminal() {
     assert_eq!(tb.vault(), before);
 }
 
+/// An agent asks for a key without a terminal; only the human's `setup` stores it.
+#[test]
+fn agents_request_keys_but_only_a_human_can_set_them_up() {
+    let tb = Toolbox::new();
+    let (url, _received) = echo_server();
+    let script = r#"return function(args)
+        return http.get(args.url, { query = { key = vault("maps") } }).status
+    end"#;
+    let manifest = json!({
+        "name": "call",
+        "description": "Calls a URL with the maps key",
+        "args": { "url": { "type": "string", "required": true } },
+        "permissions": { "http": ["127.0.0.1"], "vault": ["maps"] }
+    });
+    tb.add_command("call", manifest, script);
+
+    let missing = tb.run(&["call", "--url", &url]);
+    assert!(!missing.status.success());
+    let hint = format!("tb self vault request maps --host {} --query-param key --why", host_of(&url));
+    assert!(stderr(&missing).contains(&hint), "{}", stderr(&missing));
+
+    let note = "Get it at https://console.example.com/keys";
+    let why = "Geocode the addresses you ask about";
+    let args = [
+        "self", "vault", "request", "maps", "--host", "API.example.com", "--query-param", "key", "--why", why, "--note", note,
+    ];
+    let reply = tb.json(&args);
+    assert_eq!(reply["requested"], "maps");
+    assert_eq!(reply["why"], why);
+    assert_eq!(reply["hosts"], json!(["api.example.com"]));
+    assert_eq!(reply["used_by"], json!(["call"]));
+    assert!(reply["next"].as_str().unwrap().contains("tb self vault setup"), "{reply}");
+    assert!(!tb.vault_file().exists(), "a request must never touch the vault");
+    let saved: Value = serde_json::from_slice(&fs::read(tb.home.path().join("vault-requests.json")).unwrap()).unwrap();
+    assert_eq!((&saved["requests"][0]["why"], &saved["requests"][0]["note"]), (&json!(why), &json!(note)));
+
+    let setup = tb.run(&["self", "vault", "setup"]);
+    assert!(!setup.status.success());
+    assert!(stderr(&setup).contains("interactive terminal"), "{}", stderr(&setup));
+    assert!(!tb.vault_file().exists());
+
+    let log = tb.json(&["self", "vault", "log", "--key", "maps"]);
+    assert_eq!(log[0]["event"], "requested", "{log}");
+    assert_eq!(log[0]["why"], why, "{log}");
+
+    for (bad, why) in [
+        (vec!["maps", "--host", "localhost:8080", "--why", "x"], "localhost can mean either"),
+        (vec!["Maps!", "--host", "api.example.com", "--why", "x"], "not a valid key name"),
+        (vec!["maps", "--host", "api.example.com", "--why", "x", "--note", "two\nlines"], "one line"),
+        (vec!["maps", "--host", "api.example.com"], "--why"),
+        (vec!["maps", "--host", "api.example.com", "--why", " "], "say with --why"),
+    ] {
+        let out = tb.run(&[&["self", "vault", "request"][..], &bad].concat());
+        assert!(!out.status.success(), "{bad:?}");
+        assert!(stderr(&out).contains(why), "{bad:?}: {}", stderr(&out));
+    }
+
+    tb.add_secret("maps", SECRET, &["api.example.com"]);
+    let again = tb.run(&args);
+    assert!(stderr(&again).contains("already in the vault"), "{}", stderr(&again));
+}
+
+#[test]
+fn setup_with_nothing_waiting_needs_no_terminal() {
+    let tb = Toolbox::new();
+    tb.add_secret("test", SECRET, &["api.example.com"]);
+    tb.add_command("call", echo_manifest("call"), "return function() end");
+    tb.allow("test", "call");
+    let out = tb.run(&["self", "vault", "setup"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("Nothing is waiting"), "{}", stderr(&out));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report, json!({ "added": [], "allowed": [], "declined": [], "skipped": [] }));
+}
+
 /// Outside macOS there is no vault: the system keyring there hands keys to any program,
 /// agents included. It says so, and commands that don't use keys still run.
 #[cfg(not(target_os = "macos"))]
@@ -684,7 +759,7 @@ fn key_use_is_logged_without_the_key() {
     assert_eq!(used["outcome"], json!({ "status": 200 }));
     assert_eq!(used["terminal"], false, "the tests run without a terminal, like an agent");
     assert_eq!(refusal["event"], "refused");
-    assert!(refusal["reason"].as_str().unwrap().contains("tb self vault allow test call"), "{refusal}");
+    assert!(refusal["reason"].as_str().unwrap().contains("tb self vault setup call"), "{refusal}");
 
     assert_eq!(tb.json(&["self", "vault", "log", "--limit", "1"]).as_array().unwrap().len(), 1);
     assert_eq!(tb.json(&["self", "vault", "log", "--key", "other"]), json!([]));
@@ -704,7 +779,7 @@ fn only_commands_the_human_allowed_can_use_a_secret() {
 
     let out = tb.run(&["call", "--url", &url]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("tb self vault allow test call"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("tb self vault setup call"), "{}", stderr(&out));
     assert!(!contacted.load(Ordering::SeqCst), "an unapproved command reached the server");
 
     tb.allow("test", "call");

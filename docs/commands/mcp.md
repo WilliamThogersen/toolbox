@@ -64,7 +64,7 @@ Each call runs `tb <command> --<arg>=<value>` as its own process, exactly like o
 
 ## API keys
 
-Nothing changes. A command still needs your approval for each key ([`tb self vault allow`](vault.md)). Every call
+Nothing changes. A command still needs your approval for each key ([`tb self vault setup`](vault.md#tb-self-vault-setup)). Every call
 runs without a terminal, even when the app that started the server has one, so nothing a command runs (not even
 `tb self vault allow` through `exec`) can add, allow or read a key. When a key is missing or not allowed, the tool
 error says what to ask you to run.

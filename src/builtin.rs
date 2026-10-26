@@ -12,6 +12,7 @@ use crate::cli::{ignore_closed_pipe, print_json};
 use crate::install::{self, Confirm, Prompt, Yes, market};
 use crate::registry::Registry;
 use crate::vault::commands::{self as vault_ops, Rules, Tty};
+use crate::vault::requests::KeyRequest;
 use crate::{check, describe, mcp, paths, scaffold, vault};
 
 pub const NAMESPACE: &str = "self";
@@ -122,26 +123,32 @@ fn vault_app() -> Command {
         .subcommand(
             Command::new("add")
                 .about("Add a secret or change where it may go. Prompts for the value (empty keeps the current one), so a human must run it in a terminal")
+                .arg(key_name_arg())
+                .arg(host_arg())
+                .arg(query_param_arg()),
+        )
+        .subcommand(
+            Command::new("request")
+                .about("Ask the user for a key. Needs no terminal: an agent runs it, then asks the user to run `tb self vault setup`")
+                .arg(key_name_arg())
+                .arg(host_arg())
+                .arg(query_param_arg())
                 .arg(
-                    Arg::new("name")
+                    Arg::new("why")
+                        .long("why")
                         .required(true)
-                        .help("Name scripts use, like github, or github/work for one of several accounts"),
+                        .help("What the key is needed for, shown to the user: \"Run Lighthouse audits through the PageSpeed API\""),
                 )
                 .arg(
-                    Arg::new("host")
-                        .long("host")
-                        .required(true)
-                        .action(ArgAction::Append)
-                        .value_delimiter(',')
-                        .help("Host the secret may be sent to, e.g. api.github.com or 127.0.0.1:8080 (repeatable)"),
-                )
-                .arg(
-                    Arg::new("query-param")
-                        .long("query-param")
-                        .action(ArgAction::Append)
-                        .value_delimiter(',')
-                        .help("Query parameter it may also be sent in, e.g. key for ?key=... (repeatable)"),
+                    Arg::new("note")
+                        .long("note")
+                        .help("Shown to the user, like where to get the key: https://github.com/settings/tokens"),
                 ),
+        )
+        .subcommand(
+            Command::new("setup")
+                .about("Add the keys agents asked for and allow the commands waiting for a key, with one Touch ID")
+                .arg(Arg::new("command").help("Only this command. Also asks for keys it lists that nobody requested")),
         )
         .subcommand(Command::new("list").about("Secrets, where they may go and which commands use them (never values)"))
         .subcommand(
@@ -174,6 +181,29 @@ fn vault_app() -> Command {
                         .help("How many entries to show, newest first"),
                 ),
         )
+}
+
+fn key_name_arg() -> Arg {
+    Arg::new("name")
+        .required(true)
+        .help("Name scripts use, like github, or github/work for one of several accounts")
+}
+
+fn host_arg() -> Arg {
+    Arg::new("host")
+        .long("host")
+        .required(true)
+        .action(ArgAction::Append)
+        .value_delimiter(',')
+        .help("Host the secret may be sent to, e.g. api.github.com or 127.0.0.1:8080 (repeatable)")
+}
+
+fn query_param_arg() -> Arg {
+    Arg::new("query-param")
+        .long("query-param")
+        .action(ArgAction::Append)
+        .value_delimiter(',')
+        .help("Query parameter it may also be sent in, e.g. key for ?key=... (repeatable)")
 }
 
 pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Result<ExitCode> {
@@ -261,17 +291,34 @@ fn vault_command(matches: &ArgMatches, registry: &Registry) -> Result<ExitCode> 
         let get = |id| m.get_one::<String>(id).expect("required").clone();
         (get("secret"), get("command"))
     };
+    let values = |m: &ArgMatches, id| m.get_many::<String>(id).into_iter().flatten().cloned().collect::<Vec<_>>();
     match matches.subcommand() {
         Some(("add", m)) => {
             let name = m.get_one::<String>("name").expect("required");
-            let values = |id| m.get_many::<String>(id).into_iter().flatten().cloned().collect::<Vec<_>>();
-            let (hosts, query_params) = (values("host"), values("query-param"));
+            let (hosts, query_params) = (values(m, "host"), values(m, "query-param"));
             let rules = Rules { hosts: &hosts, query_params: &query_params };
             let summary = vault_ops::add(store.as_ref(), &log, &Tty, registry, name, rules)?;
             if let Some(note) = vault::hosts::local_note(&summary.hosts) {
                 eprintln!("{note}");
             }
             print_json(&summary)
+        }
+        Some(("request", m)) => {
+            let name = m.get_one::<String>("name").expect("required");
+            let why = m.get_one::<String>("why").expect("required");
+            let note = m.get_one::<String>("note").map(String::as_str);
+            let wanted = KeyRequest::new(name, &values(m, "host"), &values(m, "query-param"), why, note)?;
+            let path = vault::requests::default_path()?;
+            print_json(&vault::requests::request(store.as_ref(), &log, registry, &path, wanted)?)
+        }
+        Some(("setup", m)) => {
+            let only = m.get_one::<String>("command").map(String::as_str);
+            let path = vault::requests::default_path()?;
+            let report = vault::setup::setup(store.as_ref(), &log, &Tty, registry, &path, only)?;
+            if report.is_empty() {
+                eprintln!("Nothing is waiting: no key requests, and every command that uses a key is allowed.");
+            }
+            print_json(&report)
         }
         Some(("list", _)) => print_json(&vault_ops::list(store.as_ref(), registry)?),
         Some(("allow", m)) => {

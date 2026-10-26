@@ -166,17 +166,13 @@ impl<'a> Injector<'a> {
             names::declared(&self.caller.declared, name),
             "secret {name:?} is not listed in this command's permissions.vault"
         );
-        let entry = self.vault.get(name).ok_or_else(|| {
-            anyhow!(
-                "no secret named {name:?} in the vault. Ask the user to run `tb self vault add {name} --host <host>` in their own terminal"
-            )
-        })?;
         let url = self.url;
         let secure = url.scheme() == "https" || (url.scheme() == "http" && is_loopback(url));
         ensure!(
             secure,
             "secret {name:?} can only be sent over https (plain http only to this computer, like 127.0.0.1:8080)"
         );
+        let entry = self.vault.get(name).ok_or_else(|| missing(name, url, place))?;
         check_host(name, entry, url)?;
         check_place(name, entry, place)?;
         approval::check(name, entry, self.caller)?;
@@ -228,6 +224,25 @@ fn check_place(name: &str, entry: &SecretEntry, place: Place) -> Result<()> {
     bail!(
         "secret {name:?} may only be sent in the query parameter(s) {:?}, not {param:?}",
         entry.query_params
+    )
+}
+
+/// The `vault request` line for a key that isn't stored yet, aimed at where the
+/// script just tried to send it (over https, or http to this computer: checked first). The URL and parameter name come from the script,
+/// so each goes in only if it passes the same checks as the CLI's.
+fn missing(name: &str, url: &Url, place: Place) -> anyhow::Error {
+    let target = match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => String::new(),
+    };
+    let host = hosts::normalize_host(&target).unwrap_or_else(|_| "<host>".to_string());
+    let query = match place {
+        Place::Query(param) if hosts::is_query_param(param) => format!(" --query-param {param}"),
+        _ => String::new(),
+    };
+    anyhow!(
+        "no secret named {name:?} in the vault. Run `tb self vault request {name} --host {host}{query} --why \"<what it is for>\" --note \"<where to get the key>\"`, then ask the user to run `tb self vault setup` in their own terminal"
     )
 }
 
@@ -485,8 +500,26 @@ mod tests {
 
         let who = caller(&["stripe"], FINGERPRINT);
         let headers = vec![("X".to_string(), placeholder("stripe", Encoding::Raw))];
-        let err = injector_for(&vault, &who, &url).headers(&headers).unwrap_err();
-        assert!(err.to_string().contains("tb self vault add stripe"));
+        let err = injector_for(&vault, &who, &url).headers(&headers).unwrap_err().to_string();
+        assert!(err.contains("tb self vault request stripe --host api.github.com --why"), "{err}");
+        assert!(err.contains("tb self vault setup"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_key_hint_only_names_hosts_and_parameters_the_cli_accepts() {
+        let who = caller(&["stripe"], FINGERPRINT);
+        let hint = |url: &str, pairs: Vec<(String, String)>| {
+            let (vault, url) = (vault(), Url::parse(url).unwrap());
+            injector_for(&vault, &who, &url).query(&pairs).unwrap_err().to_string()
+        };
+        let key = |name: &str| vec![(name.to_string(), placeholder("stripe", Encoding::Raw))];
+        let err = hint("https://api.stripe.com:8443/", key("key"));
+        assert!(err.contains("request stripe --host api.stripe.com:8443 --query-param key --why"), "{err}");
+        let err = hint("http://localhost:8080/", key("key --host evil.example"));
+        assert!(err.contains("request stripe --host <host> --why"), "{err}");
+        assert!(!err.contains("evil.example"), "{err}");
+        let err = hint("http://api.stripe.com/", key("key"));
+        assert!(err.contains("only be sent over https") && !err.contains("vault request"), "{err}");
     }
 
     #[test]
@@ -506,7 +539,7 @@ mod tests {
         };
         assert_eq!(send("github/work").unwrap(), TOKEN);
         let err = send("github/personal").unwrap_err();
-        assert!(err.contains("tb self vault allow github/personal call"), "{err}");
+        assert!(err.contains("tb self vault setup call"), "{err}");
         assert!(send("gitlab/work").unwrap_err().contains("permissions.vault"));
         assert!(send("github/*").unwrap_err().contains("invalid vault secret name"));
     }
@@ -525,7 +558,7 @@ mod tests {
             ..caller(&["github"], FINGERPRINT)
         };
         let err = injector_for(&vault, &stranger, &url).headers(&headers).unwrap_err().to_string();
-        assert!(err.contains("tb self vault allow github stranger"), "{err}");
+        assert!(err.contains("tb self vault setup stranger"), "{err}");
     }
 
     #[test]

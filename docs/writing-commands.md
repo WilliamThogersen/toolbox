@@ -245,9 +245,8 @@ headers = { Authorization = "Bearer " .. vault("github/" .. args.account) }
 
 `*` stands for exactly one part and never the first: `github/*` covers
 `github/work` but not `github` or `github/work/token` (use `github/*/token` for
-that). The human allows each key on its own: `tb self vault allow github/work <command>`
-does not let the command use `github/personal`. `tb self vault list` shows which
-accounts exist.
+that). The human allows each key on its own: allowing `github/work` does not let the
+command use `github/personal`. `tb self vault list` shows which accounts exist.
 
 Rules:
 
@@ -257,18 +256,35 @@ Rules:
 3. The request must go to a host the human allowed for that secret, over https.
    Plain http is allowed only for this computer, at the exact address and port the
    human set (like `http://127.0.0.1:8080`, never `localhost`).
-4. The human must allow your command with `tb self vault allow <secret> <command>`.
-   The approval covers the exact `command.json` and `run.lua` they saw: after any
-   edit, the human has to allow it again.
+4. The human must allow your command, with `tb self vault setup`. The approval
+   covers the exact `command.json` and `run.lua` they saw: after any edit, the
+   human has to allow it again.
 5. Requests that carry a secret never follow redirects.
 6. Any secret value that appears in a response is replaced with `[REDACTED:<name>]`.
 7. The vault is macOS only for now: elsewhere `vault()` raises an error that says so.
 
+### Getting a key from the human
+
 `tb self vault list` shows which secrets exist, where they may be sent and which
-commands may use them. The error message tells you what to ask the user, for
-example to run `tb self vault add <name> --host <host>` or
-`tb self vault allow <secret> <command>` in their own terminal. Finish and test the
-command's logic before you ask for approval, so they only review it once. You
+commands may use them. If the key you need isn't there, request it. This needs no
+terminal:
+
+```bash
+tb self vault request pagespeed --host www.googleapis.com --query-param key \
+  --why "Run Lighthouse audits on your sites through Google's PageSpeed API" \
+  --note "Get it at https://console.cloud.google.com/apis/credentials"
+```
+
+Use the exact host the API lives on, and `--query-param` only when the API wants
+the key in the query string (otherwise it goes in headers only). `--why` is
+required: one line saying what the key is for, in the user's terms. The note is
+one line telling them where to get the key, and which scopes or access to pick. Then finish and test the command's
+logic, and ask the user to run `tb self vault setup` in their own terminal: they
+paste the key and review your command in one go. Ask once, at the end, so they
+only review it once. After you edit the command, ask them to run
+`tb self vault setup` again.
+
+When a run fails because of the vault, the error says which of these to do. You
 cannot add, change, allow or read secrets yourself.
 
 ## Full example

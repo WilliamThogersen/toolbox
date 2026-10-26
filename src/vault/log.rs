@@ -1,5 +1,5 @@
-//! The key log: every time a key is added, allowed, revoked, removed, used or
-//! refused, with when, by which command and from which programs. Never a value.
+//! The key log: every time a key is requested, added, allowed, revoked, removed, used
+//! or refused, with when, by which command and from which programs. Never a value.
 //!
 //! Each entry goes to `$TOOLBOX_HOME/vault-log.jsonl` for `tb self vault log`, and
 //! to the system log. An agent with the user's shell can edit the file, but not the
@@ -27,6 +27,7 @@ const SYSTEM_PREFIX: &str = "vault ";
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
+    Requested { key: String, hosts: Vec<String>, query_params: Vec<String>, why: String },
     Added { key: String, hosts: Vec<String>, query_params: Vec<String>, new_value: bool },
     Allowed { key: String, command: String },
     Declined { key: String, command: String },
