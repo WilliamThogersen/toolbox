@@ -13,7 +13,7 @@ use crate::install::{self, Confirm, Prompt, Yes, market};
 use crate::registry::Registry;
 use crate::vault::commands::{self as vault_ops, Rules, Tty};
 use crate::vault::requests::KeyRequest;
-use crate::{check, describe, mcp, paths, scaffold, vault};
+use crate::{check, describe, init, mcp, paths, scaffold, vault};
 
 pub const NAMESPACE: &str = "self";
 
@@ -77,6 +77,16 @@ pub fn app() -> Command {
         .subcommand(market_app())
         .subcommand(vault_app())
         .subcommand(Command::new("mcp").about("Serve your commands as MCP tools over stdio, for Claude Code and other AI apps"))
+        .subcommand(
+            Command::new("init")
+                .about("Tell Claude Code about toolbox: writes ~/.claude/TOOLBOX.md and imports it from CLAUDE.md")
+                .arg(
+                    Arg::new("remove")
+                        .long("remove")
+                        .action(ArgAction::SetTrue)
+                        .help("Take it out again: removes the import and TOOLBOX.md"),
+                ),
+        )
 }
 
 fn market_app() -> Command {
@@ -238,6 +248,17 @@ pub fn run(matches: &ArgMatches, registry: &Registry, commands_dir: &Path) -> Re
         }
         Some(("vault", m)) => vault_command(m, registry),
         Some(("mcp", _)) => mcp::serve(commands_dir),
+        Some(("init", m)) => {
+            let dir = paths::claude_dir()?;
+            if m.get_flag("remove") {
+                return print_json(&init::remove(&dir)?);
+            }
+            let report = init::install(&dir)?;
+            if let Some(note) = &report.note {
+                eprintln!("{note}");
+            }
+            print_json(&report)
+        }
         _ => unreachable!("clap requires a `self` subcommand"),
     }
 }

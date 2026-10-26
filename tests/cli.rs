@@ -351,6 +351,36 @@ fn agents_never_trigger_the_update_check() {
 }
 
 #[test]
+fn init_imports_the_instructions_into_claude_md_once_and_remove_undoes_it() {
+    let tb = Toolbox::new();
+    let claude = tempfile::tempdir().unwrap();
+    let claude_md = claude.path().join("CLAUDE.md");
+    let original = "# Mine\n\n@RTK.md\n";
+    fs::write(&claude_md, original).unwrap();
+    let env = [("CLAUDE_CONFIG_DIR", claude.path().to_str().unwrap())];
+    let init = |args: &[&str]| {
+        let out = tb.run_with_env(args, &env);
+        assert!(out.status.success(), "tb {args:?} failed: {}", stderr(&out));
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+
+    let first = init(&["self", "init"]);
+    assert_eq!((first["imported"].clone(), first["updated"].clone()), (json!(true), json!(true)));
+    assert_eq!(fs::read_to_string(&claude_md).unwrap(), "# Mine\n\n@RTK.md\n\n@TOOLBOX.md\n");
+    let instructions = fs::read_to_string(claude.path().join("TOOLBOX.md")).unwrap();
+    assert!(instructions.contains("tb self guide"), "{instructions}");
+
+    let again = init(&["self", "init"]);
+    assert_eq!((again["imported"].clone(), again["updated"].clone()), (json!(false), json!(false)));
+    assert_eq!(fs::read_to_string(&claude_md).unwrap(), "# Mine\n\n@RTK.md\n\n@TOOLBOX.md\n");
+
+    let removed = init(&["self", "init", "--remove"]);
+    assert_eq!((removed["import_removed"].clone(), removed["deleted"].clone()), (json!(true), json!(true)));
+    assert_eq!(fs::read_to_string(&claude_md).unwrap(), original);
+    assert!(!claude.path().join("TOOLBOX.md").exists());
+}
+
+#[test]
 fn keys_hidden_in_json_escapes_are_redacted_too() {
     let tb = Toolbox::new();
     let (url, _received) = escaping_echo_server();

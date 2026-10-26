@@ -71,5 +71,5 @@ error says what to ask you to run.
 
 ## See also
 
-- [AI agents](../ai-agents.md): the `CLAUDE.md` snippet for agents that use the shell
+- [`tb self init`](init.md): tell Claude Code to write and use commands through the shell too
 - [Security](../security.md): what commands can touch

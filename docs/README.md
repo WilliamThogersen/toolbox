@@ -17,6 +17,7 @@ Plain `tb` lists only your own commands. Everything that manages toolbox lives u
 | [`tb self market`](commands/market.md) | Save, list and remove marketplaces |
 | [`tb self vault`](commands/vault.md) | API keys: agents request them, you paste them and choose which commands may use them |
 | [`tb self mcp`](commands/mcp.md) | Serve your commands as MCP tools for Claude Code and other AI apps |
+| [`tb self init`](commands/init.md) | Tell Claude Code to use toolbox: writes `~/.claude/TOOLBOX.md` and imports it |
 
 Your own commands run as `tb <name> --<arg> <value>`. Add `--help` to see their args.
 
@@ -25,5 +26,5 @@ Your own commands run as `tb <name> --<arg> <value>`. Add `--help` to see their 
 - [Writing commands](writing-commands.md): `command.json`, the Lua API, the vault. Also printed by `tb self guide`.
 - [Sharing commands](sharing.md): host your own repo or marketplace, release versions.
 - [Security](security.md): what commands can touch, the risks of installing, what the vault protects.
-- [AI agents](ai-agents.md): the `CLAUDE.md` snippet, output rules, what agents can and can't do.
+- [AI agents](ai-agents.md): `tb self init`, output rules, what agents can and can't do.
 - [Development](development.md): build, test, release, project layout.

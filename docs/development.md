@@ -97,5 +97,6 @@ The image's rustup installs the pinned toolchain without clippy, hence the `rust
 | `src/runtime/` | Lua sandbox, `http`, `json`, `exec`, `env`, `vault` globals |
 | `src/vault/` | Keychain storage (macOS only), placeholder injection, redaction, `vault` subcommands |
 | `src/update.rs` | Once-a-day new-version notice on the terminal |
-| `docs/` | These docs. `docs/writing-commands.md` is printed by `tb self guide` |
+| `src/init.rs` | `tb self init`: `~/.claude/TOOLBOX.md` and its import in `CLAUDE.md` |
+| `docs/` | These docs. `docs/writing-commands.md` is printed by `tb self guide`, `docs/agent-instructions.md` is written by `tb self init` |
 | `assets/demo/` | The VHS tape and the command behind the README's demo GIF |

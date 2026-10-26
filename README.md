@@ -177,17 +177,14 @@ sequenceDiagram
 
 ## 🤖 Hook up your AI
 
-**Let it build tools.** Paste this into your `CLAUDE.md` (or your agent's instructions file):
+**Let it build tools.** One command tells Claude Code to use your commands first and write new ones:
 
-```markdown
-## toolbox (tb)
-`tb` is my toolbox CLI. Run `tb` to list my commands and `tb self describe` for their args as JSON.
-To add a command, read `tb self guide`, then `tb self new <name>`, edit the files, and run `tb self check`.
-API keys live in the toolbox vault: use `vault("name")` in headers, never ask me for a key.
-If a key is missing, request it with `tb self vault request` and ask me to run `tb self vault setup`.
-Before writing a new command, check `tb self search <words>` for one in my marketplaces.
-Before `tb self install <source> --yes`, show me the permissions it lists and wait for my OK.
+```bash
+tb self init
 ```
+
+It writes `~/.claude/TOOLBOX.md` and imports it from your `CLAUDE.md`. Other agents: copy
+[the instructions](docs/agent-instructions.md) into their instructions file.
 
 **Let it call them as tools.** Any MCP app works:
 
@@ -215,7 +212,7 @@ Every install shows the permissions first and waits for your yes. Want to publis
 - ✍️ [Writing commands](docs/writing-commands.md): `command.json`, the Lua API, the vault
 - 🤝 [Sharing commands](docs/sharing.md): host your own repo or marketplace, release versions
 - 🛡️ [Security](docs/security.md): what commands can touch, the risks of installing, what the vault protects
-- 🤖 [AI agents](docs/ai-agents.md): the `CLAUDE.md` snippet, output rules
+- 🤖 [AI agents](docs/ai-agents.md): `tb self init`, output rules
 - 🔧 [Development](docs/development.md): build, test, release, project layout
 
 <details>

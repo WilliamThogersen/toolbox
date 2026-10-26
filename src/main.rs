@@ -2,6 +2,7 @@ mod builtin;
 mod check;
 mod cli;
 mod describe;
+mod init;
 mod install;
 mod manifest;
 mod mcp;

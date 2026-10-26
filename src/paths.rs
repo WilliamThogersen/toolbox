@@ -20,3 +20,13 @@ pub fn commands_dir() -> Result<PathBuf> {
 pub fn markets_file() -> Result<PathBuf> {
     Ok(toolbox_home()?.join("markets.json"))
 }
+
+/// Claude Code's config folder (`tb self init`): `$CLAUDE_CONFIG_DIR`, or `~/.claude`.
+pub fn claude_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".claude"))
+        .context("could not find the home directory; set CLAUDE_CONFIG_DIR")
+}
