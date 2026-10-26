@@ -8,13 +8,13 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::platform;
 use super::store::TEST_VAULT_ENV;
+use super::{SecretEntry, platform};
 use crate::cli::paths;
 use crate::sys;
 
 pub const LOG_FILE: &str = "vault-log.jsonl";
-const OLD_LOG_FILE: &str = "vault-log.1.jsonl";
+pub(super) const OLD_LOG_FILE: &str = "vault-log.1.jsonl";
 const ROTATE_AT: u64 = 5 * 1024 * 1024;
 const SYSTEM_PREFIX: &str = "vault ";
 
@@ -22,13 +22,47 @@ const SYSTEM_PREFIX: &str = "vault ";
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     Requested { key: String, hosts: Vec<String>, query_params: Vec<String>, why: String },
-    Added { key: String, hosts: Vec<String>, query_params: Vec<String>, new_value: bool },
+    Added {
+        key: String,
+        hosts: Vec<String>,
+        query_params: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        methods: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        confirm: Vec<String>,
+        new_value: bool,
+    },
     Allowed { key: String, command: String },
     Declined { key: String, command: String },
     Revoked { key: String, command: String },
     Removed { key: String },
-    Used { keys: Vec<String>, command: String, request: Request, outcome: Outcome },
+    SignedIn { key: String, hosts: Vec<String>, provider: String },
+    Refreshed { key: String, command: String, host: String, outcome: Outcome },
+    Used {
+        keys: Vec<String>,
+        command: String,
+        request: Request,
+        outcome: Outcome,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        confirmed: bool,
+    },
     Refused { keys: Vec<String>, command: String, request: Request, reason: String },
+}
+
+impl Event {
+    pub fn added(key: &str, entry: &SecretEntry, new_value: bool) -> Self {
+        Self::Added {
+            key: key.to_string(),
+            hosts: entry.hosts.clone(),
+            query_params: entry.query_params.clone(),
+            methods: entry.methods.clone(),
+            paths: entry.paths.clone(),
+            confirm: entry.confirm.clone(),
+            new_value,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -143,7 +177,7 @@ pub fn read(path: &Path, filter: &Filter) -> Result<Vec<Value>> {
     Ok(entries.into_iter().rev().filter(|entry| matches(entry, filter)).take(filter.limit).collect())
 }
 
-fn matches(entry: &Value, filter: &Filter) -> bool {
+pub(super) fn matches(entry: &Value, filter: &Filter) -> bool {
     let key_ok = filter.key.is_none_or(|key| {
         entry["key"] == key || entry["keys"].as_array().is_some_and(|keys| keys.iter().any(|k| k == key))
     });
@@ -180,6 +214,7 @@ mod tests {
             command: command.into(),
             request: Request { method: "GET".into(), host: "api.github.com".into(), path: "/user".into() },
             outcome: Outcome::Status(200),
+            confirmed: false,
         }
     }
 

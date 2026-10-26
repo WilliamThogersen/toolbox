@@ -8,6 +8,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use super::hosts::{normalize_host, normalize_query_param};
 use super::log::{AuditLog, Event};
 use super::names::{self, NAME_RULES, is_secret_name};
+use super::scope::{self, normalize_confirm, normalize_method, normalize_path};
 use super::{SecretEntry, SecretSummary, SecretValue, VaultStore, approval};
 use crate::command::registry::{CommandDef, Registry};
 
@@ -100,6 +101,49 @@ fn no_tty(err: io::Error) -> anyhow::Error {
 pub struct Rules<'a> {
     pub hosts: &'a [String],
     pub query_params: &'a [String],
+    pub methods: &'a [String],
+    pub paths: &'a [String],
+    pub confirm: &'a [String],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckedRules {
+    pub hosts: Vec<String>,
+    pub query_params: Vec<String>,
+    pub methods: Vec<String>,
+    pub paths: Vec<String>,
+    pub confirm: Vec<String>,
+}
+
+impl Rules<'_> {
+    pub fn check(&self) -> Result<CheckedRules> {
+        ensure!(!self.hosts.is_empty(), "give at least one --host the secret may be sent to");
+        Ok(CheckedRules {
+            hosts: sorted(self.hosts, normalize_host)?,
+            query_params: sorted(self.query_params, normalize_query_param)?,
+            methods: sorted(self.methods, normalize_method)?,
+            paths: sorted(self.paths, normalize_path)?,
+            confirm: normalize_confirm(self.confirm)?,
+        })
+    }
+}
+
+pub(super) fn sorted(items: &[String], check: fn(&str) -> Result<String>) -> Result<Vec<String>> {
+    let unique: BTreeSet<String> = items.iter().map(|item| check(item)).collect::<Result<_>>()?;
+    Ok(unique.into_iter().collect())
+}
+
+impl CheckedRules {
+    pub fn entry(self, value: SecretValue, commands: std::collections::BTreeMap<String, String>) -> SecretEntry {
+        SecretEntry {
+            query_params: self.query_params,
+            methods: self.methods,
+            paths: self.paths,
+            confirm: self.confirm,
+            commands,
+            ..SecretEntry::new(value, self.hosts)
+        }
+    }
 }
 
 pub fn add(
@@ -111,16 +155,13 @@ pub fn add(
     rules: Rules,
 ) -> Result<SecretSummary> {
     ensure!(is_secret_name(name), "{name:?} is not a valid secret name ({NAME_RULES})");
-    ensure!(!rules.hosts.is_empty(), "give at least one --host the secret may be sent to");
-    let hosts: BTreeSet<String> = rules.hosts.iter().map(|h| normalize_host(h)).collect::<Result<_>>()?;
-    let query_params: BTreeSet<String> = rules
-        .query_params
-        .iter()
-        .map(|p| normalize_query_param(p))
-        .collect::<Result<_>>()?;
+    let checked = rules.check()?;
     let vault = store.load()?;
     let existing = vault.get(name);
     let prompt = match existing {
+        Some(current) if current.oauth.is_some() => format!(
+            "New value for {name} (input is hidden, leave empty to keep the current sign-in; a value replaces the sign-in with a plain key): "
+        ),
         Some(_) => format!("New value for {name} (input is hidden, leave empty to keep the current one): "),
         None => format!("Value for {name} (input is hidden): "),
     };
@@ -130,19 +171,11 @@ pub fn add(
         ("", Some(current)) => current.value.clone(),
         (typed, _) => SecretValue::new(typed.to_string())?,
     };
-    let entry = SecretEntry {
-        value,
-        hosts: hosts.into_iter().collect(),
-        query_params: query_params.into_iter().collect(),
-        commands: existing.map(|current| current.commands.clone()).unwrap_or_default(),
-    };
+    let kept_sign_in = existing.filter(|_| !new_value).and_then(|current| current.oauth.clone());
+    let commands = existing.map(|current| current.commands.clone()).unwrap_or_default();
+    let entry = SecretEntry { oauth: kept_sign_in, ..checked.entry(value, commands) };
     store.save(&vault.with_secret(name, entry.clone()), &add_change(name, existing, &entry, new_value))?;
-    log.record(Event::Added {
-        key: name.to_string(),
-        hosts: entry.hosts.clone(),
-        query_params: entry.query_params.clone(),
-        new_value,
-    });
+    log.record(Event::added(name, &entry, new_value));
     Ok(entry.summary(name, registry))
 }
 
@@ -168,10 +201,46 @@ pub fn list(store: &dyn VaultStore, registry: &Registry) -> Result<Vec<SecretSum
 }
 
 pub(super) fn destination(entry: &SecretEntry) -> String {
-    match entry.query_params.as_slice() {
+    let limits: Vec<String> = [
+        (!entry.query_params.is_empty()).then(|| format!("also as query parameter {}", entry.query_params.join(", "))),
+        (!entry.methods.is_empty()).then(|| format!("{} only", entry.methods.join(", "))),
+        (!entry.paths.is_empty()).then(|| format!("paths under {}", entry.paths.join(", "))),
+        confirm_text(&entry.confirm),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match limits.as_slice() {
         [] => entry.hosts.join(", "),
-        params => format!("{} (also as query parameter {})", entry.hosts.join(", "), params.join(", ")),
+        limits => format!("{} ({})", entry.hosts.join(", "), limits.join("; ")),
     }
+}
+
+fn confirm_text(confirm: &[String]) -> Option<String> {
+    let shown: Vec<&str> = confirm
+        .iter()
+        .map(|rule| if rule == scope::WRITES { "write (not GET, HEAD or OPTIONS)" } else { rule.as_str() })
+        .collect();
+    match shown.as_slice() {
+        [] => None,
+        [all] if *all == scope::ALL => Some("Touch ID before each use".to_string()),
+        rules => Some(format!("Touch ID before each {}", rules.join(", "))),
+    }
+}
+
+pub(super) fn add_flags(entry: &SecretEntry) -> String {
+    let flag = |name: &str, values: &[String]| match values {
+        [] => String::new(),
+        values => format!(" --{name} {}", values.join(",")),
+    };
+    format!(
+        "--host {}{}{}{}{}",
+        entry.hosts.join(","),
+        flag("query-param", &entry.query_params),
+        flag("method", &entry.methods),
+        flag("path", &entry.paths),
+        flag("confirm", &entry.confirm)
+    )
 }
 
 pub fn allow(
@@ -310,7 +379,7 @@ mod tests {
     }
 
     fn rules<'a>(hosts: &'a [String], query_params: &'a [String]) -> Rules<'a> {
-        Rules { hosts, query_params }
+        Rules { hosts, query_params, methods: &[], paths: &[], confirm: &[] }
     }
 
     fn add_simple(store: &MemoryStore, term: &FakeTerminal, hosts: &[&str]) -> Result<SecretSummary> {
@@ -486,6 +555,61 @@ mod tests {
         assert!(remove(&store, &*MemoryLog::new(), &term(), "stripe").unwrap());
         assert!(store.load().unwrap().get("stripe").is_none());
         assert!(remove(&store, &*MemoryLog::new(), &term(), "stripe").is_err());
+    }
+
+    #[test]
+    fn add_keeps_method_path_and_confirm_rules() {
+        let store = MemoryStore::new(VaultData::default());
+        let hosts = vec!["api.github.com".to_string()];
+        let (methods, paths) = (vec!["get".to_string(), "HEAD".to_string()], vec!["/repos/acme/".to_string()]);
+        let confirm = vec!["writes".to_string()];
+        let narrow = Rules { hosts: &hosts, query_params: &[], methods: &methods, paths: &paths, confirm: &confirm };
+        let summary = add(&store, &*MemoryLog::new(), &term(), &Registry::default(), "github", narrow).unwrap();
+        assert_eq!((summary.methods, summary.paths, summary.confirm), (
+            vec!["GET".to_string(), "HEAD".to_string()],
+            vec!["/repos/acme".to_string()],
+            vec!["writes".to_string()]
+        ));
+        assert_eq!(
+            store.changes.borrow()[0],
+            "add the API key github for api.github.com (GET, HEAD only; paths under /repos/acme; Touch ID before each write (not GET, HEAD or OPTIONS))"
+        );
+        let saved = store.load().unwrap();
+        assert_eq!(add_flags(saved.get("github").unwrap()), "--host api.github.com --method GET,HEAD --path /repos/acme --confirm writes");
+
+        for (bad_methods, bad_paths, bad_confirm) in [(vec!["G T"], vec![], vec![]), (vec![], vec!["repos"], vec![]), (vec![], vec![], vec!["PSOT"])] {
+            let strings = |items: Vec<&str>| items.into_iter().map(String::from).collect::<Vec<_>>();
+            let (m, p, c) = (strings(bad_methods), strings(bad_paths), strings(bad_confirm));
+            let rules = Rules { hosts: &hosts, query_params: &[], methods: &m, paths: &p, confirm: &c };
+            assert!(add(&store, &*MemoryLog::new(), &term(), &Registry::default(), "github", rules).is_err());
+        }
+        assert_eq!(store.changes.borrow().len(), 1, "a bad rule changes nothing");
+    }
+
+    #[test]
+    fn changing_rules_keeps_a_sign_in_but_a_new_value_replaces_it() {
+        let store = MemoryStore::new(VaultData::default());
+        add_simple(&store, &term(), &["api.example.com"]).unwrap();
+        let oauth = crate::vault::oauth::OAuth {
+            auth_url: "https://accounts.example.com/auth".into(),
+            token_url: "https://accounts.example.com/token".into(),
+            client_id: "fake-client".into(),
+            client_secret: None,
+            scopes: vec![],
+            auth_params: std::collections::BTreeMap::new(),
+            port: None,
+            cache_key: crate::vault::oauth::new_cache_key().unwrap(),
+        };
+        let signed = SecretEntry { oauth: Some(oauth), ..store.load().unwrap().get("stripe").unwrap().clone() };
+        store.save(&store.load().unwrap().with_secret("stripe", signed), "test").unwrap();
+
+        let keep = FakeTerminal::new("", true);
+        add_simple(&store, &keep, &["api.example.com", "files.example.com"]).unwrap();
+        assert!(keep.prompts.borrow()[0].contains("keep the current sign-in"), "{:?}", keep.prompts.borrow());
+        assert!(store.load().unwrap().get("stripe").unwrap().oauth.is_some());
+
+        add_simple(&store, &term(), &["api.example.com"]).unwrap();
+        assert!(store.load().unwrap().get("stripe").unwrap().oauth.is_none());
     }
 
     #[test]

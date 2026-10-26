@@ -16,8 +16,7 @@ use mlua::serde::SerializeOptions;
 use mlua::{Function, Lua, LuaSerdeExt, Value};
 
 use crate::command::registry::CommandDef;
-use crate::vault::VaultStore;
-use crate::vault::log::AuditLog;
+use crate::vault::Keys;
 use crate::vault::approval::Caller;
 
 pub fn ser_options() -> SerializeOptions {
@@ -52,12 +51,7 @@ fn seconds(secs: f64) -> Result<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
-pub fn run(
-    def: &CommandDef,
-    args: &serde_json::Value,
-    store: Box<dyn VaultStore>,
-    log: Box<dyn AuditLog>,
-) -> Result<serde_json::Value> {
+pub fn run(def: &CommandDef, args: &serde_json::Value, keys: Keys) -> Result<serde_json::Value> {
     let script = def.read_script()?;
     let lua = sandbox::new_lua()?;
     let budget = limits::Budget::for_command(&def.manifest.limits)?;
@@ -69,7 +63,7 @@ pub fn run(
     exec::install(&lua, perms.exec.clone(), perms.env.clone())?;
     fs::install(&lua, &Rc::new(fs::FsGuard::new(perms)))?;
     let caller = Caller::new(def, &script);
-    http::install(&lua, &Rc::new(http::HttpClient::new(perms, caller, store, log)))?;
+    http::install(&lua, &Rc::new(http::HttpClient::new(perms, caller, keys)))?;
     let entry = load_entry(&lua, def, &script, &budget)?;
     let result: Value = entry
         .call(lua.to_value_with(args, ser_options())?)
@@ -172,8 +166,12 @@ mod tests {
     #[expect(clippy::needless_pass_by_value, reason = "tests pass `json!(...)` values as they are")]
     fn run_script(script: &str, args: serde_json::Value) -> Result<serde_json::Value> {
         let (_tmp, def) = command(script);
-        let log = Box::new(crate::vault::log::MemoryLog::new());
-        run(&def, &args, Box::new(MemoryStore::new(VaultData::default())), log)
+        let keys = Keys {
+            store: Box::new(MemoryStore::new(VaultData::default())),
+            log: Box::new(crate::vault::log::MemoryLog::new()),
+            tokens: crate::vault::oauth::TokenCache { dir: std::env::temp_dir().join("toolbox-unused-token-cache") },
+        };
+        run(&def, &args, keys)
     }
 
     #[test]

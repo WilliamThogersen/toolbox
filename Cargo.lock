@@ -1828,6 +1828,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-local-authentication",
  "percent-encoding",
+ "ring",
  "rpassword",
  "semver",
  "serde",

@@ -122,9 +122,13 @@ fn vault_app() -> Command {
                 .about("Add a secret or change where it may go. Prompts for the value (empty keeps the current one), so a human must run it in a terminal")
                 .arg(key_name_arg())
                 .arg(host_arg())
-                .arg(query_param_arg()),
+                .arg(query_param_arg())
+                .arg(method_arg())
+                .arg(path_arg())
+                .arg(confirm_arg()),
         )
         .subcommand(vault_request_app())
+        .subcommand(vault_oauth_app())
         .subcommand(
             Command::new("setup")
                 .about("Add the keys agents asked for and allow the commands waiting for a key, with one Touch ID")
@@ -147,6 +151,8 @@ fn vault_request_app() -> Command {
         .arg(key_name_arg())
         .arg(host_arg())
         .arg(query_param_arg())
+        .arg(method_arg())
+        .arg(path_arg())
         .arg(
             Arg::new("why")
                 .long("why")
@@ -157,6 +163,41 @@ fn vault_request_app() -> Command {
             Arg::new("note")
                 .long("note")
                 .help("Shown to the user, like where to get the key: https://github.com/settings/tokens"),
+        )
+}
+
+fn vault_oauth_app() -> Command {
+    Command::new("oauth")
+        .about("Sign in on the provider's web page and keep a key that renews itself. Asks in a terminal, so a human must run it")
+        .arg(key_name_arg())
+        .arg(host_arg().required(false).help(
+            "Host the key may be sent to, e.g. gmail.googleapis.com (repeatable; signing in again keeps the current ones)",
+        ))
+        .arg(query_param_arg())
+        .arg(method_arg())
+        .arg(path_arg())
+        .arg(confirm_arg())
+        .arg(Arg::new("auth-url").long("auth-url").help("The provider's sign-in page, e.g. https://accounts.google.com/o/oauth2/v2/auth"))
+        .arg(Arg::new("token-url").long("token-url").help("Where the provider hands out tokens, e.g. https://oauth2.googleapis.com/token"))
+        .arg(Arg::new("client-id").long("client-id").help("Your OAuth app's client id. The client secret is asked for at a hidden prompt"))
+        .arg(
+            Arg::new("scope")
+                .long("scope")
+                .action(ArgAction::Append)
+                .value_delimiter(',')
+                .help("What the key may do, as the provider names it, e.g. https://www.googleapis.com/auth/gmail.send (repeatable)"),
+        )
+        .arg(
+            Arg::new("auth-param")
+                .long("auth-param")
+                .action(ArgAction::Append)
+                .help("Extra name=value for the sign-in page, e.g. access_type=offline (repeatable)"),
+        )
+        .arg(
+            Arg::new("port")
+                .long("port")
+                .value_parser(clap::value_parser!(u16).range(1..))
+                .help("Port the sign-in comes back to, for providers that need a fixed redirect URI (default: any free port)"),
         )
 }
 
@@ -178,6 +219,18 @@ fn vault_log_app() -> Command {
                 .value_parser(clap::value_parser!(usize))
                 .default_value("50")
                 .help("How many entries to show, newest first"),
+        )
+        .arg(
+            Arg::new("pretty")
+                .long("pretty")
+                .action(ArgAction::SetTrue)
+                .help("One readable line per entry, oldest first, for a person to read (not JSON)"),
+        )
+        .arg(
+            Arg::new("follow")
+                .long("follow")
+                .action(ArgAction::SetTrue)
+                .help("Keep watching and show new entries as they happen, one JSON object per line (readable lines with --pretty)"),
         )
 }
 
@@ -202,4 +255,28 @@ fn query_param_arg() -> Arg {
         .action(ArgAction::Append)
         .value_delimiter(',')
         .help("Query parameter it may also be sent in, e.g. key for ?key=... (repeatable)")
+}
+
+fn method_arg() -> Arg {
+    Arg::new("method")
+        .long("method")
+        .action(ArgAction::Append)
+        .value_delimiter(',')
+        .help("Only send it with these HTTP methods, e.g. GET,HEAD (default: any)")
+}
+
+fn path_arg() -> Arg {
+    Arg::new("path")
+        .long("path")
+        .action(ArgAction::Append)
+        .value_delimiter(',')
+        .help("Only send it to URL paths under these, e.g. /repos/acme (default: any)")
+}
+
+fn confirm_arg() -> Arg {
+    Arg::new("confirm")
+        .long("confirm")
+        .action(ArgAction::Append)
+        .value_delimiter(',')
+        .help("Ask for Touch ID before each request with it: all, writes (anything but GET, HEAD and OPTIONS), or methods like POST,DELETE")
 }

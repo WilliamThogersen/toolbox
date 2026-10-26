@@ -21,6 +21,8 @@ It is how I want APIs called and repeatable tasks done.
 - Missing key: run `tb self vault request <name> --host <host> --why "<what for>"`, then ask me to run
   `tb self vault setup`.
 - A command not allowed to use a key: the error says what to ask me to run.
+- A request I didn't confirm with Touch ID: don't retry it unless I ask.
+- An API that signs in with OAuth (Google, Microsoft, Slack): ask me to run `tb self vault oauth <name>` (see `tb self guide`).
 
 ## Installing
 - Before `tb self install <source> --yes`, show me the permissions it lists and wait for my OK.

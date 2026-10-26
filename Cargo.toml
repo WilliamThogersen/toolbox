@@ -16,6 +16,7 @@ hmac = "0.13"
 libc = "0.2.191"
 mlua = { version = "0.12", features = ["lua55", "vendored", "serde", "anyhow"] }
 percent-encoding = "2"
+ring = "0.17"
 rpassword = "7"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

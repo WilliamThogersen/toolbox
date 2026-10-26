@@ -8,7 +8,9 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::VaultStore;
+use super::commands::{add_flags, sorted};
 use super::hosts::{normalize_host, normalize_query_param};
+use super::scope::{normalize_method, normalize_path};
 use super::log::{AuditLog, Event};
 use super::names::{self, NAME_RULES, is_secret_name};
 use crate::cli::paths;
@@ -19,6 +21,8 @@ pub const REQUESTS_FILE: &str = "vault-requests.json";
 const MAX_REQUESTS: usize = 20;
 const MAX_HOSTS: usize = 5;
 const MAX_QUERY_PARAMS: usize = 5;
+const MAX_METHODS: usize = 5;
+const MAX_PATHS: usize = 5;
 const MAX_TEXT_LEN: usize = 200;
 
 pub fn default_path() -> Result<PathBuf> {
@@ -32,6 +36,10 @@ pub struct KeyRequest {
     pub hosts: Vec<String>,
     #[serde(default)]
     pub query_params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub methods: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
     pub why: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -53,13 +61,24 @@ impl KeyRequest {
             name: name.to_string(),
             hosts: hosts.into_iter().collect(),
             query_params: query_params.into_iter().collect(),
+            methods: Vec::new(),
+            paths: Vec::new(),
             why,
             note: note.filter(|note| !note.is_empty()),
         })
     }
 
+    pub fn limited_to(self, methods: &[String], paths: &[String]) -> Result<Self> {
+        let methods = sorted(methods, normalize_method)?;
+        let paths = sorted(paths, normalize_path)?;
+        ensure!(methods.len() <= MAX_METHODS, "a request may name at most {MAX_METHODS} methods");
+        ensure!(paths.len() <= MAX_PATHS, "a request may name at most {MAX_PATHS} paths");
+        Ok(Self { methods, paths, ..self })
+    }
+
     fn checked(&self) -> Result<Self> {
-        Self::new(&self.name, &self.hosts, &self.query_params, &self.why, self.note.as_deref())
+        Self::new(&self.name, &self.hosts, &self.query_params, &self.why, self.note.as_deref())?
+            .limited_to(&self.methods, &self.paths)
     }
 }
 
@@ -143,6 +162,8 @@ pub struct Requested {
     pub requested: String,
     pub hosts: Vec<String>,
     pub query_params: Vec<String>,
+    pub methods: Vec<String>,
+    pub paths: Vec<String>,
     pub why: String,
     pub used_by: Vec<String>,
     pub next: String,
@@ -156,9 +177,10 @@ pub fn request(
     wanted: KeyRequest,
 ) -> Result<Requested> {
     let name = wanted.name.clone();
-    if store.load()?.get(&name).is_some() {
+    if let Some(existing) = store.load()?.get(&name) {
         bail!(
-            "{name:?} is already in the vault. If it needs other hosts, ask the user to run `tb self vault add {name} --host <host>` in their own terminal"
+            "{name:?} is already in the vault. If it needs other hosts or rules, ask the user to run `tb self vault add {name} {}` in their own terminal, with what should change, and to leave the value empty",
+            add_flags(existing)
         );
     }
     let waiting = load(path)?.requests;
@@ -184,6 +206,8 @@ pub fn request(
         requested: name,
         hosts: wanted.hosts,
         query_params: wanted.query_params,
+        methods: wanted.methods,
+        paths: wanted.paths,
         why: wanted.why,
         used_by,
         next: "Ask the user to run `tb self vault setup` in their own terminal. It asks them for the key and lets them review the commands that use it".to_string(),
@@ -240,6 +264,24 @@ mod tests {
         assert_eq!((req.why.as_str(), req.note.as_deref()), ("Get it at x.com", Some("Get it at x.com")), "spaces can't fake extra lines");
         let danish = KeyRequest::new("ok", &hosts, &[], "Hent nøglen på x.com", None).unwrap();
         assert_eq!(danish.why, "Hent nøglen på x.com");
+    }
+
+    #[test]
+    fn requests_may_ask_for_a_narrow_key() {
+        let req = wanted("maps").limited_to(&strings(&["get", "GET", "head"]), &strings(&["/v1/geocode/"])).unwrap();
+        assert_eq!((req.methods.as_slice(), req.paths.as_slice()), (&strings(&["GET", "HEAD"])[..], &strings(&["/v1/geocode"])[..]));
+        assert!(wanted("maps").limited_to(&strings(&["G ET"]), &[]).is_err());
+        assert!(wanted("maps").limited_to(&[], &strings(&["/a/../b"])).is_err());
+        assert!(wanted("maps").limited_to(&strings(&["A", "B", "C", "D", "E", "F"]), &[]).is_err());
+        let paths: Vec<String> = (0..=MAX_PATHS).map(|i| format!("/p{i}")).collect();
+        assert!(wanted("maps").limited_to(&[], &paths).is_err());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(REQUESTS_FILE);
+        save(&path, std::slice::from_ref(&req)).unwrap();
+        assert_eq!(load(&path).unwrap().requests, vec![req]);
+        fs::write(&path, r#"{"requests":[{"name":"maps","hosts":["x.com"],"why":"x","paths":["/a/../b"]}]}"#).unwrap();
+        assert_eq!(load(&path).unwrap().ignored, 1, "a bad path in the file is checked again");
     }
 
     #[test]
@@ -308,12 +350,7 @@ mod tests {
     fn request_refuses_keys_already_in_the_vault_and_too_many_requests() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(REQUESTS_FILE);
-        let entry = SecretEntry {
-            value: SecretValue::new("fake_token_abcdefgh".into()).unwrap(),
-            hosts: strings(&["api.example.com"]),
-            query_params: vec![],
-            commands: std::collections::BTreeMap::default(),
-        };
+        let entry = SecretEntry::new(SecretValue::new("fake_token_abcdefgh".into()).unwrap(), strings(&["api.example.com"]));
         let store = MemoryStore::new(VaultData::default().with_secret("maps", entry));
         let none = Registry::default();
         let err = request(&store, &*MemoryLog::new(), &none, &path, wanted("maps")).unwrap_err().to_string();

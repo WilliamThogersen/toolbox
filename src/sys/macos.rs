@@ -1,6 +1,5 @@
 use std::sync::mpsc;
 
-use anyhow::{Result, anyhow};
 use block2::RcBlock;
 use objc2::runtime::Bool;
 use objc2_foundation::{NSError, NSString};
@@ -33,7 +32,7 @@ fn text(chars: &[libc::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-pub fn confirm_presence(reason: &str) -> Result<()> {
+pub fn confirm_presence(reason: &str) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let reply = RcBlock::new(move |ok: Bool, error: *mut NSError| {
         let answer = if ok.as_bool() { Ok(()) } else { Err(describe(error)) };
@@ -47,14 +46,9 @@ pub fn confirm_presence(reason: &str) -> Result<()> {
     unsafe { context.evaluatePolicy_localizedReason_reply(LAPolicy::DeviceOwnerAuthentication, &reason, &reply) };
     let answer = rx
         .recv()
-        .map_err(|_| anyhow!("macOS closed the Touch ID check without an answer. Nothing changed"))?;
+        .map_err(|_| "macOS closed the Touch ID check without an answer".to_string())?;
     drop(context);
-    answer.map_err(|why| {
-        anyhow!(
-            "macOS did not confirm it is you ({why}). Nothing changed. Vault changes need Touch ID or your \
-             password on this Mac itself, so they don't work over SSH"
-        )
-    })
+    answer
 }
 
 fn describe(error: *mut NSError) -> String {
