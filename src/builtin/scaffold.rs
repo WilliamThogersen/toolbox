@@ -46,6 +46,7 @@ pub fn create(commands_dir: &Path, name: &str, description: &str) -> Result<Crea
         )]),
         permissions: Permissions::default(),
         limits: Limits::default(),
+        subcommands: BTreeMap::new(),
     };
     fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
     let manifest_path = dir.join(MANIFEST_FILE);

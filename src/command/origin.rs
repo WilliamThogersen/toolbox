@@ -6,10 +6,11 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::command::registry::{MANIFEST_FILE, SCRIPT_FILE};
+use crate::command::manifest::Manifest;
+use crate::command::registry::MANIFEST_FILE;
+use crate::command::sources::Sources;
 use crate::install::source::{self, Source};
 use crate::vault;
-use crate::vault::approval::fingerprint;
 
 pub const CREATED_FILE: &str = ".created.json";
 pub const MAX_RECORD_BYTES: u64 = 64 << 10;
@@ -52,11 +53,10 @@ fn edited(source: &Source, command_dir: &Path) -> Option<bool> {
 }
 
 pub fn files_fingerprint(command_dir: &Path) -> Result<String> {
-    let read = |file| {
-        read_plain(&command_dir.join(file), MAX_COMMAND_FILE_BYTES)?
-            .with_context(|| format!("{} has no {file}", command_dir.display()))
-    };
-    Ok(fingerprint(&read(MANIFEST_FILE)?, &read(SCRIPT_FILE)?))
+    let manifest = read_plain(&command_dir.join(MANIFEST_FILE), MAX_COMMAND_FILE_BYTES)?
+        .with_context(|| format!("{} has no {MANIFEST_FILE}", command_dir.display()))?;
+    let parsed = Manifest::parse(&manifest)?;
+    Ok(Sources::read_in(command_dir, &parsed)?.fingerprint(&manifest))
 }
 
 pub fn record_created(command_dir: &Path) -> Result<()> {
@@ -102,10 +102,11 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    use crate::command::registry::SCRIPT_FILE;
 
     fn command_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(MANIFEST_FILE), "{}").unwrap();
+        fs::write(dir.path().join(MANIFEST_FILE), r#"{"name":"t","description":"t"}"#).unwrap();
         fs::write(dir.path().join(SCRIPT_FILE), "return function() end").unwrap();
         dir
     }
@@ -146,6 +147,18 @@ mod tests {
         assert_eq!(origin(dir.path()), Origin::Installed { source: source.clone(), edited: Some(true) });
 
         fs::remove_file(dir.path().join(SCRIPT_FILE)).unwrap();
+        assert_eq!(origin(dir.path()), Origin::Installed { source, edited: Some(true) });
+    }
+
+    #[test]
+    fn a_new_or_edited_lib_file_counts_as_an_edit() {
+        let dir = command_dir();
+        let source = installed_from(dir.path(), Some(files_fingerprint(dir.path()).unwrap()));
+        fs::create_dir(dir.path().join("lib")).unwrap();
+        fs::write(dir.path().join("lib/notes.txt"), "not Lua").unwrap();
+        assert_eq!(origin(dir.path()), Origin::Installed { source: source.clone(), edited: Some(false) });
+
+        fs::write(dir.path().join("lib/store.lua"), "return {}").unwrap();
         assert_eq!(origin(dir.path()), Origin::Installed { source, edited: Some(true) });
     }
 

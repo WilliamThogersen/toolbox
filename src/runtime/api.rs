@@ -1,18 +1,26 @@
 use std::io::{self, IsTerminal};
 
-use mlua::{Lua, LuaSerdeExt, Result, Value, Variadic};
+use mlua::{Lua, LuaSerdeExt, LuaString, Result, Value, Variadic};
 
 use super::{lua_error, read_capped, ser_options};
+use crate::cli::screen::printable;
 use crate::command::manifest::Permissions;
 use crate::vault::inject::{Encoding, placeholder};
 use crate::vault::names::{self, NAME_RULES};
 
 pub fn install(lua: &Lua, perms: &Permissions) -> Result<()> {
     install_json(lua)?;
+    install_yaml(lua)?;
     install_log(lua)?;
     install_env(lua, perms.env.clone())?;
     install_vault(lua, perms.vault.clone())?;
     install_stdin(lua)
+}
+
+const MAX_YAML_BYTES: usize = 4 << 20;
+
+pub fn needs_flag(flag: &str, what: &str) -> mlua::Error {
+    mlua::Error::runtime(format!("{what} needs \"{flag}\": true in this command's permissions"))
 }
 
 pub fn denied(kind: &str, what: &str) -> mlua::Error {
@@ -42,13 +50,40 @@ fn install_json(lua: &Lua) -> Result<()> {
     lua.globals().set("json", json)
 }
 
+fn install_yaml(lua: &Lua) -> Result<()> {
+    let yaml = lua.create_table()?;
+    yaml.set(
+        "encode",
+        lua.create_function(|lua, value: Value| {
+            let value: serde_json::Value = lua.from_value(value)?;
+            serde_norway::to_string(&value).map_err(mlua::Error::external)
+        })?,
+    )?;
+    yaml.set(
+        "decode",
+        lua.create_function(|lua, text: LuaString| {
+            if text.as_bytes().len() > MAX_YAML_BYTES {
+                return Err(mlua::Error::runtime(format!("yaml.decode takes at most {} MB", MAX_YAML_BYTES >> 20)));
+            }
+            let value: serde_norway::Value = serde_norway::from_slice(&text.as_bytes()).map_err(mlua::Error::external)?;
+            lua.to_value_with(&value, ser_options())
+        })?,
+    )?;
+    lua.globals().set("yaml", yaml)
+}
+
 fn install_log(lua: &Lua) -> Result<()> {
     let log = lua.create_function(|_, values: Variadic<Value>| {
         let parts = values
             .iter()
             .map(mlua::Value::to_string)
             .collect::<Result<Vec<_>>>()?;
-        eprintln!("{}", parts.join("\t"));
+        let line = parts.join("\t");
+        if io::stderr().is_terminal() {
+            eprintln!("{}", printable(&line));
+        } else {
+            eprintln!("{line}");
+        }
         Ok(())
     })?;
     lua.globals().set("print", log.clone())?;
@@ -131,6 +166,36 @@ mod tests {
             .eval()
             .unwrap();
         assert!(ok);
+    }
+
+    #[test]
+    fn yaml_round_trip() {
+        let lua = lua_with(Permissions::default());
+        let ok: bool = lua
+            .load(r#"
+                local v = yaml.decode("name: shop\nphp_version: '8.3'\nports: [80, 443]\nhooks:\n  post-start: ~\nweb:\n  env: { A: 1 }\n")
+                local back = yaml.decode(yaml.encode(v))
+                return v.name == "shop" and v.php_version == "8.3" and v.ports[2] == 443
+                   and v.hooks["post-start"] == nil and v.web.env.A == 1 and back.web.env.A == 1
+            "#)
+            .eval()
+            .unwrap();
+        assert!(ok);
+        let text: String = lua.load(r#"return yaml.encode({ name = "shop", list = { "a", "b" } })"#).eval().unwrap();
+        assert_eq!(text, "list:\n- a\n- b\nname: shop\n");
+    }
+
+    #[test]
+    fn yaml_bombs_and_bad_yaml_are_errors() {
+        let lua = lua_with(Permissions::default());
+        let bomb = (1..=9).fold("a0: &a0 [x, x, x, x, x, x, x, x, x]".to_string(), |text, n| {
+            format!("{text}\na{n}: &a{n} [*a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}, *a{p}]", p = n - 1)
+        });
+        lua.globals().set("bomb", bomb).unwrap();
+        assert!(eval_err(&lua, "yaml.decode(bomb)").contains("repetition limit"), "{}", eval_err(&lua, "yaml.decode(bomb)"));
+        assert!(!eval_err(&lua, r#"yaml.decode("a: [")"#).is_empty());
+        let huge = eval_err(&lua, &format!("yaml.decode(string.rep('x', {}))", MAX_YAML_BYTES + 1));
+        assert!(huge.contains("at most 4 MB"), "{huge}");
     }
 
     #[test]

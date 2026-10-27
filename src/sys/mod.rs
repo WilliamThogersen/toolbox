@@ -84,6 +84,41 @@ extern "C" fn on_termination(signal: libc::c_int) {
     unsafe { libc::raise(signal) };
 }
 
+pub struct InterruptsIgnored {
+    saved: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl InterruptsIgnored {
+    pub fn new() -> Self {
+        let saved = [libc::SIGINT, libc::SIGQUIT]
+            .into_iter()
+            .filter_map(|signal| ignore(signal).map(|old| (signal, old)))
+            .collect();
+        Self { saved }
+    }
+}
+
+fn ignore(signal: libc::c_int) -> Option<libc::sigaction> {
+    // SAFETY: sigaction is plain C data, for which all zeroes is a valid value.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = libc::SIG_IGN;
+    // SAFETY: as above.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: both point to complete sigactions that outlive the call.
+    let status = unsafe { libc::sigaction(signal, &raw const action, &raw mut old) };
+    (status == 0).then_some(old)
+}
+
+impl Drop for InterruptsIgnored {
+    fn drop(&mut self) {
+        for (signal, old) in &self.saved {
+            // SAFETY: `old` is the complete sigaction saved by `ignore`, and a null old
+            // action is allowed.
+            unsafe { libc::sigaction(*signal, old, std::ptr::null_mut()) };
+        }
+    }
+}
+
 pub fn start_new_session(command: &mut Command) {
     let detach = || {
         // SAFETY: setsid takes no arguments and touches no memory.

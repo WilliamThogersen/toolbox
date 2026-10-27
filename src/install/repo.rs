@@ -148,8 +148,8 @@ fn load_checked(dir: &Path, folder: Option<&str>) -> std::result::Result<Command
         None => root_name(dir).unwrap_or_else(|| ROOT_LABEL.to_string()),
     };
     let def = registry::load_command(dir, &name)?;
-    let script = folder.map_or(SCRIPT_FILE.to_string(), |f| format!("{f}/{SCRIPT_FILE}"));
-    runtime::check_syntax_as(&def, &script).map_err(|err| vec![problem(format!("{err:#}"))])?;
+    let prefix = folder.map_or(String::new(), |f| format!("{f}/"));
+    runtime::check_syntax_as(&def, &prefix).map_err(|err| vec![problem(format!("{err:#}"))])?;
     Ok(def)
 }
 

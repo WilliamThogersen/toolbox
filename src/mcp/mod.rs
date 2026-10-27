@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use lines::{Line, MAX_MESSAGE_BYTES, read_line};
 use running::Running;
+pub use tools::clashes;
 
 const PROTOCOL_VERSIONS: &[&str] = &[LATEST_PROTOCOL, "2025-06-18", "2024-11-05"];
 const LATEST_PROTOCOL: &str = "2025-11-25";

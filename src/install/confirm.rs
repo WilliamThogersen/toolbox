@@ -53,12 +53,20 @@ pub fn permissions(perms: &Permissions) -> String {
     .into_iter()
     .filter(|(_, values)| !values.is_empty())
     .map(|(kind, values)| format!("{kind}: {}", values.join(", ")))
+    .chain(flags(perms))
     .collect();
     if parts.is_empty() {
         "no permissions".to_string()
     } else {
         parts.join("; ")
     }
+}
+
+fn flags(perms: &Permissions) -> impl Iterator<Item = String> {
+    [("terminal", perms.terminal), ("background", perms.background)]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(flag, _)| flag.to_string())
 }
 
 pub fn warnings(perms: &Permissions) -> Vec<String> {
@@ -90,6 +98,12 @@ pub fn warnings(perms: &Permissions) -> Vec<String> {
             perms.write.join(", ")
         ));
     }
+    if perms.terminal {
+        lines.push("terminal asks you questions and can hand your terminal to the programs it runs".to_string());
+    }
+    if perms.background {
+        lines.push("background starts programs that keep running after the command ends".to_string());
+    }
     lines
 }
 
@@ -115,8 +129,12 @@ mod tests {
             env: vec!["AWS_SECRET_ACCESS_KEY".into()],
             read: vec!["~/notes".into()],
             write: vec![".".into()],
+            terminal: true,
+            background: true,
         };
         let text = warnings(&risky).join("\n");
+        assert!(text.contains("terminal asks you questions"), "{text}");
+        assert!(text.contains("background starts programs that keep running"), "{text}");
         assert!(text.contains("exec runs git") && text.contains("full access"), "{text}");
         assert!(text.contains("any host"), "{text}");
         assert!(text.contains("env reads AWS_SECRET_ACCESS_KEY"), "{text}");
@@ -134,5 +152,7 @@ mod tests {
             ..Permissions::default()
         };
         assert_eq!(permissions(&perms), "http: api.github.com, github.com; vault: github");
+        let talks = Permissions { exec: vec!["ssh".into()], terminal: true, background: true, ..Permissions::default() };
+        assert_eq!(permissions(&talks), "exec: ssh; terminal; background");
     }
 }

@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
@@ -18,8 +19,8 @@ enum Access {
 }
 
 pub struct FsGuard {
-    read: Vec<String>,
-    write: Vec<String>,
+    read: Vec<Root>,
+    write: Vec<Root>,
 }
 
 struct Root {
@@ -37,26 +38,18 @@ struct Entry {
 
 impl FsGuard {
     pub fn new(perms: &Permissions) -> Self {
+        let readable: Vec<String> = perms.read.iter().chain(&perms.write).cloned().collect();
         Self {
-            read: perms.read.iter().chain(&perms.write).cloned().collect(),
-            write: perms.write.clone(),
+            read: resolved(&readable),
+            write: resolved(&perms.write),
         }
     }
 
-    fn roots(&self, access: Access) -> (&'static str, Vec<Root>) {
-        let (kind, folders) = match access {
+    fn roots(&self, access: Access) -> (&'static str, &[Root]) {
+        match access {
             Access::Read => ("read", &self.read),
             Access::Write => ("write", &self.write),
-        };
-        let roots = folders
-            .iter()
-            .filter_map(|folder| {
-                let absolute = absolute(folder).ok()?;
-                let real = real(&absolute).ok()?;
-                Some(Root { absolute, real })
-            })
-            .collect();
-        (kind, roots)
+        }
     }
 
     fn check(&self, raw: &str, access: Access) -> Result<PathBuf> {
@@ -87,7 +80,7 @@ impl FsGuard {
         let path = absolute(raw)?;
         match resolve(&path) {
             Ok(resolved) if roots.iter().any(|root| resolved.starts_with(&root.real)) => Ok(resolved),
-            Err(e) if written_inside(&path, &roots) => Err(e),
+            Err(e) if written_inside(&path, roots) => Err(e),
             _ => Err(denied()),
         }
     }
@@ -144,13 +137,51 @@ impl FsGuard {
         fs::create_dir_all(&path).with_context(|| format!("could not create {raw:?}"))
     }
 
-    fn remove(&self, raw: &str) -> Result<()> {
+    fn copy(&self, from: &str, to: &str) -> Result<()> {
+        let source = self.check(from, Access::Read)?;
+        let meta = fs::metadata(&source).with_context(|| format!("could not copy {from:?}"))?;
+        ensure!(meta.is_file(), "{from:?} is not a file: fs.copy copies one file");
+        let target = self.check(to, Access::Write)?;
+        ensure!(!target.is_dir(), "{to:?} is a folder: name the file to copy to");
+        let same = fs::metadata(&target).is_ok_and(|there| there.dev() == meta.dev() && there.ino() == meta.ino());
+        ensure!(!same, "{from:?} and {to:?} are the same file");
+        fs::copy(&source, &target).with_context(|| format!("could not copy {from:?} to {to:?}"))?;
+        Ok(())
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let source = self.movable(from, "moved")?;
+        let target = self.check_entry(to, Access::Write)?;
+        let (_, roots) = self.roots(Access::Write);
+        let holds_root = |path: &Path| roots.iter().any(|root| root.real.starts_with(path));
+        ensure!(
+            !holds_root(&source) && !holds_root(&target),
+            "fs.move can't move a folder that holds one listed in permissions.write, or put anything in a listed folder's place"
+        );
+        fs::rename(&source, &target).with_context(|| format!("could not move {from:?} to {to:?} (both must be on the same disk)"))
+    }
+
+    fn chmod(&self, raw: &str, mode: &str) -> Result<()> {
+        let path = self.check(raw, Access::Write)?;
+        let bits = u32::from_str_radix(mode, 8)
+            .ok()
+            .filter(|bits| (3..=4).contains(&mode.len()) && *bits <= 0o777)
+            .ok_or_else(|| anyhow!("mode {mode:?} must be octal like \"755\" or \"0644\", without setuid, setgid or sticky bits"))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(bits)).with_context(|| format!("could not change the mode of {raw:?}"))
+    }
+
+    fn movable(&self, raw: &str, done: &str) -> Result<PathBuf> {
         let path = self.check_entry(raw, Access::Write)?;
         let (_, roots) = self.roots(Access::Write);
         ensure!(
             !roots.iter().any(|root| root.real == path),
-            "{raw:?} is a folder listed in this command's permissions.write, so it can't be removed"
+            "{raw:?} is a folder listed in this command's permissions.write, so it can't be {done}"
         );
+        Ok(path)
+    }
+
+    fn remove(&self, raw: &str) -> Result<()> {
+        let path = self.movable(raw, "removed")?;
         let meta = fs::symlink_metadata(&path).with_context(|| format!("could not remove {raw:?}"))?;
         if meta.is_dir() {
             fs::remove_dir(&path)
@@ -159,6 +190,17 @@ impl FsGuard {
             fs::remove_file(&path).with_context(|| format!("could not remove {raw:?}"))
         }
     }
+}
+
+fn resolved(folders: &[String]) -> Vec<Root> {
+    folders
+        .iter()
+        .filter_map(|folder| {
+            let absolute = absolute(folder).ok()?;
+            let real = real(&absolute).ok()?;
+            Some(Root { absolute, real })
+        })
+        .collect()
 }
 
 fn written_inside(path: &Path, roots: &[Root]) -> bool {
@@ -247,6 +289,9 @@ pub fn install(lua: &Lua, guard: &Rc<FsGuard>) -> mlua::Result<()> {
     table.set("exists", bind(lua, guard, |_, g, path: String| g.exists(&path))?)?;
     table.set("mkdir", bind(lua, guard, |_, g, path: String| g.mkdir(&path))?)?;
     table.set("remove", bind(lua, guard, |_, g, path: String| g.remove(&path))?)?;
+    table.set("copy", bind(lua, guard, |_, g, (from, to): (String, String)| g.copy(&from, &to))?)?;
+    table.set("move", bind(lua, guard, |_, g, (from, to): (String, String)| g.rename(&from, &to))?)?;
+    table.set("chmod", bind(lua, guard, |_, g, (path, mode): (String, String)| g.chmod(&path, &mode))?)?;
     lua.globals().set("fs", table)
 }
 
@@ -325,6 +370,73 @@ mod tests {
         assert_eq!(fs::read_to_string(s.path("allowed/sub/out.txt")).unwrap(), "one two");
         let back: String = s.eval(r#"return fs.read(root .. "/allowed/sub/out.txt")"#);
         assert_eq!(back, "one two");
+    }
+
+    #[test]
+    fn copies_moves_and_changes_modes_inside_allowed_folders() {
+        let s = Setup::new();
+        s.lua
+            .load(r#"
+                fs.copy(root .. "/readonly/notes.txt", root .. "/allowed/copy.txt")
+                fs.move(root .. "/allowed/copy.txt", root .. "/allowed/moved.txt")
+                fs.chmod(root .. "/allowed/moved.txt", "750")
+            "#)
+            .exec()
+            .unwrap();
+        assert!(!s.path("allowed/copy.txt").exists());
+        assert_eq!(fs::read_to_string(s.path("allowed/moved.txt")).unwrap(), "read me");
+        assert_eq!(fs::metadata(s.path("allowed/moved.txt")).unwrap().permissions().mode() & 0o7777, 0o750);
+
+        for (code, says) in [
+            (r#"fs.copy(root .. "/outside/secret.txt", root .. "/allowed/x")"#, "permissions.read"),
+            (r#"fs.copy(root .. "/readonly/notes.txt", root .. "/readonly/x")"#, "permissions.write"),
+            (r#"fs.copy(root .. "/readonly", root .. "/allowed/x")"#, "fs.copy copies one file"),
+            (r#"fs.copy(root .. "/readonly/notes.txt", root .. "/allowed")"#, "is a folder"),
+            (r#"fs.move(root .. "/readonly/notes.txt", root .. "/allowed/x")"#, "permissions.write"),
+            (r#"fs.move(root .. "/allowed/moved.txt", root .. "/outside/x")"#, "permissions.write"),
+            (r#"fs.move(root .. "/allowed", root .. "/allowed2")"#, "can't be moved"),
+            (r#"fs.chmod(root .. "/readonly/notes.txt", "644")"#, "permissions.write"),
+            (r#"fs.chmod(root .. "/allowed/moved.txt", "4755")"#, "without setuid"),
+            (r#"fs.chmod(root .. "/allowed/moved.txt", "rwx")"#, "must be octal"),
+            (r#"fs.chmod(root .. "/allowed/moved.txt", "7")"#, "must be octal"),
+        ] {
+            let err = s.err(code);
+            assert!(err.contains(says), "{code}: {err}");
+        }
+        assert_eq!(fs::read_to_string(s.path("outside/secret.txt")).unwrap(), "private");
+    }
+
+    #[test]
+    fn a_move_cannot_turn_an_allowed_folder_into_a_link_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for sub in ["proj", "outside", "cache"] {
+            fs::create_dir(root.join(sub)).unwrap();
+        }
+        fs::write(root.join("outside/secret.txt"), "private").unwrap();
+        symlink("../outside", root.join("proj/link")).unwrap();
+        let perms = Permissions {
+            write: vec![root.join("proj").display().to_string(), root.join("cache/tool").display().to_string()],
+            ..Permissions::default()
+        };
+        let lua = new_lua().unwrap();
+        install(&lua, &Rc::new(FsGuard::new(&perms))).unwrap();
+        lua.globals().set("root", root.display().to_string()).unwrap();
+
+        let err = lua.load(r#"fs.move(root .. "/proj/link", root .. "/cache/tool")"#).exec().unwrap_err().to_string();
+        assert!(err.contains("in a listed folder's place"), "{err}");
+        symlink("../outside", root.join("cache/tool")).unwrap();
+        let err = lua.load(r#"return fs.read(root .. "/cache/tool/secret.txt")"#).exec().unwrap_err().to_string();
+        assert!(err.contains("permissions.read"), "an allowed folder swapped for a link mid-run still counts: {err}");
+    }
+
+    #[test]
+    fn copying_a_file_onto_itself_keeps_it() {
+        let s = Setup::new();
+        fs::write(s.path("allowed/a.txt"), "keep").unwrap();
+        let err = s.err(r#"fs.copy(root .. "/allowed/a.txt", root .. "/allowed/./a.txt")"#);
+        assert!(err.contains("are the same file"), "{err}");
+        assert_eq!(fs::read_to_string(s.path("allowed/a.txt")).unwrap(), "keep");
     }
 
     #[test]

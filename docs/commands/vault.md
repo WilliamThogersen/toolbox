@@ -101,7 +101,7 @@ Everything waiting for you, in one go:
 
 Nothing is saved until the end, so `Ctrl-C` changes nothing. Then one Touch ID covers every key added and every
 command allowed. The dialog names each change, starting with commands that get a key you already had. When you go
-through everything, a command whose `run.lua` can't be read is skipped with a note on stderr.
+through everything, a command whose Lua files can't be read is skipped with a note on stderr.
 
 | Argument | Meaning |
 |----------|---------|
@@ -299,7 +299,7 @@ Each key's rules and the commands that use it. Never values.
 | `access` | Meaning |
 |----------|---------|
 | `allowed` | You allowed it and it hasn't changed. |
-| `changed` | You allowed it, but its `command.json` or `run.lua` changed since. Allow it again after reading the changes. |
+| `changed` | You allowed it, but its `command.json` or a Lua file changed since. Allow it again after reading the changes. |
 | `not_allowed` | It lists the key in `permissions.vault`, but you never allowed it. |
 | `missing` | You allowed it, but it's gone or broken. |
 
@@ -311,6 +311,10 @@ Lets a command use a key. It shows the command's permissions, where the key may 
 that reaches outside the script, with line numbers: calls to `http`, `exec`, `fs`, `env`, `stdin` and `vault`, and
 URLs. Answer `v` to read the whole script in a pager, then `y` or `n`. Once allowed, the command can do anything the
 key allows on those hosts.
+
+A command with [subcommands or `lib/` files](../writing-commands.md#subcommands-and-shared-code) is allowed as a
+whole: the screen covers all its Lua files, shows the permissions of every subcommand together, and puts the file
+before each line number (`lib/api.lua:3`).
 
 ```
 lighthouse wants to use your key pagespeed

@@ -34,7 +34,9 @@ tb self describe [--origin]
 }
 ```
 
-- `commands`: each manifest exactly as `command.json` defines it.
+- `commands`: each manifest exactly as `command.json` defines it. A command with
+  [subcommands](../writing-commands.md#subcommands-and-shared-code) has a `subcommands` map instead of top-level
+  `args`: run one as `tb <command> <subcommand> --<arg> <value>`.
 - `broken`: commands that failed to load. Lua syntax isn't checked here: use [`tb self check`](check.md) for that.
 - `commands_dir`: where command folders live. Set `TOOLBOX_HOME` to move it.
 
@@ -64,7 +66,7 @@ With `--origin`, the output also has `origins`, one entry per command folder (br
 
 | `kind` | Meaning |
 |--------|---------|
-| `installed` | Has a `.source.json` from [`tb self install`](install.md): `url`, `ref` (when installed with `--ref`), `commit`, and `market` when installed through a [marketplace](market.md). `edited` is `true` when `command.json` or `run.lua` no longer match what was installed, and `null` for installs from toolbox 0.8.0 and older, which kept no fingerprint. |
+| `installed` | Has a `.source.json` from [`tb self install`](install.md): `url`, `ref` (when installed with `--ref`), `commit`, and `market` when installed through a [marketplace](market.md). `edited` is `true` when `command.json` or a Lua file no longer match what was installed, and `null` for installs from toolbox 0.8.0 and older, which kept no fingerprint. |
 | `created` | Made with [`tb self new`](new.md), which writes `.created.json`: when, the programs that ran `tb` (the same chain as the [key log](vault.md#tb-self-vault-log)), and whether a terminal was attached. An AI agent's shell usually has none. |
 | `unknown` | Neither file: the folder was made by hand, or by a toolbox older than 0.9.0. |
 | `unreadable` | A record exists but can't be used (`problem` says why): broken JSON, not a plain file, or over 64 KB. |

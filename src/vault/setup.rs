@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use super::approval::{self, fingerprint};
+use super::approval;
 use super::commands::{Terminal, destination, find_command};
 use super::hosts::{local_note, normalize_host, normalize_query_param};
 use super::scope::{normalize_method, normalize_path};
@@ -13,6 +13,7 @@ use super::names::{self, is_secret_name};
 use super::requests::{self, KeyRequest};
 use super::{SecretEntry, SecretValue, VaultData, VaultStore};
 use crate::command::registry::{CommandDef, Registry};
+use crate::command::sources::Sources;
 use crate::cli::screen::{one_line, printable};
 
 const MAX_TRIES: usize = 3;
@@ -161,27 +162,25 @@ fn keys_to_add(vault: &VaultData, waiting: &[KeyRequest], only: Option<&CommandD
     let requested = waiting
         .iter()
         .filter(|req| vault.get(&req.name).is_none())
-        .filter(|req| only.is_none_or(|def| names::declared(&def.manifest.permissions.vault, &req.name)))
+        .filter(|req| only.is_none_or(|def| names::declared(&def.manifest.all_permissions().vault, &req.name)))
         .map(|req| NewKey { request: req.clone(), requested: true, calls: Vec::new() });
     let unrequested = only.into_iter().flat_map(move |def| {
-        let calls: Vec<String> = def
-            .manifest
-            .permissions
+        let perms = def.manifest.all_permissions();
+        let calls: Vec<String> = perms
             .http
             .iter()
             .filter_map(|host| normalize_host(host).ok())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        def.manifest
-            .permissions
+        perms
             .vault
-            .iter()
+            .into_iter()
             .filter(move |name| is_secret_name(name) && vault.get(name).is_none())
-            .filter(move |name| !waiting.iter().any(|req| &req.name == *name))
+            .filter(move |name| !waiting.iter().any(|req| req.name == *name))
             .map(move |name| NewKey {
                 request: KeyRequest {
-                    name: name.clone(),
+                    name,
                     hosts: if calls.len() == 1 { calls.clone() } else { Vec::new() },
                     query_params: Vec::new(),
                     methods: Vec::new(),
@@ -201,7 +200,7 @@ fn ask_new_key(term: &dyn Terminal, registry: &Registry, key: &NewKey) -> Result
     let users: Vec<&str> = registry
         .commands
         .iter()
-        .filter(|def| names::declared(&def.manifest.permissions.vault, &req.name))
+        .filter(|def| names::declared(&def.manifest.all_permissions().vault, &req.name))
         .map(|def| def.manifest.name.as_str())
         .collect();
     let header = [
@@ -287,19 +286,19 @@ fn review_command(
     new_names: &BTreeSet<&str>,
     named: bool,
 ) -> Result<Vec<Decision>> {
-    let declared = &def.manifest.permissions.vault;
+    let declared = &def.manifest.all_permissions().vault;
     if !vault.secrets.keys().any(|key| names::declared(declared, key)) {
         return Ok(Vec::new());
     }
-    let script = match def.read_script() {
-        Ok(script) => script,
+    let sources = match Sources::read(def) {
+        Ok(sources) => sources,
         Err(err) if !named => {
             eprintln!("toolbox: skipped {}: {err:#}", def.manifest.name);
             return Ok(Vec::new());
         }
         Err(err) => return Err(err),
     };
-    let fingerprint = fingerprint(&def.manifest_source, &script);
+    let fingerprint = sources.fingerprint(&def.manifest_source);
     let command = &def.manifest.name;
     let waiting: Vec<(&str, &SecretEntry)> = vault
         .secrets
@@ -314,7 +313,7 @@ fn review_command(
     let Some(((first, _), rest)) = waiting.split_first() else {
         return Ok(Vec::new());
     };
-    let review = approval::review(def, &script, &waiting);
+    let review = approval::review(def, &sources, &waiting);
     term.show("")?;
     let first_answer = term.review(&review.summary, &review.full, &review.question)?;
     let answers = rest

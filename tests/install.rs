@@ -104,6 +104,18 @@ impl Repo {
         fs::write(dir.join("run.lua"), script).unwrap();
     }
 
+    /// Writes `<folder>/command.json` and each `(path, text)` inside `<folder>`.
+    fn write_files(&self, folder: &str, manifest: Value, files: &[(&str, &str)]) {
+        let dir = self.dir.path().join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("command.json"), manifest.to_string()).unwrap();
+        for (path, text) in files {
+            let file = dir.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, text).unwrap();
+        }
+    }
+
     fn write_file(&self, path: &str, text: &str) {
         fs::write(self.dir.path().join(path), text).unwrap();
     }
@@ -165,6 +177,89 @@ fn installs_every_folder_in_a_repo_and_runs_them() {
     assert!(!tb.home.path().read_dir().unwrap().any(|e| {
         e.unwrap().file_name().to_string_lossy().starts_with(".staging")
     }));
+}
+
+fn notes_group() -> Value {
+    json!({
+        "name": "notes",
+        "version": "1.0.0",
+        "description": "Keeps notes",
+        "subcommands": {
+            "add": { "description": "Adds a note", "args": { "text": { "type": "string", "required": true } } },
+            "sync": { "description": "Pushes notes", "permissions": { "http": ["api.github.com"], "vault": ["github"] } }
+        }
+    })
+}
+
+const ADD_LUA: &str = r#"local store = require("store")
+return function(args) return store.saved(args.text) end"#;
+
+/// Every file under `dir`, as paths relative to it, sorted.
+fn files_under(dir: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut left = vec![dir.to_path_buf()];
+    while let Some(next) = left.pop() {
+        for entry in fs::read_dir(next).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                left.push(path);
+            } else {
+                found.push(path.strip_prefix(dir).unwrap().display().to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn a_group_installs_with_its_lib_files_and_nothing_else() {
+    let repo = Repo::new();
+    repo.write_files(
+        "notes",
+        notes_group(),
+        &[
+            ("add.lua", ADD_LUA),
+            ("sync.lua", "return function() end"),
+            ("lib/store.lua", r#"return { saved = function(text) return "saved " .. text end }"#),
+            ("lib/README.md", "not copied"),
+            ("notes.txt", "not copied"),
+        ],
+    );
+    repo.commit("first");
+
+    let tb = Toolbox::new();
+    let err = tb.error(&["self", "install", &repo.url()]);
+    assert!(err.contains("notes 1.0.0") && err.contains("http: api.github.com; vault: github"), "{err}");
+
+    let report = tb.json(&["self", "install", &repo.url(), "--yes"]);
+    assert_eq!(report["installed"][0]["permissions"]["vault"], json!(["github"]));
+    assert_eq!(tb.json(&["notes", "add", "--text", "milk"]), json!("saved milk"));
+    let dir = tb.commands_dir().join("notes");
+    assert_eq!(files_under(&dir), [".source.json", "add.lua", "command.json", "lib/store.lua", "sync.lua"]);
+
+    assert_eq!(tb.json(&["self", "describe", "--origin"])["origins"]["notes"]["edited"], false);
+    fs::write(dir.join("lib/store.lua"), "return {}").unwrap();
+    assert_eq!(tb.json(&["self", "describe", "--origin"])["origins"]["notes"]["edited"], true);
+}
+
+#[test]
+fn a_linked_lib_file_breaks_only_its_command() {
+    let repo = Repo::new();
+    repo.write_files("notes", notes_group(), &[("add.lua", ADD_LUA), ("sync.lua", "return function() end")]);
+    repo.write_command("hello", manifest("hello", None, json!({})), &says("hi"));
+    repo.write_file("outside.lua", "return {}");
+    fs::create_dir_all(repo.dir.path().join("notes/lib")).unwrap();
+    std::os::unix::fs::symlink("../../outside.lua", repo.dir.path().join("notes/lib/store.lua")).unwrap();
+    repo.commit("first");
+
+    let tb = Toolbox::new();
+    let report = tb.json(&["self", "install", &repo.url(), "--yes"]);
+    assert_eq!(names(&report["installed"]), vec!["hello"]);
+    assert_eq!(report["skipped"][0]["command"], "notes");
+    let problem = report["skipped"][0]["problem"].as_str().unwrap();
+    assert!(problem.contains("lib/store.lua") && problem.contains("symbolic links"), "{problem}");
+    assert!(!tb.commands_dir().join("notes").exists());
 }
 
 #[test]

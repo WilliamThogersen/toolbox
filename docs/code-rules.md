@@ -25,25 +25,35 @@ with `#[expect(lint, reason = "...")]`, which says why and fails once the lint n
 
 | Where | Bound |
 |-------|-------|
-| `runtime/exec.rs` `finish_within` | The deadline: each turn sleeps at most until it, then returns |
+| `runtime/exec/mod.rs` `wait_within` | The deadline: each turn sleeps at most until it, then returns |
 | `runtime/http.rs` `json_has_secret`, `redact_json` | Each value of the parsed body is popped once |
 | `vault/inject.rs` `parse`, `vault/unescape.rs` `Unescaped::new` | Each turn moves past what it found, so at most one turn per byte |
 | `mcp/mod.rs` `read_messages`, `mcp/lines.rs` `skip_line` | Each turn consumes at least one byte of input; ends at end of input |
 | `mcp/mod.rs` `watch` | Meant to run as long as the server; stops when stdout is gone |
 | `vault/activity.rs` `Follower::run` | Meant to run until the person presses `Ctrl-C`; stops when stdout is gone |
 
+## Recursion through Lua (rule 1)
+
+`require` (`runtime/modules.rs`) runs a Lua file, which may call `require` again, so Rust and Lua take turns on one
+stack. A module being loaded is marked in the `toolbox.loading` table and requiring it again is an error, so each
+`lib/` file is on that chain at most once: the depth is at most the number of `lib/` files (256). Lua's own C-stack
+limit (200 nested calls) ends it sooner with a plain error, never a crash.
+
 ## Caps on outside input (rule 3)
 
 | What | Cap | Where |
 |------|-----|-------|
 | `fs.read` file | 20 MB | `runtime::read_capped` |
+| A command's Lua files (scripts and `lib/`) | 256 files, 20 MB in all | `command/sources.rs` |
 | `http` response body | 20 MB | `runtime/http.rs` |
-| `exec` output, each of stdout and stderr | 20 MB (the rest is drained and dropped, so the program never blocks) | `runtime/exec.rs` |
+| `exec` output, each of stdout and stderr | 20 MB (the rest is drained and dropped, so the program never blocks) | `runtime/exec/mod.rs` |
 | `stdin.read()` | 20 MB | `runtime::read_capped` |
 | One MCP message | 4 MB | `mcp/lines.rs` |
 | Lua memory | 512 MB unless `limits.memory_mb` asks for more | `runtime/limits.rs` |
 | Lua CPU time | 60 s unless `limits.cpu_seconds` asks for more. If the CPU clock can't be read, the run fails | `runtime/limits.rs` |
-| Waiting on an `exec` program | 10 min unless the script sets `timeout` | `runtime/exec.rs` |
+| Waiting on an `exec` program | 10 min unless the script sets `timeout`; 24 h with `terminal = true`, where a person drives it | `runtime/exec/` |
+| One `prompt` answer | 4 KB, 3 tries for `confirm` and `choose`. It waits for the person like `tb self vault` prompts do; Ctrl-C ends it | `runtime/prompt.rs` |
+| `yaml.decode` input | 4 MB (decoding can take about 100 times its size in memory, outside the Lua limit) | `runtime/api.rs` |
 | OAuth token endpoint answer | 1 MB, 30 s | `vault/oauth/token.rs` |
 | OAuth sign-in coming back | 5 min in all, 20 visits, 16 KB and 5 s per visit | `vault/oauth/login.rs` |
 | Waiting for another run to renew an OAuth token | 40 s | `vault/oauth/cache.rs` |

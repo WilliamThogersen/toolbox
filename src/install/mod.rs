@@ -14,7 +14,8 @@ use tempfile::TempDir;
 
 use crate::command::manifest::{Permissions, is_valid_name};
 use crate::command::origin::files_fingerprint;
-use crate::command::registry::{CommandDef, MANIFEST_FILE, Problem, SCRIPT_FILE};
+use crate::command::registry::{CommandDef, MANIFEST_FILE, Problem};
+use crate::command::sources::Sources;
 use crate::cli::screen::{one_line, one_line_permissions, printable};
 
 pub use confirm::{Confirm, Prompt, Yes};
@@ -104,7 +105,7 @@ pub fn install(commands_dir: &Path, request: &Request, confirm: &dyn Confirm) ->
             Ok(Installed {
                 name: def.manifest.name.clone(),
                 version: def.manifest.version.clone(),
-                permissions: def.manifest.permissions.clone(),
+                permissions: def.manifest.all_permissions(),
                 dir: dir.display().to_string(),
                 source,
             })
@@ -128,7 +129,7 @@ pub fn list(commands_dir: &Path, url: &str, git_ref: Option<&str>) -> Result<Rep
             name: def.manifest.name.clone(),
             version: def.manifest.version.clone(),
             description: def.manifest.description.clone(),
-            permissions: def.manifest.permissions.clone(),
+            permissions: def.manifest.all_permissions(),
             installed: installed_from(commands_dir, &def.manifest.name, &url),
         })
         .collect();
@@ -185,7 +186,7 @@ fn install_summary(source: &Source, selection: &repo::Selection) -> String {
         .iter()
         .zip(&labels)
         .map(|(def, label)| {
-            let perms = one_line_permissions(&def.manifest.permissions);
+            let perms = one_line_permissions(&def.manifest.all_permissions());
             format!("  {label:<width$}  {}{}", confirm::permissions(&perms), confirm::warning_lines(&perms))
         })
         .collect();
@@ -236,8 +237,14 @@ impl Staging {
         let name = &def.manifest.name;
         let staged = self.path().join("new").join(name);
         fs::create_dir_all(&staged)?;
-        for file in [MANIFEST_FILE, SCRIPT_FILE] {
-            fs::copy(def.dir.join(file), staged.join(file)).with_context(|| format!("could not copy {file}"))?;
+        fs::write(staged.join(MANIFEST_FILE), &def.manifest_source).with_context(|| format!("could not copy {MANIFEST_FILE}"))?;
+        let sources = Sources::read(def)?;
+        for (path, text) in sources.files() {
+            let file = staged.join(path);
+            if let Some(folder) = file.parent() {
+                fs::create_dir_all(folder)?;
+            }
+            fs::write(&file, text).with_context(|| format!("could not copy {path}"))?;
         }
         let source = Source {
             fingerprint: Some(files_fingerprint(&staged)?),
@@ -269,6 +276,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    use crate::command::registry::SCRIPT_FILE;
 
     struct Answer {
         yes: bool,

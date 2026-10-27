@@ -20,6 +20,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::pty::{self, Pty};
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
@@ -112,6 +114,18 @@ impl Toolbox {
         fs::write(dir.join("run.lua"), script).unwrap();
     }
 
+    /// Writes `command.json` and each `(path, text)` file, folders included.
+    fn add_files(&self, name: &str, manifest: Value, files: &[(&str, &str)]) {
+        let dir = self.home.path().join("commands").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("command.json"), manifest.to_string()).unwrap();
+        for (path, text) in files {
+            let file = dir.join(path);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, text).unwrap();
+        }
+    }
+
     fn add_secret(&self, name: &str, value: &str, hosts: &[&str]) {
         self.edit_vault(|vault| vault["keys"][name] = json!({ "value": value, "hosts": hosts }));
     }
@@ -122,6 +136,18 @@ impl Toolbox {
         let manifest = fs::read_to_string(dir.join("command.json")).unwrap();
         let script = fs::read_to_string(dir.join("run.lua")).unwrap();
         let approved = fingerprint(&manifest, &script);
+        self.edit_vault(|vault| vault["keys"][secret]["commands"][command] = json!(approved));
+    }
+
+    /// Like `allow`, for a command whose Lua files are `paths` rather than only run.lua.
+    fn allow_files(&self, secret: &str, command: &str, paths: &[&str]) {
+        let dir = self.home.path().join("commands").join(command);
+        let manifest = fs::read_to_string(dir.join("command.json")).unwrap();
+        let files: Vec<(String, String)> = paths
+            .iter()
+            .map(|path| (path.to_string(), fs::read_to_string(dir.join(path)).unwrap()))
+            .collect();
+        let approved = files_fingerprint(&manifest, &files);
         self.edit_vault(|vault| vault["keys"][secret]["commands"][command] = json!(approved));
     }
 
@@ -140,6 +166,21 @@ impl Toolbox {
 fn fingerprint(manifest: &str, script: &str) -> String {
     let mut hasher = Sha256::new();
     for part in [manifest, script] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().concat()
+}
+
+/// Mirrors `vault::approval::files_fingerprint`: every Lua file with its path, sorted, after a tag
+/// that keeps it apart from the two-file `fingerprint`.
+fn files_fingerprint(manifest: &str, files: &[(String, String)]) -> String {
+    let mut sorted: Vec<&(String, String)> = files.iter().collect();
+    sorted.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"toolbox files v1\n");
+    let parts = std::iter::once(manifest).chain(sorted.iter().flat_map(|(path, text)| [path.as_str(), text.as_str()]));
+    for part in parts {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
@@ -793,6 +834,287 @@ fn only_commands_the_human_allowed_can_use_a_secret() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stdout(&out).trim(), "502");
     assert!(contacted.load(Ordering::SeqCst));
+}
+
+fn api_group() -> Value {
+    let call = |description: &str, vault: &[&str]| {
+        json!({
+            "description": description,
+            "args": { "url": { "type": "string", "required": true } },
+            "permissions": { "http": ["127.0.0.1"], "vault": vault }
+        })
+    };
+    json!({
+        "name": "api",
+        "description": "Calls a URL with the test secret",
+        "subcommands": {
+            "call": call("Calls a URL with the key", &["test"]),
+            "plain": call("Calls a URL through the same code, without the key", &[])
+        }
+    })
+}
+
+const CLIENT_LUA: &str = r#"local client = {}
+function client.status(url)
+  return http.get(url, { headers = { Authorization = vault("test") } }).status
+end
+return client"#;
+
+const CALL_LUA: &str = r#"local client = require("client")
+return function(args) return client.status(args.url) end"#;
+
+const API_FILES: [&str; 3] = ["call.lua", "lib/client.lua", "plain.lua"];
+
+fn add_api_group(tb: &Toolbox) {
+    tb.add_files("api", api_group(), &[("call.lua", CALL_LUA), ("plain.lua", CALL_LUA), ("lib/client.lua", CLIENT_LUA)]);
+}
+
+#[test]
+fn subcommands_share_lib_files_but_not_permissions() {
+    let tb = Toolbox::new();
+    let (spy, contacted) = spy_proxy();
+    let url = format!("{spy}/");
+    tb.add_secret("test", SECRET, &[host_of(&url)]);
+    add_api_group(&tb);
+    tb.allow_files("test", "api", &API_FILES);
+
+    let out = tb.run(&["api", "plain", "--url", &url]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("permissions.vault"), "{}", stderr(&out));
+    assert!(!contacted.load(Ordering::SeqCst), "a subcommand used a key it doesn't list");
+
+    let out = tb.run(&["api", "call", "--url", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "502");
+    assert!(contacted.load(Ordering::SeqCst));
+}
+
+#[test]
+fn an_edited_lib_file_needs_a_new_approval() {
+    let tb = Toolbox::new();
+    let (spy, contacted) = spy_proxy();
+    let url = format!("{spy}/");
+    tb.add_secret("test", SECRET, &[host_of(&url)]);
+    add_api_group(&tb);
+    tb.allow_files("test", "api", &API_FILES);
+
+    let lib = tb.home.path().join("commands/api/lib/client.lua");
+    fs::write(&lib, format!("{CLIENT_LUA}\n-- edited")).unwrap();
+    let out = tb.run(&["api", "call", "--url", &url]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("changed since") && stderr(&out).contains("tb self vault setup api"), "{}", stderr(&out));
+    assert!(!contacted.load(Ordering::SeqCst), "an edited lib file reached the server");
+
+    fs::write(tb.home.path().join("commands/api/lib/extra.lua"), "return 1").unwrap();
+    tb.allow_files("test", "api", &API_FILES);
+    let out = tb.run(&["api", "call", "--url", &url]);
+    assert!(stderr(&out).contains("changed since"), "a new lib file must count as an edit: {}", stderr(&out));
+
+    tb.allow_files("test", "api", &["call.lua", "lib/client.lua", "lib/extra.lua", "plain.lua"]);
+    let out = tb.run(&["api", "call", "--url", &url]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(contacted.load(Ordering::SeqCst));
+}
+
+const TRY_LUA: &str = r#"return function(args)
+  local ok, value = pcall(require, args.module)
+  if not ok then return { error = tostring(value) } end
+  require(args.module)
+  return { runs = RUNS, shout = value.shout("hi") }
+end"#;
+
+#[test]
+fn require_loads_only_the_commands_own_lib_files() {
+    let tb = Toolbox::new();
+    tb.add_files(
+        "other",
+        json!({ "name": "other", "description": "Has a lib file of its own" }),
+        &[("run.lua", "return function() end"), ("lib/secret.lua", "return { shout = function() return 'other' end }")],
+    );
+    let kit = json!({
+        "name": "kit",
+        "description": "Tries require",
+        "subcommands": { "try": { "description": "Requires a module", "args": { "module": { "type": "string", "required": true } } } }
+    });
+    tb.add_files(
+        "kit",
+        kit,
+        &[
+            ("try.lua", TRY_LUA),
+            ("lib/text.lua", "RUNS = (RUNS or 0) + 1\nreturn { shout = string.upper }"),
+            ("helper.lua", "return { shout = function() return 'not in lib' end }"),
+            ("lib/nested/deep.lua", "return { shout = function() return 'too deep' end }"),
+        ],
+    );
+
+    assert_eq!(tb.json(&["kit", "try", "--module", "text"]), json!({ "runs": 1, "shout": "HI" }));
+
+    for refused in ["secret", "../other/lib/secret", "other/secret", "lib/text", "text.lua", "helper", "nested/deep", "nested.deep", ""] {
+        let result = tb.json(&["kit", "try", "--module", refused]);
+        let error = result["error"].as_str().unwrap_or_else(|| panic!("require({refused:?}) loaded {result}"));
+        assert!(error.contains("lib/"), "require({refused:?}): {error}");
+    }
+}
+
+#[test]
+fn groups_list_their_subcommands() {
+    let tb = Toolbox::new();
+    add_api_group(&tb);
+    let top = stdout(&tb.run(&[]));
+    assert!(top.contains("api") && top.contains("Calls a URL with the test secret"), "{top}");
+
+    let out = tb.run(&["api"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let help = stdout(&out);
+    assert!(help.contains("call") && help.contains("Calls a URL with the key") && help.contains("plain"), "{help}");
+
+    let described = tb.json(&["self", "describe"]);
+    let api = &described["commands"][0];
+    assert_eq!(api["name"], "api");
+    assert_eq!(api["subcommands"]["call"]["permissions"]["vault"], json!(["test"]));
+    assert_eq!(tb.json(&["self", "check"])["ok"], true);
+}
+
+fn exec_manifest(name: &str, permissions: Value) -> Value {
+    json!({ "name": name, "description": "Runs sh", "permissions": permissions })
+}
+
+#[test]
+fn streamed_output_shows_while_the_program_runs_and_is_still_returned() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "slow",
+        exec_manifest("slow", json!({ "exec": ["sh"] })),
+        r#"return function()
+            local out = exec("sh", {"-c", "echo first; sleep 2; echo second >&2"}, { stream = true })
+            return { stdout = out.stdout, stderr = out.stderr }
+        end"#,
+    );
+    let mut child = tb.command(&["slow"]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let started = Instant::now();
+    assert_eq!(lines.next().unwrap().unwrap(), "first");
+    assert!(started.elapsed() < Duration::from_millis(1500), "first showed only when the program ended");
+    assert_eq!(lines.next().unwrap().unwrap(), "second");
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), json!({ "stdout": "first\n", "stderr": "second\n" }));
+}
+
+#[test]
+fn exec_with_the_terminal_hands_it_to_the_program_and_stdout_stays_json() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "ask",
+        exec_manifest("ask", json!({ "exec": ["sh"], "terminal": true })),
+        r#"return function()
+            local asked = exec("sh", {"-c", "printf 'name? '; read name; echo \"hi $name\""}, { terminal = true })
+            local stopped = exec("sh", {"-c", "printf 'waiting '; sleep 30"}, { terminal = true })
+            return { asked = asked, stopped = stopped }
+        end"#,
+    );
+    let terminal = Pty::open();
+    let screen = terminal.screen();
+    let mut keyboard = terminal.keyboard();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_toolbox"));
+    cmd.arg("ask")
+        .env("TOOLBOX_HOME", tb.home.path())
+        .env("TOOLBOX_INSECURE_TEST_VAULT", tb.vault_file())
+        .env("TOOLBOX_NO_UPDATE_CHECK", "1")
+        .stdin(terminal.terminal_side())
+        .stdout(Stdio::piped());
+    pty::use_as_terminal(&mut cmd, terminal.path.clone());
+    let child = cmd.spawn().unwrap();
+
+    pty::wait_for(&screen, "name? ");
+    keyboard.write_all(b"bo\n").unwrap();
+    pty::wait_for(&screen, "hi bo");
+    pty::wait_for(&screen, "waiting ");
+    keyboard.write_all(b"\x03").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "Ctrl-C reaches the program, and tb carries on");
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result, json!({ "asked": { "ok": true, "code": 0 }, "stopped": { "ok": false } }));
+}
+
+#[test]
+fn exec_with_the_terminal_needs_one() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "ask",
+        exec_manifest("ask", json!({ "exec": ["sh"], "terminal": true })),
+        r#"return function() return exec("sh", {"-c", "read x"}, { terminal = true }) end"#,
+    );
+    let out = tb.run(&["ask"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("needs a person at a terminal"), "{}", stderr(&out));
+}
+
+#[test]
+fn prompts_ask_the_person_at_the_terminal_and_never_an_agent() {
+    let tb = Toolbox::new();
+    tb.add_command(
+        "setup",
+        exec_manifest("setup", json!({ "terminal": true })),
+        r#"return function()
+            print("Paste the key for github: \27[8m")
+            local name = prompt.ask("Project name?", "shop")
+            local sure = prompt.confirm("Use Docker?")
+            local php = prompt.choose("PHP version?", { "8.2", "8.3" }, "8.3")
+            return { name = name, sure = sure, php = php }
+        end"#,
+    );
+    let out = tb.run(&["setup"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("prompt needs a person at a terminal"), "{}", stderr(&out));
+
+    let terminal = Pty::open();
+    let screen = terminal.screen();
+    let mut keyboard = terminal.keyboard();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_toolbox"));
+    cmd.arg("setup")
+        .env("TOOLBOX_HOME", tb.home.path())
+        .env("TOOLBOX_INSECURE_TEST_VAULT", tb.vault_file())
+        .env("TOOLBOX_NO_UPDATE_CHECK", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped());
+    pty::use_as_terminal(&mut cmd, terminal.path.clone());
+    let child = cmd.spawn().unwrap();
+    let shown = pty::wait_for(&screen, "setup asks: Project name? [shop] ");
+    assert!(shown.contains("Paste the key for github: \\u{1b}[8m"), "print sent a raw escape: {shown:?}");
+    assert!(shown.contains("\x1b[0m"), "the prompt didn't reset the text style first: {shown:?}");
+    keyboard.write_all(b"\n").unwrap();
+    pty::wait_for(&screen, "setup asks: Use Docker? [y/N] ");
+    keyboard.write_all(b"yes\n").unwrap();
+    pty::wait_for(&screen, "  1) 8.2\r\n  2) 8.3\r\nsetup asks: PHP version? [1-2, Enter = 8.3] ");
+    keyboard.write_all(b"1\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), json!({ "name": "shop", "sure": true, "php": "8.2" }));
+}
+
+#[test]
+fn detached_programs_keep_running_after_the_command_ends() {
+    let tb = Toolbox::new();
+    let marker = tb.home.path().join("late");
+    let script = format!(
+        r#"return function() return exec("sh", {{"-c", "sleep 1; touch '{}'"}}, {{ detach = true }}) end"#,
+        marker.display()
+    );
+    tb.add_command("later", exec_manifest("later", json!({ "exec": ["sh"] })), &script);
+    assert!(stderr(&tb.run(&["later"])).contains(r#"needs \"background\": true"#));
+
+    tb.add_command("later", exec_manifest("later", json!({ "exec": ["sh"], "background": true })), &script);
+    let started = Instant::now();
+    let result = tb.json(&["later"]);
+    assert!(started.elapsed() < Duration::from_millis(900), "tb waited for the program");
+    assert!(result["pid"].as_u64().unwrap() > 1, "{result}");
+    assert!(!marker.exists());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(marker.exists(), "the program stopped when tb did");
 }
 
 #[test]
