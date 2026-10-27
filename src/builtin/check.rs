@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::command::registry::{Problem, Registry};
-use crate::runtime;
+use crate::{mcp, runtime};
 
 #[derive(Debug, Serialize)]
 pub struct CheckReport {
@@ -17,7 +17,13 @@ pub fn check(registry: &Registry) -> CheckReport {
             problem: format!("{err:#}"),
         })
     });
-    let problems: Vec<Problem> = registry.problems.iter().cloned().chain(syntax_problems).collect();
+    let problems: Vec<Problem> = registry
+        .problems
+        .iter()
+        .cloned()
+        .chain(syntax_problems)
+        .chain(mcp::clashes(registry))
+        .collect();
     let commands = registry
         .commands
         .iter()

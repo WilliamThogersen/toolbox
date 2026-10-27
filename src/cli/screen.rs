@@ -35,6 +35,7 @@ pub fn one_line_permissions(perms: &Permissions) -> Permissions {
         env: all(&perms.env),
         read: all(&perms.read),
         write: all(&perms.write),
+        ..perms.clone()
     }
 }
 

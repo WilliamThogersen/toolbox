@@ -7,7 +7,9 @@ use sha2::{Digest, Sha256};
 use super::commands::destination;
 use super::{SecretEntry, names};
 use crate::install::confirm;
+use crate::command::entry::Entry;
 use crate::command::registry::{CommandDef, Registry};
+use crate::command::sources::Sources;
 use crate::cli::screen::{one_line, one_line_permissions, printable};
 
 #[derive(Debug, Clone)]
@@ -18,18 +20,30 @@ pub struct Caller {
 }
 
 impl Caller {
-    pub fn new(def: &CommandDef, script: &str) -> Self {
+    pub fn new(def: &CommandDef, entry: &Entry, sources: &Sources) -> Self {
         Self {
             name: def.manifest.name.clone(),
-            declared: def.manifest.permissions.vault.clone(),
-            fingerprint: fingerprint(&def.manifest_source, script),
+            declared: entry.permissions.vault.clone(),
+            fingerprint: sources.fingerprint(&def.manifest_source),
         }
     }
 }
 
 pub fn fingerprint(manifest: &str, script: &str) -> String {
+    hash_parts(b"", [manifest, script])
+}
+
+const FILES_TAG: &[u8] = b"toolbox files v1\n";
+
+pub fn files_fingerprint<'a>(manifest: &'a str, files: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let parts = std::iter::once(manifest).chain(files.flat_map(|(path, text)| [path, text]));
+    hash_parts(FILES_TAG, parts)
+}
+
+fn hash_parts<'a>(tag: &[u8], parts: impl IntoIterator<Item = &'a str>) -> String {
     let mut hasher = Sha256::new();
-    for part in [manifest, script] {
+    hasher.update(tag);
+    for part in parts {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
@@ -68,7 +82,7 @@ pub fn access(secret: &str, entry: &SecretEntry, registry: &Registry) -> Vec<Com
     let users = registry
         .commands
         .iter()
-        .filter(|def| names::declared(&def.manifest.permissions.vault, secret))
+        .filter(|def| names::declared(&def.manifest.all_permissions().vault, secret))
         .map(|def| def.manifest.name.as_str());
     let names: BTreeSet<&str> = users.chain(entry.commands.keys().map(String::as_str)).collect();
     names
@@ -83,7 +97,7 @@ pub fn access(secret: &str, entry: &SecretEntry, registry: &Registry) -> Vec<Com
 fn access_of(name: &str, entry: &SecretEntry, registry: &Registry) -> Access {
     let current = registry
         .find(name)
-        .and_then(|def| def.read_script().ok().map(|script| fingerprint(&def.manifest_source, &script)));
+        .and_then(|def| Sources::read(def).ok().map(|sources| sources.fingerprint(&def.manifest_source)));
     match (entry.commands.get(name), current) {
         (None, _) => Access::NotAllowed,
         (Some(_), None) => Access::Missing,
@@ -98,14 +112,14 @@ pub struct Review {
     pub question: String,
 }
 
-const REACHING: &[&str] = &["http", "exec", "fs", "env", "stdin", "vault", "_G", "_ENV", "rawget"];
+const REACHING: &[&str] = &["http", "exec", "fs", "env", "stdin", "prompt", "vault", "_G", "_ENV", "rawget"];
 
 const MAX_SHOWN: usize = 25;
 
-pub fn review(def: &CommandDef, script: &str, keys: &[(&str, &SecretEntry)]) -> Review {
+pub fn review(def: &CommandDef, sources: &Sources, keys: &[(&str, &SecretEntry)]) -> Review {
     debug_assert!(!keys.is_empty(), "a review asks about at least one key");
     let manifest = &def.manifest;
-    let perms = one_line_permissions(&manifest.permissions);
+    let perms = one_line_permissions(&manifest.all_permissions());
     let names: Vec<&str> = keys.iter().map(|(name, _)| *name).collect();
     let (wants, what) = match names.as_slice() {
         [one] => (format!("your key {one}"), "the key allows"),
@@ -115,39 +129,68 @@ pub fn review(def: &CommandDef, script: &str, keys: &[(&str, &SecretEntry)]) -> 
         .iter()
         .map(|(name, entry)| format!("  {name} may be sent to {}", destination(entry)))
         .collect();
-    let lines: Vec<&str> = script.lines().collect();
-    let reaching: Vec<String> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| reaches_out(line))
-        .map(|(i, line)| numbered(i + 1, line))
-        .collect();
-    let shown = match reaching.len() {
-        0 => "  (none)".to_string(),
-        n if n > MAX_SHOWN => {
-            let first: Vec<&str> = reaching.iter().take(MAX_SHOWN).map(String::as_str).collect();
-            format!("{}\n  ... and {} more", first.join("\n"), n - MAX_SHOWN)
-        }
-        _ => reaching.join("\n"),
+    let (files, outside) = match sources.paths().as_slice() {
+        [only] => (format!("its {only}"), "the script"),
+        many => (format!("its {} Lua files", many.len()), "the scripts"),
     };
     let summary = format!(
         "{name} wants to use {wants}\n  {description}\n  permissions: {perms}{warnings}\n{destinations}\n\n\
-         Lines of its run.lua ({count} in all) that reach outside the script:\n{shown}\n\n\
+         Lines of {files} ({count} in all) that reach outside {outside}:\n{shown}\n\n\
          Once allowed, this exact version can do anything {what} on those hosts.",
         name = manifest.name,
         description = one_line(&manifest.description),
         perms = confirm::permissions(&perms),
         warnings = confirm::warning_lines(&perms),
         destinations = destinations.join("\n"),
-        count = lines.len(),
+        count = sources.files().map(|(_, text)| text.lines().count()).sum::<usize>(),
+        shown = shown(&reaching_lines(sources)),
     );
-    let all: Vec<String> = lines.iter().enumerate().map(|(i, line)| numbered(i + 1, line)).collect();
-    let full = format!("{}\n\n{}\n", def.script_path().display(), all.join("\n"));
     Review {
         summary: printable(&summary),
-        full: printable(&full),
+        full: printable(&full_text(def, sources)),
         question: printable(&format!("Allow {} to use {}?", manifest.name, names.first().copied().unwrap_or_default())),
     }
+}
+
+fn reaching_lines(sources: &Sources) -> Vec<String> {
+    let many = sources.paths().len() > 1;
+    sources
+        .files()
+        .flat_map(|(path, text)| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, line)| reaches_out(line))
+                .map(move |(i, line)| {
+                    if many {
+                        format!("  {path}:{}  {}", i + 1, line.trim_end())
+                    } else {
+                        numbered(i + 1, line)
+                    }
+                })
+        })
+        .collect()
+}
+
+fn shown(reaching: &[String]) -> String {
+    match reaching.len() {
+        0 => "  (none)".to_string(),
+        n if n > MAX_SHOWN => {
+            let first: Vec<&str> = reaching.iter().take(MAX_SHOWN).map(String::as_str).collect();
+            format!("{}\n  ... and {} more", first.join("\n"), n - MAX_SHOWN)
+        }
+        _ => reaching.join("\n"),
+    }
+}
+
+fn full_text(def: &CommandDef, sources: &Sources) -> String {
+    let files: Vec<String> = sources
+        .files()
+        .map(|(path, text)| {
+            let all: Vec<String> = text.lines().enumerate().map(|(i, line)| numbered(i + 1, line)).collect();
+            format!("{}\n\n{}\n", def.dir.join(path).display(), all.join("\n"))
+        })
+        .collect();
+    files.join("\n")
 }
 
 fn numbered(number: usize, line: &str) -> String {
@@ -200,7 +243,8 @@ mod tests {
     }
 
     fn caller(def: &CommandDef) -> Caller {
-        Caller::new(def, &def.read_script().unwrap())
+        let sources = Sources::read(def).unwrap();
+        Caller::new(def, &def.manifest.entry(None).unwrap(), &sources)
     }
 
     #[test]
@@ -266,7 +310,7 @@ mod tests {
         let script = "local API = \"https://api.github.com\"\nlocal n = 1\nreturn function()\n  \
                       local res = http.get(API) -- \u{1b}[2Khidden\u{202e}x\rcover\n  local httpish = 2\nend\n";
         let def = command(tmp.path(), "stars", &["github"], script);
-        let review = review(&def, script, &[("github", &entry(&[]))]);
+        let review = review(&def, &Sources::read(&def).unwrap(), &[("github", &entry(&[]))]);
         let summary = &review.summary;
         assert!(summary.starts_with("stars wants to use your key github\n"), "{summary}");
         assert!(summary.contains("    1  local API = \"https://api.github.com\""), "{summary}");
@@ -290,13 +334,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let def = command(tmp.path(), "both", &["github/*"], "return function() end");
         let maps = SecretEntry { query_params: vec!["key".into()], ..entry(&[]) };
-        let review = review(&def, "return function() end", &[("github/work", &entry(&[])), ("github/maps", &maps)]);
+        let review = review(&def, &Sources::read(&def).unwrap(), &[("github/work", &entry(&[])), ("github/maps", &maps)]);
         let summary = &review.summary;
         assert!(summary.starts_with("both wants to use your keys github/work, github/maps\n"), "{summary}");
         assert!(summary.contains("  github/work may be sent to api.github.com\n"), "{summary}");
         assert!(summary.contains("  github/maps may be sent to api.github.com (also as query parameter key)\n"), "{summary}");
         assert!(summary.contains("anything these keys allow"), "{summary}");
         assert_eq!(review.question, "Allow both to use github/work?");
+    }
+
+    #[test]
+    fn review_covers_every_lua_file_of_a_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("notes");
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        fs::write(dir.join("add.lua"), "local api = require('api')\nreturn function() return api.post() end").unwrap();
+        fs::write(dir.join("lib/api.lua"), "local api = {}\nfunction api.post()\n  return http.post('https://api.github.com/x')\nend\nreturn api").unwrap();
+        let source = serde_json::json!({
+            "name": "notes",
+            "description": "Keeps notes",
+            "subcommands": { "add": { "description": "x", "permissions": { "http": ["api.github.com"], "vault": ["github"] } } },
+        })
+        .to_string();
+        let def = CommandDef { manifest: Manifest::parse(&source).unwrap(), manifest_source: source, dir: dir.clone() };
+        let review = review(&def, &Sources::read(&def).unwrap(), &[("github", &entry(&[]))]);
+        let summary = &review.summary;
+        assert!(summary.contains("permissions: http: api.github.com; vault: github"), "{summary}");
+        assert!(summary.contains("Lines of its 2 Lua files (7 in all) that reach outside the scripts:\n  lib/api.lua:3    return http.post('https://api.github.com/x')\n"), "{summary}");
+        assert!(!summary.contains("add.lua:"), "{summary}");
+        assert!(review.full.contains(&format!("{}\n\n    1  local api = require('api')\n", dir.join("add.lua").display())), "{}", review.full);
+        assert!(review.full.contains(&format!("{}\n\n    1  local api = {{}}\n", dir.join("lib/api.lua").display())), "{}", review.full);
     }
 
     #[test]
@@ -314,7 +381,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let script = "http.get(1)\n".repeat(MAX_SHOWN + 3);
         let def = command(tmp.path(), "many", &["github"], &script);
-        let review = review(&def, &script, &[("github", &entry(&[]))]);
+        let review = review(&def, &Sources::read(&def).unwrap(), &[("github", &entry(&[]))]);
         assert!(review.summary.contains("... and 3 more"), "{}", review.summary);
         assert_eq!(review.full.matches("http.get(1)").count(), MAX_SHOWN + 3);
     }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -5,13 +6,58 @@ use serde_json::{Map, Value, json};
 
 use super::running::Running;
 use super::{INTERNAL_ERROR, INVALID_PARAMS, RpcError};
-use crate::command::manifest::{ArgSpec, ArgType, Manifest};
-use crate::command::registry::{self, Registry};
+use crate::command::entry::Entry;
+use crate::command::manifest::{ArgSpec, ArgType};
+use crate::command::registry::{self, Problem, Registry};
 use crate::sys;
+
+struct Tool<'a> {
+    name: String,
+    entry: Entry<'a>,
+}
+
+fn tools(registry: &Registry) -> Vec<Tool<'_>> {
+    let all = registry
+        .commands
+        .iter()
+        .flat_map(|def| def.manifest.entries())
+        .map(|entry| Tool { name: tool_name(&entry), entry });
+    all.fold(Vec::new(), |mut kept, tool| {
+        if !kept.iter().any(|seen: &Tool| seen.name == tool.name) {
+            kept.push(tool);
+        }
+        kept
+    })
+}
+
+pub fn clashes(registry: &Registry) -> Vec<Problem> {
+    let all: Vec<(String, &str)> = registry
+        .commands
+        .iter()
+        .flat_map(|def| def.manifest.entries())
+        .map(|entry| (tool_name(&entry), entry.command))
+        .collect();
+    all.iter()
+        .enumerate()
+        .filter_map(|(at, (name, command))| {
+            let (_, first) = all.iter().take(at).find(|(seen, _)| seen == name)?;
+            Some(Problem {
+                command: (*command).to_string(),
+                problem: format!("its MCP tool name {name:?} is taken by {first:?}, so MCP apps don't see it. Rename one of them"),
+            })
+        })
+        .collect()
+}
+
+fn tool_name(entry: &Entry) -> String {
+    entry
+        .subcommand
+        .map_or_else(|| entry.command.to_string(), |sub| format!("{}_{sub}", entry.command))
+}
 
 pub fn list(commands_dir: &Path) -> Result<Value, RpcError> {
     let registry = load(commands_dir)?;
-    let tools: Vec<Value> = registry.commands.iter().map(|def| tool(&def.manifest)).collect();
+    let tools: Vec<Value> = tools(&registry).iter().map(tool).collect();
     Ok(json!({ "tools": tools }))
 }
 
@@ -21,8 +67,9 @@ pub fn call(commands_dir: &Path, params: &Value, running: &Running, id: &str) ->
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new(INVALID_PARAMS, "tools/call needs a tool name"))?;
     let registry = load(commands_dir)?;
-    let def = registry
-        .find(name)
+    let found = tools(&registry)
+        .into_iter()
+        .find(|tool| tool.name == name)
         .ok_or_else(|| RpcError::new(INVALID_PARAMS, format!("unknown tool {name:?}")))?;
     let empty = Map::new();
     let arguments = match params.get("arguments") {
@@ -30,8 +77,8 @@ pub fn call(commands_dir: &Path, params: &Value, running: &Running, id: &str) ->
         Some(Value::Object(arguments)) => arguments,
         Some(_) => return Ok(failure("arguments must be an object")),
     };
-    Ok(match cli_args(&def.manifest, arguments) {
-        Ok(args) => run(name, &args, running, id),
+    Ok(match cli_args(&found.entry, arguments) {
+        Ok(args) => run(&found.entry, &args, running, id),
         Err(problem) => failure(&problem),
     })
 }
@@ -45,22 +92,20 @@ fn load(commands_dir: &Path) -> Result<Registry, RpcError> {
     registry::load(commands_dir).map_err(|err| RpcError::new(INTERNAL_ERROR, format!("{err:#}")))
 }
 
-fn tool(manifest: &Manifest) -> Value {
+fn tool(tool: &Tool) -> Value {
     json!({
-        "name": manifest.name,
-        "description": manifest.description,
-        "inputSchema": input_schema(manifest),
+        "name": tool.name,
+        "description": tool.entry.description,
+        "inputSchema": input_schema(tool.entry.args),
     })
 }
 
-fn input_schema(manifest: &Manifest) -> Value {
-    let properties: Map<String, Value> = manifest
-        .args
+fn input_schema(args: &BTreeMap<String, ArgSpec>) -> Value {
+    let properties: Map<String, Value> = args
         .iter()
         .map(|(name, spec)| (name.clone(), property(spec)))
         .collect();
-    let required: Vec<&String> = manifest
-        .args
+    let required: Vec<&String> = args
         .iter()
         .filter(|(_, spec)| spec.required)
         .map(|(name, _)| name)
@@ -100,12 +145,12 @@ fn a_type(kind: ArgType) -> &'static str {
     }
 }
 
-fn cli_args(manifest: &Manifest, arguments: &Map<String, Value>) -> Result<Vec<String>, String> {
-    if let Some(unknown) = arguments.keys().find(|name| !manifest.args.contains_key(*name)) {
-        let known: Vec<&String> = manifest.args.keys().collect();
-        return Err(format!("unknown argument {unknown:?}. {} takes: {known:?}", manifest.name));
+fn cli_args(entry: &Entry, arguments: &Map<String, Value>) -> Result<Vec<String>, String> {
+    if let Some(unknown) = arguments.keys().find(|name| !entry.args.contains_key(*name)) {
+        let known: Vec<&String> = entry.args.keys().collect();
+        return Err(format!("unknown argument {unknown:?}. {} takes: {known:?}", entry.label()));
     }
-    manifest
+    entry
         .args
         .iter()
         .map(|(name, spec)| match arguments.get(name) {
@@ -135,14 +180,16 @@ fn flag(name: &str, spec: &ArgSpec, value: &Value) -> Result<Option<String>, Str
     }
 }
 
-fn run(name: &str, args: &[String], running: &Running, id: &str) -> Value {
+fn run(entry: &Entry, args: &[String], running: &Running, id: &str) -> Value {
+    let name = entry.label();
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => return failure(&format!("could not find the toolbox binary: {err}")),
     };
     let mut command = Command::new(exe);
     command
-        .arg(name)
+        .arg(entry.command)
+        .args(entry.subcommand)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -197,6 +244,8 @@ fn failure(message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::manifest::Manifest;
+    use crate::command::registry::CommandDef;
 
     fn manifest() -> Manifest {
         Manifest::parse(
@@ -217,12 +266,13 @@ mod tests {
 
     #[expect(clippy::needless_pass_by_value, reason = "tests pass `json!(...)` values as they are")]
     fn args(value: Value) -> Result<Vec<String>, String> {
-        cli_args(&manifest(), value.as_object().unwrap())
+        let manifest = manifest();
+        cli_args(&manifest.entry(None).unwrap(), value.as_object().unwrap())
     }
 
     #[test]
     fn schema_lists_types_required_descriptions_and_defaults() {
-        let schema = input_schema(&manifest());
+        let schema = input_schema(&manifest().args);
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"], json!(["repo"]));
         assert_eq!(schema["additionalProperties"], false);
@@ -233,9 +283,31 @@ mod tests {
     }
 
     #[test]
+    fn subcommands_are_tools_and_the_first_of_two_names_wins() {
+        let def = |source: &str| {
+            let manifest = Manifest::parse(source).unwrap();
+            CommandDef { dir: std::path::PathBuf::from(&manifest.name), manifest, manifest_source: source.to_string() }
+        };
+        let registry = Registry {
+            commands: vec![
+                def(r#"{"name":"notes","description":"x","subcommands":{"add":{"description":"Adds"},"list":{"description":"Lists"}}}"#),
+                def(r#"{"name":"notes_add","description":"Clashes"}"#),
+            ],
+            problems: Vec::new(),
+        };
+        let found = tools(&registry);
+        let names: Vec<(&str, &str)> = found.iter().map(|tool| (tool.name.as_str(), tool.entry.description)).collect();
+        assert_eq!(names, [("notes_add", "Adds"), ("notes_list", "Lists")]);
+        let clashes = clashes(&registry);
+        assert_eq!(clashes.len(), 1);
+        assert_eq!(clashes[0].command, "notes_add");
+        assert!(clashes[0].problem.contains("\"notes_add\" is taken by \"notes\""), "{}", clashes[0].problem);
+    }
+
+    #[test]
     fn a_command_without_args_takes_an_empty_object() {
         let bare = Manifest::parse(r#"{"name":"t","description":"t"}"#).unwrap();
-        let schema = input_schema(&bare);
+        let schema = input_schema(&bare.args);
         assert_eq!(schema["properties"], json!({}));
         assert_eq!(schema["required"], json!([]));
     }

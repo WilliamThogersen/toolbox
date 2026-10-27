@@ -15,7 +15,10 @@ For each folder in `~/.toolbox/commands/` it checks:
 1. `command.json` exists and parses. Unknown fields are errors, so typos are caught.
 2. The manifest rules: the name matches the folder, the description isn't empty, `version` is semver, arg types and
    defaults fit together, vault names are valid, `http` has no empty hosts.
-3. `run.lua` exists and compiles. It is never run.
+3. Every Lua file exists, is a plain file (not a link) and compiles: `run.lua`, or one `<subcommand>.lua` per
+   subcommand, plus `lib/*.lua`. None is run.
+4. No two commands want the same [MCP](mcp.md) tool name (`notes_add` for `tb notes add` and a command named
+   `notes_add`).
 
 ## Output
 

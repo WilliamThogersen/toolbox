@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
@@ -6,6 +7,7 @@ use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::command::entry::Entry;
 use crate::command::manifest::{ArgSpec, ArgType, Manifest};
 use crate::cli::matches::{flag, optional};
 use crate::command::registry::{self, CommandDef, Registry};
@@ -23,12 +25,25 @@ pub fn run() -> Result<ExitCode> {
     let matches = app.clone().get_matches();
     match matches.subcommand() {
         Some((builtin::NAMESPACE, m)) => builtin::run(m, &registry, &commands_dir),
-        Some((name, m)) => run_user_command(&registry, name, m),
+        Some((name, m)) => match m.subcommand() {
+            Some((sub, m)) => run_user_command(&registry, name, Some(sub), m),
+            None if registry.find(name).is_some_and(|def| def.manifest.is_group()) => print_group_help(&mut app, name),
+            None => run_user_command(&registry, name, None, m),
+        },
         None => {
             ignore_closed_pipe(app.print_help())?;
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn print_group_help(app: &mut Command, name: &str) -> Result<ExitCode> {
+    app.build();
+    let group = app
+        .find_subcommand_mut(name)
+        .with_context(|| format!("unknown command {name:?}"))?;
+    ignore_closed_pipe(group.print_help())?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn app(registry: &Registry) -> Command {
@@ -65,10 +80,23 @@ fn help_template(registry: &Registry) -> &'static str {
 }
 
 fn user_app(manifest: &Manifest) -> Command {
-    manifest.args.iter().fold(
-        Command::new(manifest.name.clone()).about(manifest.description.clone()),
-        |cmd, (name, spec)| cmd.arg(user_arg(name, spec)),
-    )
+    let command = Command::new(manifest.name.clone()).about(manifest.description.clone());
+    if !manifest.is_group() {
+        return with_args(command, &manifest.args);
+    }
+    let group = command
+        .override_usage(format!("tb {} <subcommand> [args]", manifest.name))
+        .disable_help_subcommand(true);
+    manifest.entries().iter().fold(group, |group, entry| group.subcommand(sub_app(entry)))
+}
+
+fn sub_app(entry: &Entry) -> Command {
+    let name = entry.subcommand.unwrap_or(entry.command).to_string();
+    with_args(Command::new(name).about(entry.description.to_string()), entry.args)
+}
+
+fn with_args(command: Command, args: &BTreeMap<String, ArgSpec>) -> Command {
+    args.iter().fold(command, |cmd, (name, spec)| cmd.arg(user_arg(name, spec)))
 }
 
 fn user_arg(name: &str, spec: &ArgSpec) -> Arg {
@@ -83,9 +111,8 @@ fn user_arg(name: &str, spec: &ArgSpec) -> Arg {
     }
 }
 
-fn collect_args(manifest: &Manifest, matches: &ArgMatches) -> Result<Value> {
-    let given = manifest
-        .args
+fn collect_args(args: &BTreeMap<String, ArgSpec>, matches: &ArgMatches) -> Result<Value> {
+    let given = args
         .iter()
         .map(|(name, spec)| Ok(arg_value(name, spec, matches)?.map(|value| (name.clone(), value))))
         .collect::<Result<Vec<_>>>()?;
@@ -106,17 +133,22 @@ fn arg_value(name: &str, spec: &ArgSpec, matches: &ArgMatches) -> Result<Option<
     Ok(given.or_else(fallback))
 }
 
-fn run_user_command(registry: &Registry, name: &str, matches: &ArgMatches) -> Result<ExitCode> {
+fn run_user_command(registry: &Registry, name: &str, sub: Option<&str>, matches: &ArgMatches) -> Result<ExitCode> {
     let def: &CommandDef = registry
         .find(name)
         .with_context(|| format!("unknown command {name:?}"))?;
-    let args = collect_args(&def.manifest, matches)?;
+    let entry = def
+        .manifest
+        .entry(sub)
+        .with_context(|| format!("{name} has no subcommand {:?}", sub.unwrap_or_default()))?;
+    let label = entry.label();
+    let args = collect_args(entry.args, matches)?;
     let keys = vault::Keys {
         store: vault::default_store(),
         log: Box::new(vault::log::default_log()?),
         tokens: vault::oauth::TokenCache::in_home()?,
     };
-    let output = runtime::run(def, &args, keys).with_context(|| format!("command {name:?} failed"))?;
+    let output = runtime::run(def, sub, &args, keys).with_context(|| format!("command {label:?} failed"))?;
     print_json(&output)
 }
 

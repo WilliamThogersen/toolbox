@@ -11,6 +11,7 @@ use super::names::{self, NAME_RULES, is_secret_name};
 use super::scope::{self, normalize_confirm, normalize_method, normalize_path};
 use super::{SecretEntry, SecretSummary, SecretValue, VaultStore, approval};
 use crate::command::registry::{CommandDef, Registry};
+use crate::command::sources::Sources;
 
 const MAX_VIEWS: usize = 10;
 
@@ -257,13 +258,13 @@ pub fn allow(
         .ok_or_else(|| anyhow!("no secret named {secret:?}"))?;
     let def = find_command(registry, command)?;
     ensure!(
-        names::declared(&def.manifest.permissions.vault, secret),
+        names::declared(&def.manifest.all_permissions().vault, secret),
         "command {command:?} does not list {secret:?} (or a pattern covering it) in permissions.vault, so it could not use it anyway"
     );
-    let script = def.read_script()?;
-    let fingerprint = approval::fingerprint(&def.manifest_source, &script);
+    let sources = Sources::read(def)?;
+    let fingerprint = sources.fingerprint(&def.manifest_source);
     let (key, name) = (secret.to_string(), command.to_string());
-    let review = approval::review(def, &script, &[(secret, entry)]);
+    let review = approval::review(def, &sources, &[(secret, entry)]);
     if !term.review(&review.summary, &review.full, &review.question)? {
         log.record(Event::Declined { key, command: name });
         return Ok(false);

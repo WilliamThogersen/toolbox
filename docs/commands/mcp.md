@@ -43,6 +43,10 @@ Every working command is one tool, with the same name and description. Its args 
 | `"required": true` | Listed as required |
 | `"description"`, `"default"` | Passed along |
 
+A command with [subcommands](../writing-commands.md#subcommands-and-shared-code) gives one tool per subcommand, named
+`<command>_<subcommand>` (`notes_add`). If that name is also a command's, the one that sorts first keeps it and
+[`tb self check`](check.md) reports the other.
+
 Broken commands are left out ([`tb self check`](check.md) shows why). The `tb self` built-ins are never tools.
 
 When you or an agent add, remove or change a command, the app is told within a few seconds and fetches the new list.
@@ -50,13 +54,16 @@ A command an agent just wrote can be used right away.
 
 ## How a call runs
 
-Each call runs `tb <command> --<arg>=<value>` as its own process, exactly like on the command line:
+Each call runs `tb <command> --<arg>=<value>` (or `tb <command> <subcommand> ...`) as its own process, exactly like
+on the command line:
 
 - The result is the command's JSON output.
 - A failed run (a Lua `error`, a missing key, a bad argument) comes back as a tool error with the message, so the
   model can read it and fix its call.
 - Lines the script writes with `print` or `log` come back in a second text block.
 - `stdin.read()` returns an empty string: the script can't read the app's messages.
+- There is no terminal: `prompt` and `exec` with `terminal = true` fail with an error the model can read, so
+  commands should take those answers as args too. Output from `exec` with `stream = true` comes back as log output.
 - Calls run side by side, so a slow command doesn't hold up the others.
 - A call the app cancels is stopped, along with any programs it started. When the app disconnects, every running
   call is stopped.

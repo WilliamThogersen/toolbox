@@ -16,9 +16,15 @@ command or a whole marketplace of them. Others install with [`tb self install`](
      pr-status/
        command.json
        run.lua
+     notes/             a command with subcommands and shared code
+       command.json
+       add.lua
+       list.lua
+       lib/store.lua
    ```
 
-   A repo with `command.json` and `run.lua` at the root is a single command instead.
+   A repo with `command.json` and its Lua files at the root is a single command instead. See
+   [subcommands and shared code](writing-commands.md#subcommands-and-shared-code) for the `notes` layout.
 2. Give each command a `"version": "1.0.0"` in `command.json`.
 3. Commit, then try it: `tb self install ./tb-tools --list` checks every command in your local repo, and
    `tb self install ./tb-tools` installs them.
@@ -29,10 +35,10 @@ Rules for the folders:
 
 - The folder name must equal the `name` in its `command.json`.
 - Top-level folders without a `command.json` (like `docs/`) and hidden folders (like `.github/`) are ignored.
-- `command.json` and `run.lua` must be regular files. Symlinks are refused, so a repo can't make toolbox read files
-  outside it.
-- Only `command.json` and `run.lua` are copied. Scripts can't read other files, so put everything a command needs in
-  those two files.
+- `command.json` and the Lua files must be regular files. Symlinks are refused, so a repo can't make toolbox read
+  files outside it.
+- Only `command.json`, the scripts (`run.lua`, or one `<subcommand>.lua` each) and `lib/*.lua` are copied. Scripts
+  can't read other files, so put everything a command needs in those.
 
 ## Releasing a new version
 
@@ -81,6 +87,6 @@ Each installed command is a normal folder in `~/.toolbox/commands/` plus a `.sou
 ```
 
 `ref` is only there when the user installed with `--ref`, `market` only when they installed through a marketplace.
-`fingerprint` covers `command.json` and `run.lua` as installed, so
+`fingerprint` covers `command.json` and every Lua file as installed, so
 [`tb self describe --origin`](commands/describe.md#origins) can tell when someone edited them. `tb self update` reads this file to know where to look.
 [`tb self uninstall`](commands/uninstall.md) only removes folders that have it.

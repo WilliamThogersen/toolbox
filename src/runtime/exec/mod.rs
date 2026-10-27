@@ -1,3 +1,6 @@
+mod detached;
+mod terminal;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -11,11 +14,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use mlua::{Lua, LuaSerdeExt, Value};
+use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde::Deserialize;
 
-use super::api::denied;
+use super::api::{denied, needs_flag};
 use super::{MAX_INPUT_BYTES, lua_error, seconds};
+use crate::command::manifest::Permissions;
 use crate::sys;
 
 const POLL: Duration = Duration::from_millis(10);
@@ -40,6 +44,49 @@ struct ExecOptions {
     env: BTreeMap<String, String>,
     #[serde(default)]
     timeout: Option<f64>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    terminal: bool,
+    #[serde(default)]
+    detach: bool,
+}
+
+struct Rules {
+    programs: Vec<String>,
+    env: Vec<String>,
+    terminal: bool,
+    background: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    Captured,
+    Terminal,
+    Detached,
+}
+
+impl ExecOptions {
+    fn mode(&self) -> Result<Mode> {
+        match (self.terminal, self.detach) {
+            (true, true) => Err(anyhow!("exec can't use terminal and detach together")),
+            (true, false) => {
+                ensure!(
+                    self.stdin.is_none() && !self.stream,
+                    "with terminal = true the program reads and writes the terminal itself, so stdin and stream don't apply"
+                );
+                Ok(Mode::Terminal)
+            }
+            (false, true) => {
+                ensure!(
+                    self.stdin.is_none() && !self.stream && self.timeout.is_none(),
+                    "with detach = true the program runs on after the command ends, so stdin, stream and timeout don't apply"
+                );
+                Ok(Mode::Detached)
+            }
+            (false, false) => Ok(Mode::Captured),
+        }
+    }
 }
 
 struct Finished {
@@ -65,44 +112,81 @@ impl Drained {
     }
 }
 
-pub fn install(lua: &Lua, allowed: Vec<String>, declared_env: Vec<String>) -> mlua::Result<()> {
+pub fn install(lua: &Lua, perms: &Permissions) -> mlua::Result<()> {
+    let rules = Rules {
+        programs: perms.exec.clone(),
+        env: perms.env.clone(),
+        terminal: perms.terminal,
+        background: perms.background,
+    };
     let exec = lua.create_function(
         move |lua, (program, args, opts): (String, Option<Vec<String>>, Option<Value>)| {
-            if !allowed.contains(&program) {
+            if !rules.programs.contains(&program) {
                 return Err(denied("exec", &program));
             }
             let options: ExecOptions = match opts {
                 Some(value) => lua.from_value(value)?,
                 None => ExecOptions::default(),
             };
-            let done = run(&program, &args.unwrap_or_default(), options, &declared_env).map_err(lua_error)?;
-            let result = lua.create_table()?;
-            result.set("ok", done.status.success())?;
-            result.set("code", done.status.code())?;
-            result.set("stdout", done.stdout.text(&program, "stdout").map_err(lua_error)?)?;
-            result.set("stderr", done.stderr.text(&program, "stderr").map_err(lua_error)?)?;
-            Ok(result)
+            call(lua, &rules, &program, &args.unwrap_or_default(), options)
         },
     )?;
     lua.globals().set("exec", exec)
 }
 
-fn run(program: &str, args: &[String], options: ExecOptions, declared_env: &[String]) -> Result<Finished> {
-    let own_group = options.timeout.is_some();
-    let limit = time_limit(options.timeout)?;
+fn call(lua: &Lua, rules: &Rules, program: &str, args: &[String], options: ExecOptions) -> mlua::Result<Table> {
+    let result = lua.create_table()?;
+    match options.mode().map_err(lua_error)? {
+        Mode::Captured => {
+            let done = run(program, args, options, &rules.env).map_err(lua_error)?;
+            result.set("ok", done.status.success())?;
+            result.set("code", done.status.code())?;
+            result.set("stdout", done.stdout.text(program, "stdout").map_err(lua_error)?)?;
+            result.set("stderr", done.stderr.text(program, "stderr").map_err(lua_error)?)?;
+        }
+        Mode::Terminal => {
+            if !rules.terminal {
+                return Err(needs_flag("terminal", "exec with terminal = true"));
+            }
+            let limit = options.timeout.map(seconds).transpose().map_err(lua_error)?;
+            let command = prepared(program, args, &options, &rules.env).map_err(lua_error)?;
+            let status = terminal::run(command, program, limit).map_err(lua_error)?;
+            result.set("ok", status.success())?;
+            result.set("code", status.code())?;
+        }
+        Mode::Detached => {
+            if !rules.background {
+                return Err(needs_flag("background", "exec with detach = true"));
+            }
+            let command = prepared(program, args, &options, &rules.env).map_err(lua_error)?;
+            result.set("pid", detached::run(command, program).map_err(lua_error)?)?;
+        }
+    }
+    Ok(result)
+}
+
+fn prepared(program: &str, args: &[String], options: &ExecOptions, declared_env: &[String]) -> Result<Command> {
     refuse_code_loading_env(&options.env)?;
     let mut command = Command::new(locate(program)?);
     command
         .args(args)
         .env_clear()
         .envs(env::vars_os().filter(|(name, _)| name.to_str().is_some_and(|name| inherits(name, declared_env))))
-        .envs(&options.env)
-        .stdin(if options.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .envs(&options.env);
     if let Some(cwd) = &options.cwd {
         command.current_dir(cwd);
     }
+    Ok(command)
+}
+
+fn run(program: &str, args: &[String], options: ExecOptions, declared_env: &[String]) -> Result<Finished> {
+    let own_group = options.timeout.is_some();
+    let limit = time_limit(options.timeout)?;
+    let mut command = prepared(program, args, &options, declared_env)?;
+    command
+        .stdin(if options.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if own_group {
         command.process_group(0);
     }
@@ -112,8 +196,8 @@ fn run(program: &str, args: &[String], options: ExecOptions, declared_env: &[Str
     if let (Some(text), Some(mut pipe)) = (options.stdin, child.stdin.take()) {
         thread::spawn(move || pipe.write_all(text.as_bytes()));
     }
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
+    let stdout = drain(child.stdout.take(), options.stream);
+    let stderr = drain(child.stderr.take(), options.stream);
     let _watched = own_group.then(|| sys::WatchedGroup::new(child.id())).flatten();
     finish_within(child, &stdout, &stderr, limit).ok_or_else(|| {
         let hint = if own_group { "" } else { " (the default; set `timeout` to wait longer)" };
@@ -158,17 +242,50 @@ fn is_executable(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
-fn drain(pipe: Option<impl Read + Send + 'static>) -> Receiver<Drained> {
+fn drain(pipe: Option<impl Read + Send + 'static>, echo: bool) -> Receiver<Drained> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut drained = Drained::default();
         if let Some(mut pipe) = pipe {
-            let _ = (&mut pipe).take(MAX_INPUT_BYTES as u64).read_to_end(&mut drained.bytes);
+            let mut kept = Kept { bytes: &mut drained.bytes, echo };
+            let _ = io::copy(&mut (&mut pipe).take(MAX_INPUT_BYTES as u64), &mut kept);
             drained.overflowed = io::copy(&mut pipe, &mut io::sink()).is_ok_and(|extra| extra > 0);
         }
         let _ = tx.send(drained);
     });
     rx
+}
+
+struct Kept<'a> {
+    bytes: &'a mut Vec<u8>,
+    echo: bool,
+}
+
+impl Write for Kept<'_> {
+    fn write(&mut self, chunk: &[u8]) -> io::Result<usize> {
+        if self.echo {
+            let _ = io::stderr().lock().write_all(chunk);
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn wait_within(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait().ok()? {
+            return Some(status);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        thread::sleep(POLL.min(left));
+    }
 }
 
 fn finish_within(
@@ -180,15 +297,7 @@ fn finish_within(
     let deadline = Instant::now() + limit;
     let left = || deadline.saturating_duration_since(Instant::now());
     let finished = (|| {
-        let status = loop {
-            if let Some(status) = child.try_wait().ok()? {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(POLL.min(left()));
-        };
+        let status = wait_within(&mut child, deadline)?;
         Some(Finished {
             status,
             stdout: stdout.recv_timeout(left()).ok()?,
@@ -211,8 +320,12 @@ mod tests {
     use crate::runtime::sandbox::new_lua;
 
     fn lua_with(allowed: &[&str]) -> Lua {
+        lua_allowed(&Permissions { exec: allowed.iter().map(std::string::ToString::to_string).collect(), ..Permissions::default() })
+    }
+
+    fn lua_allowed(perms: &Permissions) -> Lua {
         let lua = new_lua().unwrap();
-        install(&lua, allowed.iter().map(std::string::ToString::to_string).collect(), Vec::new()).unwrap();
+        install(&lua, perms).unwrap();
         lua
     }
 
@@ -236,7 +349,7 @@ mod tests {
     #[test]
     fn a_program_outside_its_own_group_is_still_killed_at_the_limit() {
         let mut child = Command::new("sleep").arg("30").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+        let (stdout, stderr) = (drain(child.stdout.take(), false), drain(child.stderr.take(), false));
         let pid = child.id();
         let started = Instant::now();
         assert!(finish_within(child, &stdout, &stderr, Duration::from_millis(200)).is_none());
@@ -361,6 +474,49 @@ mod tests {
         let lua = lua_with(&["true"]);
         let err = lua.load(r#"exec("true", {}, { timeout = 1e19 })"#).exec().unwrap_err();
         assert!(err.to_string().contains("not a valid number of seconds"), "{err}");
+    }
+
+    #[test]
+    fn modes_need_their_permission_and_fit_together() {
+        let lua = lua_with(&["sh"]);
+        for (opts, says) in [
+            ("{ terminal = true }", r#"exec with terminal = true needs "terminal": true"#),
+            ("{ detach = true }", r#"exec with detach = true needs "background": true"#),
+        ] {
+            let err = lua.load(format!(r#"exec("sh", {{}}, {opts})"#)).exec().unwrap_err().to_string();
+            assert!(err.contains(says), "{opts}: {err}");
+        }
+        let lua = lua_allowed(&Permissions { exec: vec!["sh".into()], terminal: true, background: true, ..Permissions::default() });
+        for (opts, says) in [
+            ("{ terminal = true, detach = true }", "terminal and detach together"),
+            ("{ terminal = true, stdin = 'x' }", "stdin and stream don't apply"),
+            ("{ terminal = true, stream = true }", "stdin and stream don't apply"),
+            ("{ detach = true, timeout = 1 }", "stdin, stream and timeout don't apply"),
+            ("{ detach = true, stream = true }", "stdin, stream and timeout don't apply"),
+        ] {
+            let err = lua.load(format!(r#"exec("sh", {{}}, {opts})"#)).exec().unwrap_err().to_string();
+            assert!(err.contains(says), "{opts}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_detached_program_runs_on_its_own() {
+        let lua = lua_allowed(&Permissions { exec: vec!["sh".into()], background: true, ..Permissions::default() });
+        let marker = tempfile::tempdir().unwrap();
+        let file = marker.path().join("done");
+        lua.globals().set("file", file.display().to_string()).unwrap();
+        let started = Instant::now();
+        let out: Table = lua
+            .load(r#"return exec("sh", {"-c", "sleep 0.3; echo $$ > '" .. file .. "'"}, { detach = true })"#)
+            .eval()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250), "detach waited for the program");
+        let pid: u32 = out.get("pid").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(fs::read_to_string(&file).unwrap().trim(), pid.to_string());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use pty::Pty;
+use common::pty::{self, Pty};
 
 const WAIT: Duration = Duration::from_secs(15);
 const SECRET: &str = "fake_SUPERSECRET_value_123";
@@ -45,83 +45,6 @@ enum Session {
     /// The way MCP clients start servers: in a session with a controlling terminal, with
     /// stdin and stdout as pipes.
     Terminal,
-}
-
-/// A pseudo-terminal, to start the server the way MCP clients do.
-mod pty {
-    #![expect(unsafe_code, reason = "opening a pseudo-terminal and making it a child's terminal takes libc calls")]
-
-    use std::ffi::{CStr, CString};
-    use std::io;
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    /// The controller side of a pseudo-terminal, and the path of its terminal side.
-    pub struct Pty {
-        controller: libc::c_int,
-        pub path: CString,
-    }
-
-    impl Pty {
-        pub fn open() -> Self {
-            // SAFETY: plain flags, no pointers.
-            let controller = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
-            assert!(controller >= 0, "posix_openpt: {}", io::Error::last_os_error());
-            // SAFETY: `controller` is the descriptor posix_openpt just returned.
-            assert_eq!(unsafe { libc::grantpt(controller) }, 0);
-            // SAFETY: as above.
-            assert_eq!(unsafe { libc::unlockpt(controller) }, 0);
-            // SAFETY: as above. ptsname returns a NUL-terminated string that stays valid
-            // until the next call, and it is copied right away.
-            let name = unsafe { libc::ptsname(controller) };
-            assert!(!name.is_null(), "ptsname: {}", io::Error::last_os_error());
-            // SAFETY: checked for null just above.
-            let path = unsafe { CStr::from_ptr(name) }.to_owned();
-            Self { controller, path }
-        }
-    }
-
-    impl Drop for Pty {
-        fn drop(&mut self) {
-            // SAFETY: the descriptor is ours and closed only here.
-            unsafe { libc::close(self.controller) };
-        }
-    }
-
-    /// Makes `cmd` start in a new session whose controlling terminal is `path`.
-    pub fn use_as_terminal(cmd: &mut Command, path: CString) {
-        // SAFETY: `take_terminal` only makes async-signal-safe calls, as code between fork
-        // and exec must, and allocates nothing.
-        unsafe { cmd.pre_exec(move || take_terminal(&path)) };
-    }
-
-    /// Runs in the child before exec: a new session whose controlling terminal is `path`, also
-    /// used as stderr (clients let servers inherit theirs). Keeping it open keeps it the
-    /// controlling terminal: macOS drops that when the last handle closes.
-    fn take_terminal(path: &CStr) -> io::Result<()> {
-        // SAFETY: setsid takes no arguments.
-        if unsafe { libc::setsid() } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `path` is a NUL-terminated string that outlives the call.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` is open, and TIOCSCTTY takes no pointer.
-        if unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: both are open descriptors.
-        if unsafe { libc::dup2(fd, 2) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if fd != 2 {
-            // SAFETY: `fd` is ours, and stderr now holds its own copy.
-            unsafe { libc::close(fd) };
-        }
-        Ok(())
-    }
 }
 
 impl Server {
@@ -320,6 +243,39 @@ fn commands_are_listed_and_called_as_tools() {
     let result: Value = serde_json::from_str(text(&reply, 0)).unwrap();
     assert_eq!(result, json!({ "message": "HELLO -BO", "times": 3 }));
     assert_eq!(text(&reply, 1), "Log output:\ngreeting -bo");
+}
+
+#[test]
+fn each_subcommand_of_a_group_is_its_own_tool() {
+    let mut server = Server::ready();
+    let dir = server.home.path().join("commands/hi");
+    fs::create_dir_all(dir.join("lib")).unwrap();
+    let manifest = json!({
+        "name": "hi",
+        "description": "Greets in two ways",
+        "subcommands": {
+            "greet": { "description": "Greets someone", "args": greet_args() },
+            "wave": { "description": "Waves" }
+        }
+    });
+    fs::write(dir.join("command.json"), manifest.to_string()).unwrap();
+    fs::write(dir.join("greet.lua"), GREET).unwrap();
+    fs::write(dir.join("wave.lua"), r#"return function() return require("hand").wave() end"#).unwrap();
+    fs::write(dir.join("lib/hand.lua"), r#"return { wave = function() return "o/" end }"#).unwrap();
+
+    let list = server.request(1, "tools/list", json!({}));
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let names: Vec<&str> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["hi_greet", "hi_wave"]);
+    assert_eq!(tools[0]["description"], "Greets someone");
+    assert_eq!(tools[0]["inputSchema"]["required"], json!(["name"]));
+
+    let reply = server.call(2, "hi_greet", json!({ "name": "bo" }));
+    assert_eq!(serde_json::from_str::<Value>(text(&reply, 0)).unwrap(), json!({ "message": "hello bo", "times": 1 }));
+    let reply = server.call(3, "hi_wave", json!({}));
+    assert_eq!(text(&reply, 0), "\"o/\"");
+    let reply = server.call(4, "hi", json!({}));
+    assert!(reply["error"]["message"].as_str().unwrap().contains("unknown tool"), "{reply}");
 }
 
 #[test]

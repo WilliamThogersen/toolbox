@@ -4,6 +4,8 @@ mod exec;
 mod fs;
 mod http;
 mod limits;
+mod modules;
+mod prompt;
 mod sandbox;
 mod time;
 
@@ -15,7 +17,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use mlua::serde::SerializeOptions;
 use mlua::{Function, Lua, LuaSerdeExt, Value};
 
+use crate::command::entry::Entry;
 use crate::command::registry::CommandDef;
+use crate::command::sources::Sources;
 use crate::vault::Keys;
 use crate::vault::approval::Caller;
 
@@ -51,89 +55,91 @@ fn seconds(secs: f64) -> Result<Duration> {
     Ok(Duration::from_secs_f64(secs))
 }
 
-pub fn run(def: &CommandDef, args: &serde_json::Value, keys: Keys) -> Result<serde_json::Value> {
-    let script = def.read_script()?;
+pub fn run(def: &CommandDef, subcommand: Option<&str>, args: &serde_json::Value, keys: Keys) -> Result<serde_json::Value> {
+    let entry = def
+        .manifest
+        .entry(subcommand)
+        .with_context(|| format!("{} has no subcommand {:?}", def.manifest.name, subcommand.unwrap_or_default()))?;
+    let sources = Rc::new(Sources::read(def)?);
     let lua = sandbox::new_lua()?;
-    let budget = limits::Budget::for_command(&def.manifest.limits)?;
-    limits::install(&lua, budget, &def.manifest.name)?;
-    let perms = &def.manifest.permissions;
+    let budget = limits::Budget::for_command(entry.limits)?;
+    limits::install(&lua, budget, &entry.label())?;
+    let perms = entry.permissions;
     api::install(&lua, perms)?;
     encoding::install(&lua)?;
     time::install(&lua)?;
-    exec::install(&lua, perms.exec.clone(), perms.env.clone())?;
+    exec::install(&lua, perms)?;
     fs::install(&lua, &Rc::new(fs::FsGuard::new(perms)))?;
-    let caller = Caller::new(def, &script);
+    modules::install(&lua, &sources)?;
+    prompt::install(&lua, perms.terminal, &entry.label())?;
+    let caller = Caller::new(def, &entry, &sources);
     http::install(&lua, &Rc::new(http::HttpClient::new(perms, caller, keys)))?;
-    let entry = load_entry(&lua, def, &script, &budget)?;
-    let result: Value = entry
+    let files = sources.paths();
+    let main = load_entry(&lua, &entry, &sources, &budget)?;
+    let result: Value = main
         .call(lua.to_value_with(args, ser_options())?)
-        .map_err(|err| explain(&err, &budget))?;
+        .map_err(|err| explain(&err, &budget, &files))?;
     lua.from_value(result)
         .context("the command returned a value that cannot be turned into JSON")
 }
 
 pub fn check_syntax(def: &CommandDef) -> Result<()> {
-    compile(def, chunk_name(def))
+    compile(def, |path| format!("@{}", def.dir.join(path).display()))
 }
 
-pub fn check_syntax_as(def: &CommandDef, label: &str) -> Result<()> {
-    compile(def, format!("@{label}"))
+pub fn check_syntax_as(def: &CommandDef, folder: &str) -> Result<()> {
+    compile(def, |path| format!("@{folder}{path}"))
 }
 
-fn compile(def: &CommandDef, chunk: String) -> Result<()> {
+fn compile(def: &CommandDef, chunk: impl Fn(&str) -> String) -> Result<()> {
     let lua = sandbox::new_lua()?;
-    let source = def.read_script()?;
-    sandbox::load_source(&lua, &source, chunk).into_function()?;
+    let sources = Sources::read(def)?;
+    for (path, text) in sources.files() {
+        sandbox::load_source(&lua, text, chunk(path)).into_function()?;
+    }
     Ok(())
 }
 
-fn load_entry(lua: &Lua, def: &CommandDef, script: &str, budget: &limits::Budget) -> Result<Function> {
-    let returned: Value = sandbox::load_source(lua, script, chunk_name(def))
+fn load_entry(lua: &Lua, entry: &Entry, sources: &Sources, budget: &limits::Budget) -> Result<Function> {
+    let script = entry.script();
+    let text = sources.get(&script).with_context(|| format!("missing {script}"))?;
+    let returned: Value = sandbox::load_source(lua, text, format!("@{script}"))
         .eval()
-        .map_err(|err| explain(&err, budget))?;
+        .map_err(|err| explain(&err, budget, &sources.paths()))?;
     match returned {
-        Value::Function(entry) => Ok(entry),
+        Value::Function(main) => Ok(main),
         other => bail!(
-            "run.lua must end with `return function(args) ... end`, but it returned {}",
+            "{script} must end with `return function(args) ... end`, but it returned {}",
             other.type_name()
         ),
     }
 }
 
-fn explain(err: &mlua::Error, budget: &limits::Budget) -> anyhow::Error {
+fn explain(err: &mlua::Error, budget: &limits::Budget, files: &[&str]) -> anyhow::Error {
     if err.to_string().contains("not enough memory") {
         anyhow!(budget.memory_message())
     } else {
-        tidy(err)
+        tidy(err, files)
     }
 }
 
-fn tidy(err: &mlua::Error) -> anyhow::Error {
+fn tidy(err: &mlua::Error, files: &[&str]) -> anyhow::Error {
     let text = err.to_string();
     let (message, trace) = text.split_once("\nstack traceback:").unwrap_or((&text, ""));
-    let message = short_paths(message.trim_start_matches("runtime error: ").trim_end());
-    let line = trace.lines().find_map(|frame| {
-        let (_, rest) = frame.split_once("run.lua:")?;
-        rest.split(':').next().filter(|n| n.parse::<u32>().is_ok())
-    });
-    match line {
-        Some(line) if !message.contains("run.lua:") => anyhow!("{message} (at run.lua:{line})"),
+    let message = message.trim_start_matches("runtime error: ").trim_end();
+    let place = trace.lines().find_map(|frame| place_in(frame.trim_start(), files));
+    let placed = files.iter().any(|file| message.contains(&format!("{file}:")));
+    match place {
+        Some(place) if !placed => anyhow!("{message} (at {place})"),
         _ => anyhow!("{message}"),
     }
 }
 
-fn short_paths(text: &str) -> String {
-    text.split(' ')
-        .map(|word| match word.find("run.lua:") {
-            Some(at) if word[..at].contains('/') => &word[at..],
-            _ => word,
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn chunk_name(def: &CommandDef) -> String {
-    format!("@{}", def.script_path().display())
+fn place_in(frame: &str, files: &[&str]) -> Option<String> {
+    files.iter().find_map(|file| {
+        let line = frame.strip_prefix(file)?.strip_prefix(':')?.split(':').next()?;
+        line.parse::<u32>().ok().map(|line| format!("{file}:{line}"))
+    })
 }
 
 #[cfg(test)]
@@ -163,15 +169,42 @@ mod tests {
         assert_eq!(err.to_string(), "stdin is larger than 20 MB");
     }
 
-    #[expect(clippy::needless_pass_by_value, reason = "tests pass `json!(...)` values as they are")]
-    fn run_script(script: &str, args: serde_json::Value) -> Result<serde_json::Value> {
-        let (_tmp, def) = command(script);
-        let keys = Keys {
+    fn no_keys() -> Keys {
+        Keys {
             store: Box::new(MemoryStore::new(VaultData::default())),
             log: Box::new(crate::vault::log::MemoryLog::new()),
             tokens: crate::vault::oauth::TokenCache { dir: std::env::temp_dir().join("toolbox-unused-token-cache") },
-        };
-        run(&def, &args, keys)
+        }
+    }
+
+    #[expect(clippy::needless_pass_by_value, reason = "tests pass `json!(...)` values as they are")]
+    fn run_script(script: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+        let (_tmp, def) = command(script);
+        run(&def, None, &args, no_keys())
+    }
+
+    #[test]
+    fn errors_in_a_lib_file_say_which_file() {
+        let (tmp, def) = command("local m = require('m')\nreturn function(args) return m[args.how]() end");
+        std::fs::create_dir(tmp.path().join("lib")).unwrap();
+        std::fs::write(tmp.path().join("lib/m.lua"), "return {\n  thrown = function() error('broke', 0) end,\n  bug = function() return nil .. 1 end,\n}").unwrap();
+        let failed = |how: &str| format!("{:#}", run(&def, None, &serde_json::json!({ "how": how }), no_keys()).unwrap_err());
+        assert_eq!(failed("thrown"), "broke (at lib/m.lua:2)");
+        assert!(failed("bug").starts_with("lib/m.lua:3: attempt to concatenate"), "{}", failed("bug"));
+    }
+
+    #[test]
+    fn a_group_runs_the_script_of_the_subcommand_asked_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.lua"), "return function() return 'a' end").unwrap();
+        std::fs::write(tmp.path().join("b.lua"), "return 5").unwrap();
+        let source = r#"{"name":"g","description":"g","subcommands":{"a":{"description":"a"},"b":{"description":"b"}}}"#;
+        let def = CommandDef { manifest: Manifest::parse(source).unwrap(), manifest_source: source.to_string(), dir: tmp.path().to_path_buf() };
+        assert_eq!(run(&def, Some("a"), &serde_json::json!({}), no_keys()).unwrap(), serde_json::json!("a"));
+        let err = run(&def, Some("b"), &serde_json::json!({}), no_keys()).unwrap_err().to_string();
+        assert!(err.starts_with("b.lua must end with `return function"), "{err}");
+        let err = run(&def, None, &serde_json::json!({}), no_keys()).unwrap_err().to_string();
+        assert_eq!(err, "g has no subcommand \"\"");
     }
 
     #[test]

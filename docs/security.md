@@ -5,8 +5,9 @@ commands only touch what they declare.
 
 ## What every command gets
 
-Scripts run in a sandboxed Lua 5.5 with no `io`, `os`, `require`, `load` or `dofile`. They can't open sockets or
-load other code (`run.lua` must be source: precompiled bytecode is refused), and they only see files through `fs`.
+Scripts run in a sandboxed Lua 5.5 with no `io`, `os`, `load` or `dofile`. They can't open sockets or load other
+code: `require` only loads the command's own `lib/*.lua`, from the copy read when the run started, and every script
+must be source (precompiled bytecode is refused). They only see files through `fs`.
 Everything that touches the outside goes through globals that are each gated by the command's `permissions`:
 
 | Permission | Lets the command |
@@ -17,6 +18,8 @@ Everything that touches the outside goes through globals that are each gated by 
 | `vault` | Use these keys in HTTP requests once you allow the command, never read them. |
 | `read` | Read files in these folders and below. |
 | `write` | Create, change and delete files in these folders and below (and read them). |
+| `terminal` | Ask you questions (`prompt`) and hand you a program it runs (`exec` with `terminal = true`), only when you run it in a terminal yourself. Each question names the command, answers are never hidden, and `print`/`log` can't send terminal control codes, so a script can't fake toolbox's own key prompts: toolbox asks for keys only in `tb self vault` commands. A program `exec` runs can open your terminal regardless (as `ssh` and `sudo` do), so `exec` itself is the bigger grant. |
+| `background` | Start programs that keep running after the command ends (`exec` with `detach = true`). |
 
 `fs` checks every path after resolving symlinks, so a link inside an allowed folder can't lead outside it. `~` is your
 home folder and a relative entry like `"."` is the folder you run `tb` in, so the same command can reach different
@@ -64,8 +67,9 @@ API keys your AI can use but never see. See [`tb self vault`](commands/vault.md)
 
 - **Scripts never get the value.** `vault("github")` returns the placeholder `{{vault:github}}`.
 - **Only commands you allowed.** Listing a key in `permissions.vault` isn't enough: you approve each command at
-  your terminal after seeing its script. The approval is pinned to a SHA-256 of `command.json` and `run.lua`, so
-  an edit (by an AI, by you, or by an update) needs a new approval. A brand-new command an AI just wrote can't
+  your terminal after seeing its script. The approval is pinned to a SHA-256 of `command.json` and every Lua file
+  of the command (its scripts and `lib/`), so an edit (by an AI, by you, or by an update), or a new `lib/` file,
+  needs a new approval. A brand-new command an AI just wrote can't
   touch your keys.
 - **Keys only go where you said.** toolbox swaps in the real key only in header values (and query parameters you
   named), only for hosts you allowed, only over https (http for this computer only). Keys for this computer are

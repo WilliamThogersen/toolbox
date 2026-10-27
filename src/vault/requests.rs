@@ -199,7 +199,7 @@ pub fn request(
     let used_by = registry
         .commands
         .iter()
-        .filter(|def| names::declared(&def.manifest.permissions.vault, &name))
+        .filter(|def| names::declared(&def.manifest.all_permissions().vault, &name))
         .map(|def| def.manifest.name.clone())
         .collect();
     Ok(Requested {

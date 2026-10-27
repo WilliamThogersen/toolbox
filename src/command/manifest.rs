@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::vault::names::{NAME_RULES, is_secret_pattern};
 
-pub const RESERVED_NAMES: &[&str] = &["self", "help"];
+pub const RESERVED_NAMES: &[&str] = &["self", "help", "tb", "toolbox"];
 
 const MAX_NAME_LEN: usize = 64;
 
@@ -27,6 +27,20 @@ pub struct Manifest {
     pub permissions: Permissions,
     #[serde(default, skip_serializing_if = "Limits::is_default")]
     pub limits: Limits,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subcommands: BTreeMap<String, Subcommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Subcommand {
+    pub description: String,
+    #[serde(default)]
+    pub args: BTreeMap<String, ArgSpec>,
+    #[serde(default)]
+    pub permissions: Permissions,
+    #[serde(default, skip_serializing_if = "Limits::is_default")]
+    pub limits: Limits,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
@@ -39,7 +53,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    fn is_default(&self) -> bool {
+    pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
 
@@ -93,6 +107,15 @@ pub struct Permissions {
     pub read: Vec<String>,
     #[serde(default)]
     pub write: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub terminal: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub background: bool,
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde's skip_serializing_if passes a reference")]
+fn is_false(flag: &bool) -> bool {
+    !flag
 }
 
 impl Manifest {
@@ -129,25 +152,58 @@ impl Manifest {
         if self.description.trim().is_empty() {
             problems.push("description must not be empty".to_string());
         }
-        for (name, spec) in &self.args {
-            problems.extend(validate_arg(name, spec));
-        }
-        for secret in &self.permissions.vault {
-            if !is_secret_pattern(secret) {
-                problems.push(format!(
-                    "permissions.vault entry {secret:?} is not a valid secret name or pattern ({NAME_RULES}, or github/* for any account)"
-                ));
-            }
-        }
-        if self.permissions.http.iter().any(|h| h.trim().is_empty()) {
-            problems.push("permissions.http must not contain empty hosts".to_string());
-        }
-        for (kind, folders) in [("read", &self.permissions.read), ("write", &self.permissions.write)] {
-            problems.extend(folders.iter().filter_map(|folder| validate_folder(kind, folder)));
-        }
-        problems.extend(self.limits.problems());
+        problems.extend(validate_spec("", &self.args, &self.permissions, &self.limits));
+        problems.extend(self.subcommand_problems());
         problems
     }
+
+    fn subcommand_problems(&self) -> Vec<String> {
+        if self.subcommands.is_empty() {
+            return Vec::new();
+        }
+        let at_top = !self.args.is_empty() || self.permissions != Permissions::default() || !self.limits.is_default();
+        let top = at_top.then(|| {
+            "a command with subcommands takes args, permissions and limits on each subcommand, not at the top".to_string()
+        });
+        let each = self.subcommands.iter().flat_map(|(name, sub)| {
+            let at = format!("subcommands.{name}: ");
+            let naming = (!is_valid_name(name) || name == "help").then(|| {
+                format!("subcommand {name:?} must be 1-{MAX_NAME_LEN} chars of a-z, 0-9, '-', '_', start with a letter or digit and not be \"help\"")
+            });
+            let description = sub
+                .description
+                .trim()
+                .is_empty()
+                .then(|| format!("{at}description must not be empty"));
+            naming
+                .into_iter()
+                .chain(description)
+                .chain(validate_spec(&at, &sub.args, &sub.permissions, &sub.limits))
+        });
+        top.into_iter().chain(each).collect()
+    }
+}
+
+fn validate_spec(at: &str, args: &BTreeMap<String, ArgSpec>, permissions: &Permissions, limits: &Limits) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, spec) in args {
+        problems.extend(validate_arg(name, spec));
+    }
+    for secret in &permissions.vault {
+        if !is_secret_pattern(secret) {
+            problems.push(format!(
+                "permissions.vault entry {secret:?} is not a valid secret name or pattern ({NAME_RULES}, or github/* for any account)"
+            ));
+        }
+    }
+    if permissions.http.iter().any(|h| h.trim().is_empty()) {
+        problems.push("permissions.http must not contain empty hosts".to_string());
+    }
+    for (kind, folders) in [("read", &permissions.read), ("write", &permissions.write)] {
+        problems.extend(folders.iter().filter_map(|folder| validate_folder(kind, folder)));
+    }
+    problems.extend(limits.problems());
+    problems.into_iter().map(|problem| format!("{at}{problem}")).collect()
 }
 
 fn validate_folder(kind: &str, folder: &str) -> Option<String> {

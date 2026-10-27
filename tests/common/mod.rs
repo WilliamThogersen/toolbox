@@ -1,6 +1,8 @@
 //! Helpers every end-to-end test file uses.
 #![expect(unsafe_code, reason = "starting `tb` without a terminal needs setsid between fork and exec")]
 
+pub mod pty;
+
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;

@@ -29,15 +29,16 @@ A name like `acme` always means a saved marketplace. To use a local folder with 
 ## What it does
 
 1. Fetches one commit of the repo with your own `git`, so private repos work through your SSH keys or git credentials.
-2. Checks every command in it: the manifest, the Lua syntax, and that `command.json` and `run.lua` are regular files
-   (symlinks are refused).
+2. Checks every command in it: the manifest, the Lua syntax, and that `command.json` and the Lua files are regular
+   files (symlinks are refused).
 3. Picks the commands: the ones you named, or every working one. Broken commands nobody asked for are skipped and
    listed.
 4. Shows each command's permissions, marks the risky ones with `!`, and asks.
-5. Copies `command.json` and `run.lua` into `~/.toolbox/commands/<name>/`, plus a `.source.json` that records the
-   repo, ref and commit for [`tb self update`](update.md), the marketplace when you named one, and a fingerprint of
-   the two files so [`tb self describe --origin`](describe.md#origins) can tell when they were edited. Nothing else in
-   the repo is copied.
+5. Copies `command.json` and the Lua files (`run.lua` or one per subcommand, plus `lib/*.lua`) into
+   `~/.toolbox/commands/<name>/`, plus a `.source.json` that records the repo, ref and commit for
+   [`tb self update`](update.md), the marketplace when you named one, and a fingerprint of those files so
+   [`tb self describe --origin`](describe.md#origins) can tell when they were edited. Nothing else in the repo is
+   copied.
 
 The prompt:
 

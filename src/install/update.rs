@@ -156,7 +156,7 @@ fn plan_one(local: Local, fetched: &Source, scan: &Scan) -> Outcome {
         def: def.clone(),
         source: source.clone(),
         change,
-        old_permissions: local.manifest.map(|m| m.permissions).unwrap_or_default(),
+        old_permissions: local.manifest.map(|m| m.all_permissions()).unwrap_or_default(),
     }))
 }
 
@@ -179,7 +179,7 @@ fn update_summary(plans: &[&Plan]) -> String {
         .map(|plan| {
             let Change { name, from, to } = &plan.change;
             let old_perms = one_line_permissions(&plan.old_permissions);
-            let new_perms = one_line_permissions(&plan.def.manifest.permissions);
+            let new_perms = one_line_permissions(&plan.def.manifest.all_permissions());
             let perms = if old_perms == new_perms {
                 format!("    permissions: {}", confirm::permissions(&new_perms))
             } else {
@@ -239,6 +239,7 @@ mod tests {
             args: BTreeMap::new(),
             permissions: Permissions::default(),
             limits: crate::command::manifest::Limits::default(),
+            subcommands: BTreeMap::new(),
         }
     }
 

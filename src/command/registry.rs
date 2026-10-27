@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::command::manifest::Manifest;
+use crate::command::sources::LIB_DIR;
 
 pub const MANIFEST_FILE: &str = "command.json";
 pub const SCRIPT_FILE: &str = "run.lua";
@@ -14,17 +15,6 @@ pub struct CommandDef {
     pub manifest: Manifest,
     pub manifest_source: String,
     pub dir: PathBuf,
-}
-
-impl CommandDef {
-    pub fn script_path(&self) -> PathBuf {
-        self.dir.join(SCRIPT_FILE)
-    }
-
-    pub fn read_script(&self) -> Result<String> {
-        let path = self.script_path();
-        fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -88,9 +78,8 @@ pub fn load_command(dir: &Path, folder: &str) -> std::result::Result<CommandDef,
     let manifest = Manifest::parse(&raw).map_err(|e| vec![problem(format!("{e:#}"))])?;
 
     let mut problems: Vec<Problem> = manifest.validate(folder).into_iter().map(problem).collect();
-    if !dir.join(SCRIPT_FILE).is_file() {
-        problems.push(problem(format!("missing {SCRIPT_FILE}")));
-    }
+    problems.extend(manifest.scripts().iter().filter_map(|script| script_problem(dir, script)).map(problem));
+    problems.extend(lib_problem(dir).map(problem));
     if problems.is_empty() {
         Ok(CommandDef {
             manifest,
@@ -100,6 +89,20 @@ pub fn load_command(dir: &Path, folder: &str) -> std::result::Result<CommandDef,
     } else {
         Err(problems)
     }
+}
+
+fn script_problem(dir: &Path, script: &str) -> Option<String> {
+    match dir.join(script).symlink_metadata() {
+        Ok(meta) if meta.is_file() => None,
+        Ok(meta) if meta.file_type().is_symlink() => Some(format!("{script} must be a plain file, not a link")),
+        Ok(_) => Some(format!("{script} must be a plain file")),
+        Err(_) => Some(format!("missing {script}")),
+    }
+}
+
+fn lib_problem(dir: &Path) -> Option<String> {
+    let meta = dir.join(LIB_DIR).symlink_metadata().ok()?;
+    (!meta.is_dir()).then(|| format!("{LIB_DIR} must be a folder, not a link or a file"))
 }
 
 #[cfg(test)]
@@ -133,6 +136,17 @@ mod tests {
         );
         write_command(tmp.path(), "noscript", r#"{"name":"noscript","description":"x"}"#, None);
         write_command(tmp.path(), "badjson", "{", Some(""));
+        write_command(
+            tmp.path(),
+            "group",
+            r#"{"name":"group","description":"x","subcommands":{"a":{"description":"x"},"b":{"description":"x"}}}"#,
+            None,
+        );
+        fs::write(tmp.path().join("group/a.lua"), "return function() end").unwrap();
+        write_command(tmp.path(), "linked", r#"{"name":"linked","description":"x"}"#, None);
+        std::os::unix::fs::symlink(tmp.path().join("hello/run.lua"), tmp.path().join("linked/run.lua")).unwrap();
+        write_command(tmp.path(), "libfile", r#"{"name":"libfile","description":"x"}"#, Some("return function() end"));
+        fs::write(tmp.path().join("libfile/lib"), "").unwrap();
 
         let registry = load(tmp.path()).unwrap();
         assert_eq!(registry.commands.len(), 1);
@@ -140,6 +154,9 @@ mod tests {
         assert!(registry.find("noscript").is_none());
 
         let broken: Vec<&str> = registry.problems.iter().map(|p| p.command.as_str()).collect();
-        assert_eq!(broken, vec!["badjson", "noscript"]);
+        assert_eq!(broken, vec!["badjson", "group", "libfile", "linked", "noscript"]);
+        assert_eq!(registry.problems[1].problem, "missing b.lua");
+        assert_eq!(registry.problems[2].problem, "lib must be a folder, not a link or a file");
+        assert_eq!(registry.problems[3].problem, "run.lua must be a plain file, not a link");
     }
 }
