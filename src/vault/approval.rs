@@ -182,7 +182,7 @@ fn shown(reaching: &[String]) -> String {
     }
 }
 
-fn full_text(def: &CommandDef, sources: &Sources) -> String {
+pub fn full_text(def: &CommandDef, sources: &Sources) -> String {
     let files: Vec<String> = sources
         .files()
         .map(|(path, text)| {

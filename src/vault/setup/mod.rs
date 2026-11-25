@@ -1,22 +1,25 @@
+mod menu;
+
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use super::approval;
 use super::commands::{Terminal, destination, find_command};
 use super::hosts::{local_note, normalize_host, normalize_query_param};
-use super::scope::{normalize_method, normalize_path};
 use super::log::{AuditLog, Event};
 use super::names::{self, is_secret_name};
 use super::requests::{self, KeyRequest};
+use super::scope::{normalize_method, normalize_path};
 use super::{SecretEntry, SecretValue, VaultData, VaultStore};
+use crate::cli::screen::{one_line, printable};
 use crate::command::registry::{CommandDef, Registry};
 use crate::command::sources::Sources;
-use crate::cli::screen::{one_line, printable};
+use menu::{Action, KeyRow, Menu, Script, UseRow};
 
 const MAX_TRIES: usize = 3;
+const MAX_PRESSES: usize = 100_000;
 
 #[derive(Debug, Default, PartialEq, Serialize)]
 pub struct Report {
@@ -45,7 +48,7 @@ pub struct Grant {
     pub command: String,
 }
 
-struct NewKey {
+pub struct NewKey {
     request: KeyRequest,
     requested: bool,
     calls: Vec<String>,
@@ -54,12 +57,6 @@ struct NewKey {
 struct Decision {
     grant: Grant,
     fingerprint: String,
-    allowed: bool,
-}
-
-struct NewKeys {
-    added: Vec<(String, SecretEntry)>,
-    skipped: Vec<String>,
 }
 
 pub fn setup(
@@ -73,15 +70,25 @@ pub fn setup(
     let only = only.map(|name| find_command(registry, name)).transpose()?;
     let vault = store.load()?;
     let requests::Waiting { requests: waiting, ignored } = requests::load(requests_path)?;
-
-    let NewKeys { added, skipped } = ask_keys(term, registry, keys_to_add(&vault, &waiting, only))?;
-    let with_keys = added
-        .iter()
-        .fold(vault, |data, (name, entry)| data.with_secret(name, entry.clone()));
-    let (yes, no) = review_commands(term, registry, only, &with_keys, &added)?;
+    let keys: Vec<KeyRow> = keys_to_add(&vault, &waiting, only)
+        .into_iter()
+        .map(|key| KeyRow { users: users_of(registry, &key.request.name), key, entry: None })
+        .collect();
+    let pending: BTreeSet<String> = keys.iter().map(|row| row.key.request.name.clone()).collect();
+    let (scripts, uses) = waiting_uses(registry, only, &vault, &pending)?;
+    let mut menu = Menu::new(keys, uses, scripts, &vault, registry);
+    if !menu.is_empty() {
+        run(term, &mut menu)?;
+    }
+    let plan = menu.plan();
+    let added: Vec<(String, SecretEntry)> = plan.added.iter().map(|(name, entry)| ((*name).to_string(), (*entry).clone())).collect();
+    let decide = |rows: &[&UseRow]| -> Vec<Decision> { rows.iter().map(|row| decision(&menu, row)).collect() };
+    let (yes, no) = (decide(&plan.allowed), decide(&plan.declined));
+    let skipped: Vec<String> = plan.skipped.iter().map(|name| (*name).to_string()).collect();
     for declined in &no {
         log.record(Event::Declined { key: declined.grant.key.clone(), command: declined.grant.command.clone() });
     }
+    let with_keys = added.iter().fold(vault.clone(), |data, (name, entry)| data.with_secret(name, entry.clone()));
     let done = grant(with_keys, &yes)?;
     let allowed: Vec<Grant> = yes.into_iter().map(|d| d.grant).collect();
     save(store, log, &done, &added, &allowed)?;
@@ -97,35 +104,112 @@ pub fn setup(
     })
 }
 
-fn ask_keys(term: &dyn Terminal, registry: &Registry, keys: Vec<NewKey>) -> Result<NewKeys> {
-    let answered = keys
-        .into_iter()
-        .map(|key| Ok((key.request.name.clone(), ask_new_key(term, registry, &key)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let (given, skipped): (Vec<_>, Vec<_>) = answered.into_iter().partition(|(_, entry)| entry.is_some());
-    Ok(NewKeys {
-        added: given.into_iter().filter_map(|(name, entry)| entry.map(|entry| (name, entry))).collect(),
-        skipped: skipped.into_iter().map(|(name, _)| name).collect(),
-    })
+fn decision(menu: &Menu<'_>, row: &UseRow) -> Decision {
+    Decision {
+        grant: Grant { key: row.key.clone(), command: menu.command(row).to_string() },
+        fingerprint: menu.scripts.get(row.script).map(|s| s.fingerprint.clone()).unwrap_or_default(),
+    }
 }
 
-fn review_commands(
-    term: &dyn Terminal,
-    registry: &Registry,
-    only: Option<&CommandDef>,
+fn run(term: &dyn Terminal, menu: &mut Menu<'_>) -> Result<()> {
+    term.full_screen(true)?;
+    let result = run_keys(term, menu);
+    term.full_screen(false)?;
+    result
+}
+
+fn run_keys(term: &dyn Terminal, menu: &mut Menu<'_>) -> Result<()> {
+    for _ in 0..MAX_PRESSES {
+        let (width, height) = term.size();
+        let key = term.key(&menu.render(width, height))?;
+        match menu.press(key) {
+            Action::Stay => {}
+            Action::AskKey(index) => {
+                term.full_screen(false)?;
+                ask_in_menu(term, menu, index);
+                term.full_screen(true)?;
+            }
+            Action::Read(script) => term.view(&menu.full_script(script))?,
+            Action::Save => return Ok(()),
+            Action::Quit => bail!("quit without saving. Nothing was changed"),
+        }
+    }
+    bail!("stopped after {MAX_PRESSES} key presses. Nothing was changed")
+}
+
+fn ask_in_menu(term: &dyn Terminal, menu: &mut Menu<'_>, index: usize) {
+    let Some(row) = menu.keys.get(index) else { return };
+    match ask_new_key(term, &row.users, &row.key) {
+        Ok(entry) => menu.set_entry(index, entry),
+        Err(err) => {
+            let text = format!("{} was not added: {err:#}", row.key.request.name);
+            menu.set_status(&text);
+        }
+    }
+}
+
+fn users_of(registry: &Registry, key: &str) -> Vec<String> {
+    registry
+        .commands
+        .iter()
+        .filter(|def| names::declared(&def.manifest.all_permissions().vault, key))
+        .map(|def| def.manifest.name.clone())
+        .collect()
+}
+
+fn waiting_uses<'a>(
+    registry: &'a Registry,
+    only: Option<&'a CommandDef>,
     vault: &VaultData,
-    added: &[(String, SecretEntry)],
-) -> Result<(Vec<Decision>, Vec<Decision>)> {
-    let new_names: BTreeSet<&str> = added.iter().map(|(name, _)| name.as_str()).collect();
+    pending: &BTreeSet<String>,
+) -> Result<(Vec<Script<'a>>, Vec<UseRow>)> {
     let commands: Vec<&CommandDef> = match only {
         Some(def) => vec![def],
         None => registry.commands.iter().collect(),
     };
-    let decisions = commands
+    let mut scripts = Vec::new();
+    let mut uses = Vec::new();
+    for def in commands {
+        let Some((script, keys)) = script_uses(def, vault, pending, only.is_some())? else { continue };
+        let index = scripts.len();
+        uses.extend(keys.into_iter().map(|(key, changed)| UseRow { script: index, key, changed, allowed: false }));
+        scripts.push(script);
+    }
+    Ok((scripts, uses))
+}
+
+type Uses<'a> = Option<(Script<'a>, Vec<(String, bool)>)>;
+
+fn script_uses<'a>(def: &'a CommandDef, vault: &VaultData, pending: &BTreeSet<String>, named: bool) -> Result<Uses<'a>> {
+    let declared = &def.manifest.all_permissions().vault;
+    let candidates: BTreeSet<&str> = vault
+        .secrets
+        .keys()
+        .chain(pending.iter())
+        .map(String::as_str)
+        .filter(|key| names::declared(declared, key))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let sources = match Sources::read(def) {
+        Ok(sources) => sources,
+        Err(err) if !named => {
+            eprintln!("toolbox: skipped {}: {err:#}", def.manifest.name);
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    let fingerprint = sources.fingerprint(&def.manifest_source);
+    let command = &def.manifest.name;
+    let keys: Vec<(String, bool)> = candidates
         .into_iter()
-        .map(|def| review_command(term, def, vault, &new_names, only.is_some()))
-        .collect::<Result<Vec<_>>>()?;
-    Ok(decisions.into_iter().flatten().partition(|d| d.allowed))
+        .filter_map(|key| match vault.get(key).and_then(|entry| entry.commands.get(command)) {
+            Some(approved) => (*approved != fingerprint).then(|| (key.to_string(), true)),
+            None => (named || pending.contains(key) || declared.iter().any(|name| name == key)).then(|| (key.to_string(), false)),
+        })
+        .collect();
+    Ok((!keys.is_empty()).then_some((Script { def, sources, fingerprint }, keys)))
 }
 
 fn grant(vault: VaultData, allowed: &[Decision]) -> Result<VaultData> {
@@ -195,19 +279,13 @@ fn keys_to_add(vault: &VaultData, waiting: &[KeyRequest], only: Option<&CommandD
     requested.chain(unrequested).collect()
 }
 
-fn ask_new_key(term: &dyn Terminal, registry: &Registry, key: &NewKey) -> Result<Option<SecretEntry>> {
+fn ask_new_key(term: &dyn Terminal, users: &[String], key: &NewKey) -> Result<Option<SecretEntry>> {
     let req = &key.request;
-    let users: Vec<&str> = registry
-        .commands
-        .iter()
-        .filter(|def| names::declared(&def.manifest.all_permissions().vault, &req.name))
-        .map(|def| def.manifest.name.as_str())
-        .collect();
     let header = [
         Some(format!("\nKey {} {}", req.name, if key.requested { "was requested" } else { "is missing" })),
         (!req.why.is_empty()).then(|| format!("  why: {}", one_line(&req.why))),
         req.note.as_ref().map(|note| format!("  note: {}", one_line(note))),
-        Some(match users.as_slice() {
+        Some(match users {
             [] => "  no command uses it yet".to_string(),
             names => format!("  used by {}", names.join(", ")),
         }),
@@ -279,58 +357,6 @@ fn ask_value(term: &dyn Terminal, name: &str) -> Result<Option<SecretValue>> {
     bail!("stopped after {MAX_TRIES} values that didn't work. Nothing was changed")
 }
 
-fn review_command(
-    term: &dyn Terminal,
-    def: &CommandDef,
-    vault: &VaultData,
-    new_names: &BTreeSet<&str>,
-    named: bool,
-) -> Result<Vec<Decision>> {
-    let declared = &def.manifest.all_permissions().vault;
-    if !vault.secrets.keys().any(|key| names::declared(declared, key)) {
-        return Ok(Vec::new());
-    }
-    let sources = match Sources::read(def) {
-        Ok(sources) => sources,
-        Err(err) if !named => {
-            eprintln!("toolbox: skipped {}: {err:#}", def.manifest.name);
-            return Ok(Vec::new());
-        }
-        Err(err) => return Err(err),
-    };
-    let fingerprint = sources.fingerprint(&def.manifest_source);
-    let command = &def.manifest.name;
-    let waiting: Vec<(&str, &SecretEntry)> = vault
-        .secrets
-        .iter()
-        .filter(|(key, _)| names::declared(declared, key))
-        .filter(|(key, entry)| match entry.commands.get(command) {
-            Some(approved) => *approved != fingerprint,
-            None => named || new_names.contains(key.as_str()) || declared.contains(key),
-        })
-        .map(|(key, entry)| (key.as_str(), entry))
-        .collect();
-    let Some(((first, _), rest)) = waiting.split_first() else {
-        return Ok(Vec::new());
-    };
-    let review = approval::review(def, &sources, &waiting);
-    term.show("")?;
-    let first_answer = term.review(&review.summary, &review.full, &review.question)?;
-    let answers = rest
-        .iter()
-        .map(|(key, _)| term.confirm(&printable(&format!("Allow {command} to use {key} too?"))))
-        .collect::<Result<Vec<bool>>>()?;
-    let keys = std::iter::once(*first).chain(rest.iter().map(|(key, _)| *key));
-    Ok(keys
-        .zip(std::iter::once(first_answer).chain(answers))
-        .map(|(key, allowed)| Decision {
-            grant: Grant { key: key.to_string(), command: command.clone() },
-            fingerprint: fingerprint.clone(),
-            allowed,
-        })
-        .collect())
-}
-
 fn change(added: &[(String, SecretEntry)], allowed: &[Grant]) -> String {
     let is_new = |grant: &&Grant| added.iter().any(|(name, _)| *name == grant.key);
     let (to_new, to_old): (Vec<&Grant>, Vec<&Grant>) = allowed.iter().partition(is_new);
@@ -380,7 +406,8 @@ mod tests {
 
     use super::*;
     use crate::command::manifest::Manifest;
-    use crate::vault::approval::Access;
+    use crate::vault::approval::{self, Access};
+    use crate::vault::commands::Key;
     use crate::vault::log::MemoryLog;
     use crate::vault::requests::{REQUESTS_FILE, with_request};
     use crate::vault::store::MemoryStore;
@@ -425,6 +452,25 @@ mod tests {
         fn review(&self, summary: &str, _full: &str, question: &str) -> Result<bool> {
             self.seen.borrow_mut().push(summary.to_string());
             Ok(self.next(question)? == "y")
+        }
+        fn key(&self, screen: &str) -> Result<Key> {
+            let key = match self.next(screen)?.as_str() {
+                "<up>" => Key::Up,
+                "<down>" => Key::Down,
+                "<enter>" => Key::Enter,
+                "<space>" => Key::Space,
+                "<tab>" => Key::Tab,
+                "<esc>" => Key::Quit,
+                other => other.chars().next().map_or(Key::Other, Key::Char),
+            };
+            Ok(key)
+        }
+        fn view(&self, text: &str) -> Result<()> {
+            self.seen.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+        fn size(&self) -> (usize, usize) {
+            (160, 60)
         }
     }
 
@@ -486,11 +532,17 @@ mod tests {
         Grant { key: key.into(), command: command.into() }
     }
 
+    const SAVE: [&str; 2] = ["s", "<enter>"];
+
+    fn keys(parts: &[&[&'static str]]) -> Vec<&'static str> {
+        parts.concat()
+    }
+
     #[test]
     fn a_requested_key_is_added_and_allowed_with_one_save() {
         let home = Home::new(&[("lighthouse", &["www.googleapis.com"], &["maps"])]);
         home.request("maps", &["www.googleapis.com"], &["key"]);
-        let term = Script::new(&["", "", VALUE, "y"]);
+        let term = Script::new(&keys(&[&["<enter>", "", "", VALUE, "<down>", "<space>"], &SAVE]));
         let report = home.setup(&term, None).unwrap();
         assert_eq!(
             report,
@@ -500,6 +552,7 @@ mod tests {
         assert!(term.saw("Hosts it may go to (Enter keeps www.googleapis.com, - skips this key): "));
         assert!(term.saw("Query parameters it may go in (Enter keeps key, - for headers only): "));
         assert!(term.saw("lighthouse wants to use your key maps"));
+        assert!(term.saw("let lighthouse use maps"), "the save screen lists what is saved");
         assert_eq!(
             *home.store.changes.borrow(),
             vec![
@@ -513,6 +566,7 @@ mod tests {
         assert!(matches!(&events[0], Event::Added { key, new_value: true, .. } if key == "maps"), "{events:?}");
         assert_eq!(events[1], Event::Allowed { key: "maps".into(), command: "lighthouse".into() });
         assert!(!format!("{events:?}").contains(VALUE));
+        assert!(!term.seen.borrow().iter().any(|seen| seen.contains(VALUE)), "the value is never drawn");
     }
 
     #[test]
@@ -524,7 +578,7 @@ mod tests {
             .limited_to(&strings(&["GET"]), &strings(&["/pagespeedonline"]))
             .unwrap();
         requests::save(&home.requests(), &[narrow]).unwrap();
-        let term = Script::new(&["", "", "-", VALUE, "y"]);
+        let term = Script::new(&keys(&[&["<enter>", "", "", "-", VALUE, "<down>", "<space>"], &SAVE]));
         home.setup(&term, None).unwrap();
         assert!(term.saw("Methods it may be sent with (Enter keeps GET, - for any): "));
         assert!(term.saw("Paths it may go to (Enter keeps /pagespeedonline, - for any): "));
@@ -538,10 +592,11 @@ mod tests {
     fn the_human_can_change_where_a_requested_key_goes() {
         let home = Home::new(&[]);
         home.request("maps", &["evil.example"], &["key"]);
-        let term = Script::new(&["https://bad", "maps.googleapis.com", "-", VALUE]);
+        let term = Script::new(&keys(&[&["<enter>", "https://bad", "maps.googleapis.com", "-", VALUE], &SAVE]));
         let report = home.setup(&term, None).unwrap();
         assert_eq!(report.added, vec!["maps"]);
         assert!(term.saw("is not a valid host"));
+        assert!(term.saw("add the key maps, sent only to maps.googleapis.com"));
         let data = home.store.load().unwrap();
         let maps = data.get("maps").unwrap();
         assert_eq!((maps.hosts.clone(), maps.query_params.clone()), (vec!["maps.googleapis.com".into()], vec![]));
@@ -553,39 +608,61 @@ mod tests {
         let home = Home::new(&[]);
         home.request("maps", &["maps.googleapis.com"], &[]);
         home.request("github", &["api.github.com"], &[]);
-        let term = Script::new(&["", "", "-"]);
+        let term = Script::new(&keys(&[&["<enter>", "", "", "<down>", "<enter>", "-"], &SAVE]));
         let report = home.setup(&term, None).unwrap();
         assert_eq!(report.skipped, vec!["maps", "github"]);
+        assert!(term.saw("Still waiting"));
         assert!(home.store.changes.borrow().is_empty());
         assert_eq!(requests::load(&home.requests()).unwrap().requests.len(), 2);
     }
 
     #[test]
-    fn stopping_halfway_saves_nothing() {
+    fn stopping_or_quitting_halfway_saves_nothing() {
         let home = Home::new(&[("lighthouse", &["www.googleapis.com"], &["maps"])]);
         home.request("maps", &["www.googleapis.com"], &[]);
-        assert!(home.setup(&Script::new(&["", VALUE]), None).is_err(), "no answer at the review");
-        assert!(home.setup(&Script::new(&["a b", "c d", "e f"]), None).unwrap_err().to_string().contains("Nothing was changed"));
-        assert!(home.setup(&Script::new(&["", "short", "short", "short"]), None).is_err());
+        assert!(home.setup(&Script::new(&["<enter>", "", VALUE]), None).is_err(), "no keys left");
+        let quit = Script::new(&["<enter>", "", VALUE, "q", "q"]);
+        assert!(home.setup(&quit, None).unwrap_err().to_string().contains("Nothing was changed"));
+        assert!(quit.saw("Press q again to quit without saving"));
+        let bad = Script::new(&["<enter>", "a b", "c d", "e f", "<esc>"]);
+        assert!(home.setup(&bad, None).unwrap_err().to_string().contains("quit without saving"));
+        assert!(bad.saw("maps was not added: stopped after 3 answers"));
         assert!(home.store.changes.borrow().is_empty());
         assert_eq!(requests::load(&home.requests()).unwrap().requests.len(), 1);
+    }
+
+    #[test]
+    fn a_command_can_only_be_allowed_once_its_key_is_there() {
+        let home = Home::new(&[("lighthouse", &["www.googleapis.com"], &["maps"])]);
+        home.request("maps", &["www.googleapis.com"], &[]);
+        let term = Script::new(&keys(&[&["<down>", "<down>", "<space>", "v", "<up>", "<up>", "<up>"], &SAVE]));
+        let report = home.setup(&term, None).unwrap();
+        assert!(term.saw("Add the key maps first"));
+        assert!(term.saw("add the key first"));
+        assert!(term.saw("return function() end"), "v pages the whole script");
+        assert_eq!(report.skipped, vec!["maps"]);
+        assert!(report.allowed.is_empty() && report.declined.is_empty(), "{report:?}");
     }
 
     #[test]
     fn changed_commands_are_reviewed_again_and_declines_are_logged() {
         let home = Home::new(&[("charge", &["api.stripe.com"], &["stripe"]), ("refund", &["api.stripe.com"], &["stripe"])]);
         home.request("stripe", &["api.stripe.com"], &[]);
-        home.setup(&Script::new(&["", VALUE, "y", "y"]), None).unwrap();
+        let both = keys(&[&["<enter>", "", VALUE, "<down>", "<space>", "<down>", "<space>"], &SAVE]);
+        home.setup(&Script::new(&both), None).unwrap();
         assert_eq!(home.access("stripe").iter().filter(|(_, a)| *a == Access::Allowed).count(), 2);
 
         fs::write(home.dir.path().join("charge/run.lua"), "return function() return 1 end").unwrap();
-        let term = Script::new(&["n"]);
+        let term = Script::new(&SAVE);
         let report = home.setup(&term, None).unwrap();
+        assert!(term.saw("changed since you allowed it"));
+        assert!(term.saw("charge may not use stripe"));
         assert_eq!(report.declined, vec![grant("stripe", "charge")]);
         assert_eq!(home.store.changes.borrow().len(), 1, "a decline saves nothing");
         assert!(home.log.0.borrow().contains(&Event::Declined { key: "stripe".into(), command: "charge".into() }));
 
-        assert_eq!(home.setup(&Script::new(&["y"]), None).unwrap().allowed, vec![grant("stripe", "charge")]);
+        let again = keys(&[&["<space>"], &SAVE]);
+        assert_eq!(home.setup(&Script::new(&again), None).unwrap().allowed, vec![grant("stripe", "charge")]);
         assert!(home.setup(&Script::new(&[]), None).unwrap().is_empty(), "nothing waits, nothing is asked");
     }
 
@@ -594,15 +671,16 @@ mod tests {
         let home = Home::new(&[("stars", &["api.github.com"], &["github/*"])]);
         home.request("github/work", &["api.github.com"], &[]);
         home.request("github/home", &["api.github.com"], &[]);
-        let term = Script::new(&["", VALUE, "", VALUE, "y", "n"]);
+        let add_both = ["<enter>", "", VALUE, "<down>", "<enter>", "", VALUE, "<down>"];
+        let term = Script::new(&keys(&[&add_both, &["<space>"], &SAVE]));
         let report = home.setup(&term, None).unwrap();
-        assert!(term.saw("stars wants to use your keys github/home, github/work"));
-        assert!(term.saw("Allow stars to use github/work too?"));
+        assert!(term.saw("stars wants to use your key github/home"));
+        assert!(term.saw("stars may use github/work"));
         assert_eq!(report.allowed, vec![grant("github/home", "stars")]);
         assert_eq!(report.declined, vec![grant("github/work", "stars")]);
 
         assert!(home.setup(&Script::new(&[]), None).unwrap().is_empty(), "a sweep leaves declined accounts alone");
-        let report = home.setup(&Script::new(&["y"]), Some("stars")).unwrap();
+        let report = home.setup(&Script::new(&keys(&[&["<space>"], &SAVE])), Some("stars")).unwrap();
         assert_eq!(report.allowed, vec![grant("github/work", "stars")]);
     }
 
@@ -612,12 +690,12 @@ mod tests {
             ("one", &["api.stripe.com", "*"], &["stripe"]),
             ("two", &["api.stripe.com", "hooks.slack.com"], &["stripe", "slack"]),
         ]);
-        let term = Script::new(&["", VALUE, "y"]);
+        let term = Script::new(&keys(&[&["<enter>", "", VALUE, "<down>", "<space>"], &SAVE]));
         assert_eq!(home.setup(&term, Some("one")).unwrap().added, vec!["stripe"]);
         assert!(term.saw("Key stripe is missing\n  used by one, two"));
         assert!(term.saw("Hosts it may go to (Enter keeps api.stripe.com, - skips this key): "));
 
-        let term = Script::new(&["", "y"]);
+        let term = Script::new(&keys(&[&["<enter>", "", "<down>", "<down>", "<space>"], &SAVE]));
         let report = home.setup(&term, Some("two")).unwrap();
         assert!(term.saw("the command calls api.stripe.com, hooks.slack.com"));
         assert!(term.saw("Hosts it may go to (empty skips this key): "), "two hosts: no default");
@@ -632,7 +710,7 @@ mod tests {
         let home = Home::new(&[("charge", &["api.stripe.com"], &["stripe"])]);
         home.request("stripe", &["api.stripe.com"], &[]);
         home.request("maps", &["maps.googleapis.com"], &[]);
-        home.setup(&Script::new(&["", VALUE, "y"]), Some("charge")).unwrap();
+        home.setup(&Script::new(&keys(&[&["<enter>", "", VALUE, "<down>", "<space>"], &SAVE])), Some("charge")).unwrap();
         let left: Vec<String> = requests::load(&home.requests()).unwrap().requests.into_iter().map(|r| r.name).collect();
         assert_eq!(left, vec!["maps"]);
     }
@@ -654,8 +732,9 @@ mod tests {
         home.store.save(&VaultData::default().with_secret("github", entry), "test").unwrap();
         home.request("k0", &["a.example"], &[]);
         home.request("k1", &["b.example"], &[]);
-        let term = Script::new(&["", VALUE, "", VALUE, "y", "y", "y"]);
-        home.setup(&term, None).unwrap();
+        let add = ["<enter>", "", VALUE, "<down>", "<enter>", "", VALUE];
+        let allow = ["<down>", "<space>", "<down>", "<space>", "<down>", "<space>"];
+        home.setup(&Script::new(&keys(&[&add, &allow, &SAVE])), None).unwrap();
         let changes = home.store.changes.borrow();
         assert_eq!(
             changes[1],
@@ -665,11 +744,23 @@ mod tests {
     }
 
     #[test]
+    fn the_access_view_shows_what_each_key_is_allowed_for() {
+        let home = Home::new(&[("charge", &["api.stripe.com"], &["stripe"]), ("refund", &["api.stripe.com"], &["stripe"])]);
+        home.request("stripe", &["api.stripe.com"], &[]);
+        home.setup(&Script::new(&keys(&[&["<enter>", "", VALUE, "<down>", "<space>"], &SAVE])), None).unwrap();
+        let term = Script::new(&["<tab>", "<esc>", "<esc>"]);
+        assert!(home.setup(&term, None).is_err(), "quit");
+        assert!(term.saw("stripe\u{1b}[0m  goes to api.stripe.com"));
+        assert!(term.saw("charge                       allowed"));
+        assert!(term.saw("refund                       not allowed"));
+    }
+
+    #[test]
     fn broken_request_entries_are_skipped_and_cleaned_up() {
         let home = Home::new(&[]);
         let file = r#"{"requests":[{"name":"bad","hosts":["localhost"]},{"name":"maps","hosts":["maps.googleapis.com"],"why":"Maps"}]}"#;
         fs::write(home.requests(), file).unwrap();
-        let report = home.setup(&Script::new(&["", VALUE]), None).unwrap();
+        let report = home.setup(&Script::new(&keys(&[&["<enter>", "", VALUE], &SAVE])), None).unwrap();
         assert_eq!((report.added, report.ignored_requests), (vec!["maps".to_string()], 1));
         let left = requests::load(&home.requests()).unwrap();
         assert_eq!((left.requests.len(), left.ignored), (0, 0));
@@ -680,8 +771,8 @@ mod tests {
         let home = Home::new(&[("broken", &["api.stripe.com"], &["stripe"]), ("charge", &["api.stripe.com"], &["stripe"])]);
         home.request("stripe", &["api.stripe.com"], &[]);
         fs::remove_file(home.dir.path().join("broken/run.lua")).unwrap();
-        let report = home.setup(&Script::new(&["", VALUE, "y"]), None).unwrap();
+        let report = home.setup(&Script::new(&keys(&[&["<enter>", "", VALUE, "<down>", "<space>"], &SAVE])), None).unwrap();
         assert_eq!(report.allowed, vec![grant("stripe", "charge")]);
-        assert!(home.setup(&Script::new(&["y"]), Some("broken")).is_err(), "a named command still fails loudly");
+        assert!(home.setup(&Script::new(&[]), Some("broken")).is_err(), "a named command still fails loudly");
     }
 }

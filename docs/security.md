@@ -117,7 +117,8 @@ each. An agent can edit that file, but not the copy in the macOS system log.
   again before a changed binary reads the keychain: only click Allow right after you installed or upgraded toolbox
   yourself.
 - **Hosts you accept without reading.** An agent can [request a key](commands/vault.md#tb-self-vault-request) for
-  any host. `tb self vault setup` shows the hosts and lets you change them, and pressing Enter keeps them. Read them,
+  any host. `tb self vault setup` shows the hosts and lets you change them, and pressing Enter keeps them. Its save screen
+  (`s`) names every host again. Read them,
   and the Touch ID sentence that names them again, before you paste a key.
 - **A Touch ID prompt you didn't expect.** An agent can start a vault change and make macOS ask you. Read the
   sentence in the dialog: if you didn't start that change, cancel it and look at

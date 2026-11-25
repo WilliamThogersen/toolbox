@@ -135,16 +135,21 @@ $ tb self vault request github --host api.github.com --why "Read star counts of 
 ```console
 $ tb self vault setup
 
+Keys to add
+> [ ] github                   waiting for you, enter to paste it
+
+Commands that want a key
+  [ ] stars may use github                     add the key first
+------------------------------------------------------------
 Key github was requested
   why: Read star counts of your private GitHub repos
   note: Get it at https://github.com/settings/tokens
   used by stars
-Hosts it may go to (Enter keeps api.github.com, - skips this key):
-Paste the key for github (input is hidden, empty skips it):
-stars wants to use your key github
-  ...
-Allow stars to use github? [y/N, v = read the whole script] y
+up/down move  enter choose  v read script  tab current access  s save  q quit
 ```
+
+Enter on the key asks where it may go and for the key itself. Then tick `stars` after reading what its script
+does, press `s` to see exactly what will be saved, and Enter. One Touch ID saves it.
 
 Rather type it all yourself? `tb self vault add github --host api.github.com`, then `tb self vault allow github stars`.
 

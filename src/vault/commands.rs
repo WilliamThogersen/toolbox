@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow, bail, ensure};
@@ -21,6 +22,55 @@ pub trait Terminal {
     fn show(&self, text: &str) -> Result<()>;
     fn confirm(&self, prompt: &str) -> Result<bool>;
     fn review(&self, summary: &str, full: &str, question: &str) -> Result<bool>;
+
+    fn key(&self, _screen: &str) -> Result<Key> {
+        bail!("this needs a human at an interactive terminal")
+    }
+
+    fn view(&self, text: &str) -> Result<()> {
+        self.show(text)
+    }
+
+    fn size(&self) -> (usize, usize) {
+        (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+    }
+
+    fn full_screen(&self, _on: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+const DEFAULT_WIDTH: usize = 80;
+const DEFAULT_HEIGHT: usize = 24;
+const CLEAR_SCREEN: &str = "\x1b[H\x1b[2J";
+const ENTER_FULL_SCREEN: &str = "\x1b[?1049h";
+const LEAVE_FULL_SCREEN: &str = "\x1b[?1049l";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Up,
+    Down,
+    Enter,
+    Space,
+    Tab,
+    Quit,
+    Char(char),
+    Other,
+}
+
+impl Key {
+    pub fn parse(bytes: &[u8]) -> Self {
+        match bytes {
+            [0x1b, b'[' | b'O', b'A', ..] => Self::Up,
+            [0x1b, b'[' | b'O', b'B', ..] => Self::Down,
+            [0x1b] | [0x03 | 0x04, ..] => Self::Quit,
+            [b'\r' | b'\n', ..] => Self::Enter,
+            [b' ', ..] => Self::Space,
+            [b'\t', ..] => Self::Tab,
+            [byte, ..] if byte.is_ascii_graphic() => Self::Char(char::from(*byte)),
+            _ => Self::Other,
+        }
+    }
 }
 
 pub struct Tty;
@@ -57,7 +107,37 @@ impl Terminal for Tty {
         writeln!(tty, "No answer after reading it {MAX_VIEWS} times, so no.")?;
         Ok(false)
     }
+
+    fn key(&self, screen: &str) -> Result<Key> {
+        let mut tty = open_tty()?;
+        write!(tty, "{CLEAR_SCREEN}{screen}")?;
+        tty.flush()?;
+        let raw = crate::sys::RawMode::enter(tty.as_raw_fd()).map_err(no_tty)?;
+        let mut bytes = [0u8; 8];
+        let read = tty.read(&mut bytes)?;
+        drop(raw);
+        Ok(Key::parse(bytes.get(..read).unwrap_or_default()))
+    }
+
+    fn view(&self, text: &str) -> Result<()> {
+        page(&open_tty()?, text)
+    }
+
+    fn size(&self) -> (usize, usize) {
+        open_tty()
+            .ok()
+            .and_then(|tty| crate::sys::terminal_size(tty.as_raw_fd()))
+            .unwrap_or((DEFAULT_WIDTH, DEFAULT_HEIGHT))
+    }
+
+    fn full_screen(&self, on: bool) -> Result<()> {
+        let mut tty = open_tty()?;
+        write!(tty, "{}", if on { ENTER_FULL_SCREEN } else { LEAVE_FULL_SCREEN })?;
+        tty.flush()?;
+        Ok(())
+    }
 }
+
 
 fn open_tty() -> Result<File> {
     OpenOptions::new()
@@ -403,6 +483,20 @@ mod tests {
             manifest_source: source,
             dir,
         }
+    }
+
+    #[test]
+    fn keys_parse_from_what_a_terminal_sends() {
+        assert_eq!(Key::parse(b"\x1b[A"), Key::Up);
+        assert_eq!(Key::parse(b"\x1bOB"), Key::Down);
+        assert_eq!(Key::parse(b"\r"), Key::Enter);
+        assert_eq!(Key::parse(b" "), Key::Space);
+        assert_eq!(Key::parse(b"\t"), Key::Tab);
+        assert_eq!(Key::parse(b"\x1b"), Key::Quit);
+        assert_eq!(Key::parse(b"\x03"), Key::Quit, "ctrl-c is a key in raw mode");
+        assert_eq!(Key::parse(b"q"), Key::Char('q'));
+        assert_eq!(Key::parse(b"\x1b[C"), Key::Other);
+        assert_eq!(Key::parse(b""), Key::Other);
     }
 
     #[test]

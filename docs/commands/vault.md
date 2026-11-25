@@ -32,24 +32,9 @@ Let your AI agent prepare everything. You only paste the key:
 
 1. The agent writes the command and runs `tb self vault request <name> --host <host> --why <text>`. That needs no
    terminal and doesn't touch the vault.
-2. You run `tb self vault setup`. It shows each requested key and why it's needed, asks you to paste it, shows the
-   command's script and asks yes or no. One Touch ID saves it all.
-
-```console
-$ tb self vault setup
-
-Key pagespeed was requested
-  why: Run Lighthouse audits on your sites through Google's PageSpeed API
-  note: Get it at https://console.cloud.google.com/apis/credentials
-  used by lighthouse
-Hosts it may go to (Enter keeps www.googleapis.com, - skips this key):
-Query parameters it may go in (Enter keeps key, - for headers only):
-Paste the key for pagespeed (input is hidden, empty skips it):
-lighthouse wants to use your key pagespeed
-  ...
-Allow lighthouse to use pagespeed? [y/N, v = read the whole script] y
-{ "added": ["pagespeed"], "allowed": [{ "key": "pagespeed", "command": "lighthouse" }], "declined": [], "skipped": [] }
-```
+2. You run `tb self vault setup`. It lists every requested key and every command waiting for one. Move with the
+   arrow keys, press Enter on a key to paste it, tick the commands that may use it after reading their script, and
+   press `s` to see what will be saved. One Touch ID saves it all.
 
 After an agent edits a command, run `tb self vault setup` again to review the changes.
 
@@ -89,19 +74,46 @@ dialog names the hosts again.
 
 ## tb self vault setup
 
-Everything waiting for you, in one go:
+Everything waiting for you, on one screen you move through with the arrow keys (or `j` and `k`):
 
-1. **Requested keys.** For each one: why it's needed, then where it may go (Enter keeps what the request says, or type other hosts), then
-   the methods and paths it may be sent with when the request named some (Enter keeps them, `-` allows any), then
-   the value at a hidden prompt. An empty value or `-` at the hosts prompt skips the key and keeps its request for
-   next time.
-2. **Commands waiting for a key.** Each command's review screen, the same one [`allow`](#tb-self-vault-allow) shows,
-   then one yes or no per key. A command waits when it lists a key by name and was never allowed, when a key was
-   just added for it, or when it changed since you allowed it.
+```
+tb self vault setup  what is waiting for you
 
-Nothing is saved until the end, so `Ctrl-C` changes nothing. Then one Touch ID covers every key added and every
-command allowed. The dialog names each change, starting with commands that get a key you already had. When you go
-through everything, a command whose Lua files can't be read is skipped with a note on stderr.
+Keys to add
+> [x] pagespeed                ready, goes to www.googleapis.com (also as query parameter key)
+  [ ] github/work              waiting for you, enter to paste it
+
+Commands that want a key
+  [x] lighthouse may use pagespeed             new
+  [ ] stars may use github/work                add the key first
+------------------------------------------------------------
+Key pagespeed was requested
+  why: Run Lighthouse audits through PageSpeed
+  ...
+up/down move  enter choose  v read script  tab current access  s save  q quit
+```
+
+The part under the line shows the item under the cursor: why a key was requested and where it may go, or a
+command's review, the same one [`allow`](#tb-self-vault-allow) shows.
+
+| Key | What it does |
+|-----|--------------|
+| up, down, `k`, `j` | Move. |
+| Enter, space | On a key: check where it may go (Enter keeps what the request says, or type other hosts), the methods and paths when the request named some (Enter keeps them, `-` allows any), then paste the value at a hidden prompt. An empty value or `-` at the hosts prompt leaves it out. On a command: tick or untick it. A command can only be ticked once its key is there. |
+| `v` | Read the whole script of the command under the cursor. |
+| Tab, `a` | Show the keys you already have, where each may go, and which commands are allowed, changed since you allowed them, or not allowed. |
+| `s` | Show exactly what will be saved, what is not allowed and which requests stay. Enter or `y` saves, any other key goes back. |
+| `q`, Esc, `Ctrl-C` | Quit without saving. When you added or ticked something, press it twice. |
+
+**Keys** are the requested ones that aren't stored yet. **Commands** wait when they list a key by name and were never
+allowed, when a key is being added for them, or when they changed since you allowed them: those say `changed since
+you allowed it`.
+
+Nothing is saved before you press `s` and Enter. Then one Touch ID covers every key added and every command ticked.
+The dialog names each change, starting with commands that get a key you already had. Commands left unticked whose
+key is there are logged as declined; requests for keys you didn't add stay for next time. When you go through
+everything, a command whose Lua files can't be read is skipped with a note on stderr. Quitting prints an error and
+changes nothing.
 
 | Argument | Meaning |
 |----------|---------|

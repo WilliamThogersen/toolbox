@@ -147,6 +147,46 @@ pub fn syslog(message: &CStr) {
     unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), message.as_ptr()) };
 }
 
+pub struct RawMode {
+    fd: libc::c_int,
+    saved: libc::termios,
+}
+
+impl RawMode {
+    pub fn enter(fd: libc::c_int) -> io::Result<Self> {
+        // SAFETY: termios is plain C data, for which all zeroes is a valid value.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: tcgetattr only writes the termios it is given, which outlives the call.
+        if unsafe { libc::tcgetattr(fd, &raw mut saved) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut raw = saved;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+        raw.c_iflag &= !(libc::IXON | libc::ICRNL);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        // SAFETY: `raw` is a complete termios that outlives the call.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const raw) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd, saved })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        // SAFETY: `saved` is the complete termios tcgetattr filled in `enter`.
+        unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &raw const self.saved) };
+    }
+}
+
+pub fn terminal_size(fd: libc::c_int) -> Option<(usize, usize)> {
+    let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    // SAFETY: TIOCGWINSZ only writes the winsize it is given, which outlives the call.
+    let status = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &raw mut size) };
+    (status == 0 && size.ws_col > 0 && size.ws_row > 0).then(|| (usize::from(size.ws_col), usize::from(size.ws_row)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
