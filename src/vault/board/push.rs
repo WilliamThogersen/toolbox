@@ -27,6 +27,7 @@ pub fn push(local: &dyn VaultStore, board: &Connection, term: &dyn Terminal, nam
     for name in names {
         ensure!(vault.get(name).is_some(), "no secret named {name:?} on this Mac");
     }
+    let on_board: Vec<String> = board.secrets()?.into_iter().map(|held| held.name).collect();
     let mut report = PushReport::default();
     let mut candidates = Vec::new();
     for (name, entry) in &vault.secrets {
@@ -35,6 +36,8 @@ pub fn push(local: &dyn VaultStore, board: &Connection, term: &dyn Terminal, nam
         }
         if entry.oauth.is_some() {
             report.skipped.push(skipped(name, "a sign-in key stays on this Mac for now"));
+        } else if on_board.contains(name) {
+            report.skipped.push(skipped(name, "the board already has a key with this name, so it is not overwritten. Rotate it on the board"));
         } else if entry.remote {
             report.skipped.push(skipped(name, "the board already holds it"));
         } else {

@@ -279,7 +279,7 @@ impl HttpClient {
             url: outgoing.url.as_str(),
             headers: &outgoing.headers,
             query: &outgoing.query,
-            body,
+            body: body.as_deref(),
             timeout_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
         })?;
         Ok(ResponseData {

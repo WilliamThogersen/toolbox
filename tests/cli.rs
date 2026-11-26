@@ -1693,7 +1693,7 @@ fn answer(status: u16, body: &str) -> Value {
 fn a_paired_mac_sends_requests_with_placeholders_to_the_board_and_holds_no_key() {
     let tb = Toolbox::new();
     let target = "http://127.0.0.1:9/";
-    let (board, seen) = fake_board(json!({ "secrets": [{ "name": "test", "hosts": [host_of(target)], "methods": [], "paths": [] }] }), answer(201, r#"{"made":true}"#));
+    let (board, seen) = fake_board(json!({ "secrets": [{ "name": "test", "hosts": [host_of(target)], "methods": null, "paths": null }] }), answer(201, r#"{"made":true}"#));
     tb.edit_vault(|vault| vault["keys"]["test"] = json!({ "value": "", "hosts": [], "remote": true }));
     tb.add_command(
         "call",
@@ -1792,11 +1792,12 @@ fn push_moves_local_keys_to_the_board_once_it_confirms() {
     assert_eq!(report["skipped"][0]["name"], "signin");
     assert_eq!(report["failed"][0]["name"], "bad-one");
 
+    assert_eq!(seen.recv().unwrap().method, "GET");
     let put = seen.recv().unwrap();
     assert_eq!((put.method.as_str(), put.path.as_str(), put.auth.as_str()), ("PUT", "/api/v1/secrets/bad-one", "Bearer device-token-123"));
     let put = seen.recv().unwrap();
     assert_eq!(put.path, "/api/v1/secrets/good");
-    assert_eq!(put.body, json!({ "value": SECRET, "allowed_hosts": ["api.example.com"], "methods": ["GET"], "paths": [] }));
+    assert_eq!(put.body, json!({ "value": SECRET, "hosts": ["api.example.com"], "methods": ["GET"] }));
 
     let vault = tb.vault();
     assert_eq!(vault["keys"]["good"]["value"], "");
@@ -1818,6 +1819,6 @@ fn push_needs_a_pairing_and_a_human() {
     let (board, seen) = fake_board(json!([]), answer(200, "{}"));
     let no_terminal = tb.run_with_env(&["self", "vault", "push"], &paired(&board));
     assert!(!no_terminal.status.success());
-    assert!(seen.try_recv().is_err(), "nothing is sent without a person saying yes");
+    assert!(seen.try_iter().all(|call| call.method == "GET"), "nothing is sent without a person saying yes");
     assert_eq!(tb.vault()["keys"]["k"]["value"], SECRET);
 }

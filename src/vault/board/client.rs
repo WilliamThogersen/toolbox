@@ -18,22 +18,26 @@ const SHOWN_ERROR_CHARS: usize = 300;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BoardSecret {
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "list_or_null")]
     pub hosts: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "list_or_null")]
     pub methods: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "list_or_null")]
     pub paths: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+fn list_or_null<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+    Ok(Option::<Vec<String>>::deserialize(de)?.unwrap_or_default())
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct ProxyRequest<'a> {
     pub method: &'a str,
     pub url: &'a str,
     pub headers: &'a [(String, String)],
     pub query: &'a [(String, String)],
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
+    pub body: Option<&'a str>,
     pub timeout_ms: u64,
 }
 
@@ -56,8 +60,10 @@ struct RawProxied {
 #[derive(Serialize)]
 struct Put<'a> {
     value: &'a str,
-    allowed_hosts: &'a [String],
+    hosts: &'a [String],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
     methods: &'a [String],
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
     paths: &'a [String],
 }
 
@@ -75,15 +81,15 @@ impl Connection {
     }
 
     pub fn put_secret(&self, name: &str, value: &str, hosts: &[String], methods: &[String], paths: &[String]) -> Result<()> {
-        let body = serde_json::to_vec(&Put { value, allowed_hosts: hosts, methods, paths })?;
+        let body = serde_json::to_vec(&Put { value, hosts, methods, paths })?;
         let path = format!("/api/v1/secrets/{}", percent_encoding::utf8_percent_encode(name, NAME));
         let (status, bytes) = self.call("PUT", &path, Some(body), LIST_TIMEOUT)?;
         ensure_ok(status, &bytes, &format!("save {name:?} on the board"))
     }
 
     pub fn proxy(&self, request: &ProxyRequest) -> Result<Proxied> {
-        let body = serde_json::to_vec(request)?;
-        let wait = Duration::from_millis(request.timeout_ms) + PROXY_MARGIN;
+        let body = serde_json::to_vec(&ProxyRequest { timeout_ms: request.timeout_ms.clamp(1000, 120_000), ..*request })?;
+        let wait = Duration::from_millis(request.timeout_ms.clamp(1000, 120_000)) + PROXY_MARGIN;
         let (status, bytes) = self.call("POST", "/api/v1/vault/request", Some(body), wait)?;
         ensure_ok(status, &bytes, "send the request through the board")?;
         let raw: RawProxied = serde_json::from_slice(&bytes).context("the board's answer is not the expected JSON")?;
@@ -165,6 +171,13 @@ fn ensure_ok(status: u16, bytes: &[u8], what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unset_rules_may_come_as_null() {
+        let listed: Vec<BoardSecret> = serde_json::from_str(r#"[{"name":"a","hosts":["h"],"methods":null,"paths":null}]"#).unwrap();
+        assert_eq!(listed[0].hosts, ["h"]);
+        assert!(listed[0].methods.is_empty() && listed[0].paths.is_empty());
+    }
 
     #[test]
     fn headers_come_as_an_object_or_as_pairs() {
