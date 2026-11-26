@@ -384,7 +384,7 @@ second Touch ID saves that change.
 
 | Argument | Meaning |
 |----------|---------|
-| `<name>` | Only these keys. Without names, every key on this Mac that isn't a sign-in key. |
+| `<name>` | Only these keys, replacing a key of the same name on the board. Without names, every key on this Mac that isn't a sign-in key and that the board doesn't have yet. |
 
 The result lists `pushed`, `skipped` and `failed` keys (each with a reason). Sign-in keys (`tb self vault oauth`)
 are skipped: they stay on this Mac for now. A key the board refused stays here too, so run it again after fixing
@@ -405,7 +405,8 @@ holds the key values and tb holds none for the keys the board has:
   on the board.
 - One request can't mix keys the board holds with keys kept on this Mac.
 - `--query-param` and `--confirm` are rules of this Mac and the board knows nothing about them. A key that only the
-  board has lets a command use it in headers.
+  board has is used in headers until you run `tb self vault add <name> --query-param <param>` or `--confirm`;
+  leave the value empty and the key stays with the board.
 - `tb self vault rm` removes this Mac's entry and approvals, not the board's key.
 - A Mac that isn't paired works exactly as before, with the Keychain. If the board can't be reached, `list` and the
   other vault commands show only this Mac's keys.

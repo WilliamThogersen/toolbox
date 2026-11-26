@@ -1822,3 +1822,32 @@ fn push_needs_a_pairing_and_a_human() {
     assert!(seen.try_iter().all(|call| call.method == "GET"), "nothing is sent without a person saying yes");
     assert_eq!(tb.vault()["keys"]["k"]["value"], SECRET);
 }
+
+#[test]
+fn a_declined_confirmation_sends_nothing_to_the_board_and_keys_are_not_mixed() {
+    let tb = Toolbox::new();
+    let target = "http://127.0.0.1:9/";
+    let (board, seen) = fake_board(json!([{ "name": "bk", "hosts": [host_of(target)] }]), answer(200, "{}"));
+    tb.edit_vault(|vault| {
+        vault["keys"]["bk"] = json!({ "value": "", "hosts": [], "remote": true, "confirm": ["writes"] });
+        vault["keys"]["lk"] = json!({ "value": SECRET, "hosts": [host_of(target)] });
+    });
+    let manifest = |name: &str| json!({
+        "name": name, "description": "d", "args": { "url": { "type": "string", "required": true } },
+        "permissions": { "http": ["127.0.0.1"], "vault": ["bk", "lk"] }
+    });
+    tb.add_command("write", manifest("write"), r#"return function(args) return http.post(args.url, { headers = { Authorization = vault("bk") } }).status end"#);
+    tb.add_command("mix", manifest("mix"), r#"return function(args) return http.get(args.url, { headers = { Authorization = vault("bk"), ["X-Other"] = vault("lk") } }).status end"#);
+    tb.allow("bk", "write");
+    tb.allow("bk", "mix");
+    tb.allow("lk", "mix");
+
+    let declined = tb.run_with_env(&["write", "--url", target], &paired(&board));
+    assert!(!declined.status.success());
+    assert!(stderr(&declined).contains("did not confirm"), "{}", stderr(&declined));
+    assert!(seen.try_iter().all(|call| call.path != "/api/v1/vault/request"));
+
+    let mixed = tb.run_with_env(&["mix", "--url", target], &paired(&board));
+    assert!(!mixed.status.success());
+    assert!(stderr(&mixed).contains("can't use keys held by the board together"), "{}", stderr(&mixed));
+}

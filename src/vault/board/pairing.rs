@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -10,6 +11,7 @@ const KEYCHAIN_SERVICE: &str = "wgt-worker";
 const BASE_URL_ENV: &str = "WGT_BASE_URL";
 const TOKEN_ENV: &str = "WGT_DEVICE_TOKEN";
 const CONFIG_ENV: &str = "WGT_WORKER_CONFIG";
+const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const SECURITY: &str = "/usr/bin/security";
 
 impl Connection {
@@ -57,7 +59,8 @@ fn config_path() -> Option<PathBuf> {
 }
 
 fn configured_base() -> Option<String> {
-    let text = std::fs::read_to_string(config_path()?).ok()?;
+    let mut text = String::new();
+    std::fs::File::open(config_path()?).ok()?.take(MAX_CONFIG_BYTES).read_to_string(&mut text).ok()?;
     let config: serde_json::Value = serde_json::from_str(&text).ok()?;
     config.get("base_url")?.as_str().map(|url| url.trim().to_string())
 }

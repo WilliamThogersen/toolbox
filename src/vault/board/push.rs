@@ -36,8 +36,8 @@ pub fn push(local: &dyn VaultStore, board: &Connection, term: &dyn Terminal, nam
         }
         if entry.oauth.is_some() {
             report.skipped.push(skipped(name, "a sign-in key stays on this Mac for now"));
-        } else if on_board.contains(name) {
-            report.skipped.push(skipped(name, "the board already has a key with this name, so it is not overwritten. Rotate it on the board"));
+        } else if names.is_empty() && on_board.contains(name) {
+            report.skipped.push(skipped(name, "the board already has a key with this name, so a push of everything leaves it. Name it (`tb self vault push <name>`) to overwrite the board's key with this one"));
         } else if entry.remote {
             report.skipped.push(skipped(name, "the board already holds it"));
         } else {
@@ -65,7 +65,9 @@ pub fn push(local: &dyn VaultStore, board: &Connection, term: &dyn Terminal, nam
     }
     if !moved.is_empty() {
         let change = format!("delete the API keys {} from this Mac, now that the board holds them", moved.join(", "));
-        local.save(&without_values(&vault, &moved), &change)?;
+        local.save(&without_values(&vault, &moved), &change).map_err(|err| {
+            anyhow::anyhow!("the board holds {} now, but they are still on this Mac: {err:#}. Run `tb self vault push {}` again to finish", moved.join(", "), moved.join(" "))
+        })?;
     }
     report.pushed = moved;
     Ok(report)
