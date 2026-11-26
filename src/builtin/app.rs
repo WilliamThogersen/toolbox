@@ -141,7 +141,12 @@ fn vault_app() -> Command {
                 .about("Add the keys agents asked for and allow the commands waiting for a key, with one Touch ID")
                 .arg(Arg::new("command").help("Only this command. Also asks for keys it lists that nobody requested")),
         )
-        .subcommand(Command::new("list").about("Secrets, where they may go and which commands use them (never values)"))
+        .subcommand(Command::new("list").about("Secrets, where they may go and which commands use them (never values). Keys the board holds are marked board"))
+        .subcommand(
+            Command::new("push")
+                .about("Move keys from this Mac to the board's vault and delete them here once the board has them. Asks in a terminal, then Touch ID")
+                .arg(Arg::new("name").num_args(0..).help("Only these keys (default: every key that isn't a sign-in key)")),
+        )
         .subcommand(grant_app("allow", "Let a command use a secret. Shows its script and asks in a terminal"))
         .subcommand(grant_app("revoke", "Stop a command from using a secret. Asks in a terminal"))
         .subcommand(

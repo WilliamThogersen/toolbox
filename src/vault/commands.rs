@@ -247,6 +247,10 @@ pub fn add(
         None => format!("Value for {name} (input is hidden): "),
     };
     let typed = term.read_secret(&prompt)?;
+    ensure!(
+        !typed.trim().is_empty() || !existing.is_some_and(|current| current.remote),
+        "{name:?} is held by the board, so this Mac has no value to keep. Type a value to keep it on this Mac instead, or change its rules on the board"
+    );
     let new_value = !typed.trim().is_empty() || existing.is_none();
     let value = match (typed.trim(), existing) {
         ("", Some(current)) => current.value.clone(),

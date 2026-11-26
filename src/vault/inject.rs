@@ -861,4 +861,12 @@ mod tests {
     fn empty_redactor_changes_nothing() {
         assert_eq!(Redactor::default().redact("hello"), "hello");
     }
+
+    #[test]
+    fn keys_held_by_the_board_have_nothing_to_redact_and_nothing_breaks() {
+        let held = VaultData::default().with_secret("coolify", SecretEntry::held_by_board(vec!["c.example.com".into()]));
+        let redactor = Redactor::new(&held, &[]);
+        assert_eq!(redactor.redact("text with  spaces and coolify"), "text with  spaces and coolify");
+        assert!(!redactor.finds("anything"));
+    }
 }

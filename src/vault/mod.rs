@@ -1,5 +1,6 @@
 pub mod activity;
 pub mod approval;
+pub mod board;
 pub mod commands;
 pub mod hosts;
 pub mod inject;
@@ -22,6 +23,10 @@ use serde::{Deserialize, Serialize};
 pub use platform::ancestors;
 pub use store::{VaultStore, default_store};
 
+pub fn board_store(link: &std::rc::Rc<board::Link>) -> Box<dyn VaultStore> {
+    Box::new(board::BoardStore::new(default_store(), std::rc::Rc::clone(link)))
+}
+
 use crate::command::registry::Registry;
 use approval::CommandAccess;
 use log::AuditLog;
@@ -30,6 +35,7 @@ pub struct Keys {
     pub store: Box<dyn VaultStore>,
     pub log: Box<dyn AuditLog>,
     pub tokens: oauth::TokenCache,
+    pub board: std::rc::Rc<board::Link>,
 }
 
 pub(crate) const MIN_SECRET_LEN: usize = 8;
@@ -56,6 +62,8 @@ pub struct SecretEntry {
     pub oauth: Option<oauth::OAuth>,
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remote: bool,
 }
 
 impl SecretEntry {
@@ -69,10 +77,18 @@ impl SecretEntry {
             confirm: Vec::new(),
             oauth: None,
             commands: BTreeMap::new(),
+            remote: false,
         }
     }
 
+    pub fn held_by_board(hosts: Vec<String>) -> Self {
+        Self { remote: true, ..Self::new(SecretValue::absent(), hosts) }
+    }
+
     pub fn secret_values(&self) -> Vec<&SecretValue> {
+        if self.remote {
+            return Vec::new();
+        }
         let oauth = self.oauth.iter().flat_map(|oauth| oauth.client_secret.iter().chain([&oauth.cache_key]));
         std::iter::once(&self.value).chain(oauth).collect()
     }
@@ -108,6 +124,7 @@ impl SecretEntry {
             paths: self.paths.clone(),
             confirm: self.confirm.clone(),
             oauth: self.oauth.as_ref().map(oauth::OAuth::summary),
+            board: self.remote,
             commands: approval::access(name, self, registry),
         }
     }
@@ -134,6 +151,10 @@ impl SecretValue {
         Ok(Self(raw))
     }
 
+    pub fn absent() -> Self {
+        Self(String::new())
+    }
+
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -155,6 +176,8 @@ pub struct SecretSummary {
     pub confirm: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth: Option<oauth::OAuthSummary>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub board: bool,
     pub commands: Vec<CommandAccess>,
 }
 

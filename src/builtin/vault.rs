@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;
+use std::rc::Rc;
 
 use anyhow::{Result, bail};
 use clap::ArgMatches;
@@ -10,6 +11,7 @@ use crate::cli::matches::{flag, optional, required, typed, values};
 use crate::command::registry::Registry;
 use crate::vault::activity::{Follower, Style, print_line, render};
 use crate::vault::commands::{self as vault_ops, Rules, Tty};
+use crate::vault::board::{Link, push};
 use crate::vault::log::{FileLog, Filter};
 use crate::vault::oauth::TokenCache;
 use crate::vault::oauth::login::{SignIn, SystemBrowser, Tools, sign_in};
@@ -20,16 +22,19 @@ struct Context<'a> {
     store: Box<dyn VaultStore>,
     log: FileLog,
     registry: &'a Registry,
+    board: Rc<Link>,
 }
 
 pub fn run(matches: &ArgMatches, registry: &Registry) -> Result<ExitCode> {
-    let cx = Context { store: vault::default_store(), log: vault::log::default_log()?, registry };
+    let board = Link::lazy();
+    let cx = Context { store: vault::board_store(&board), log: vault::log::default_log()?, registry, board };
     match matches.subcommand() {
         Some(("add", m)) => add(&cx, m),
         Some(("request", m)) => request(&cx, m),
         Some(("oauth", m)) => oauth(&cx, m),
         Some(("setup", m)) => setup(&cx, m),
         Some(("list", _)) => print_json(&vault_ops::list(cx.store.as_ref(), registry)?),
+        Some(("push", m)) => push_keys(&cx, m),
         Some(("allow", m)) => {
             let (secret, command) = (required(m, "secret")?, required(m, "command")?);
             let allowed = vault_ops::allow(cx.store.as_ref(), &cx.log, &Tty, registry, secret, command)?;
@@ -62,6 +67,14 @@ fn add(cx: &Context, m: &ArgMatches) -> Result<ExitCode> {
         eprintln!("{note}");
     }
     print_json(&summary)
+}
+
+fn push_keys(cx: &Context, m: &ArgMatches) -> Result<ExitCode> {
+    let Some(board) = cx.board.connection() else {
+        bail!("this Mac is not paired with a board, so there is nowhere to move keys to. Pair it with `wgt-worker --pair <code> --url <board>`");
+    };
+    let names = values(m, "name")?;
+    print_json(&push::push(vault::default_store().as_ref(), board, &Tty, &names)?)
 }
 
 fn oauth(cx: &Context, m: &ArgMatches) -> Result<ExitCode> {

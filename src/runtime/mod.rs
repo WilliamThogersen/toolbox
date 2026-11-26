@@ -174,6 +174,7 @@ mod tests {
             store: Box::new(MemoryStore::new(VaultData::default())),
             log: Box::new(crate::vault::log::MemoryLog::new()),
             tokens: crate::vault::oauth::TokenCache { dir: std::env::temp_dir().join("toolbox-unused-token-cache") },
+            board: crate::vault::board::Link::none(),
         }
     }
 

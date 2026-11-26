@@ -8,6 +8,7 @@ tb self vault setup [<command>]
 tb self vault add <name> --host <host>... [--query-param <param>...] [--method <method>...] [--path <path>...] [--confirm <when>]
 tb self vault oauth <name> --host <host>... --auth-url <url> --token-url <url> --client-id <id> [--scope <scope>...] [--auth-param <name=value>...] [--port <port>] [same rules as add]
 tb self vault list
+tb self vault push [<name>...]
 tb self vault allow <secret> <command>
 tb self vault revoke <secret> <command>
 tb self vault rm <name>
@@ -290,7 +291,8 @@ needs `--scope offline_access`. Tokens that never expire (GitHub OAuth apps) are
 
 ## tb self vault list
 
-Each key's rules and the commands that use it. Never values.
+Each key's rules and the commands that use it. Never values. When this Mac is paired with a board (see
+[the board's vault](#the-boards-vault)), the keys the board holds are listed too, marked `"board": true`.
 
 ```json
 [{
@@ -371,6 +373,42 @@ Stops a command from using a key, after asking for confirmation on the terminal.
 ```json
 { "secret": "github", "command": "gh-stars", "revoked": true }
 ```
+
+## tb self vault push
+
+Moves keys from this Mac to the board's vault. It asks at the terminal, then in a macOS dialog (Touch ID) that
+names the board the keys go to. Each key is sent with its hosts, methods and paths to
+`PUT <board>/api/v1/secrets/<name>`, and only a key the board confirmed is deleted from this Mac. What stays here is
+the entry without its value: the approvals, `--confirm` and `--query-param` rules, marked as held by the board. A
+second Touch ID saves that change.
+
+| Argument | Meaning |
+|----------|---------|
+| `<name>` | Only these keys. Without names, every key on this Mac that isn't a sign-in key. |
+
+The result lists `pushed`, `skipped` and `failed` keys (each with a reason). Sign-in keys (`tb self vault oauth`)
+are skipped: they stay on this Mac for now. A key the board refused stays here too, so run it again after fixing
+what the reason says.
+
+## The board's vault
+
+When this Mac is paired with a board (`wgt-worker --pair`, which keeps the device token in the Keychain under the
+service `wgt-worker` and the board's URL as account, and `base_url` in `~/.config/wgt-worker/config.json`), the board
+holds the key values and tb holds none for the keys the board has:
+
+- A request that contains `{{vault:name}}` for a key the board holds is not filled in here. After every local check
+  (`permissions.vault`, approval, host, method, path, `--confirm` and its Touch ID) tb sends it to
+  `POST <board>/api/v1/vault/request` with the device token, and the board puts the key on and sends it. The answer
+  has the key removed already. Requests without a placeholder go straight to their host, as always.
+- Commands are approved on this Mac as before (`tb self vault setup`, `allow`). The approval is stored here, in an
+  entry with no value. The board's hosts, methods and paths are what a key may do, and they are checked here and
+  on the board.
+- One request can't mix keys the board holds with keys kept on this Mac.
+- `--query-param` and `--confirm` are rules of this Mac and the board knows nothing about them. A key that only the
+  board has lets a command use it in headers.
+- `tb self vault rm` removes this Mac's entry and approvals, not the board's key.
+- A Mac that isn't paired works exactly as before, with the Keychain. If the board can't be reached, `list` and the
+  other vault commands show only this Mac's keys.
 
 ## tb self vault rm
 

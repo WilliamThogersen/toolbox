@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use anyhow::{Context, Result, anyhow, bail};
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use super::{seconds, ser_options};
 use crate::cli::screen::{one_line, printable};
 use crate::command::manifest::Permissions;
 use crate::vault::approval::Caller;
+use crate::vault::board::{Link, ProxyRequest};
 use crate::vault::inject::{Injector, Redactor, Values, ensure_absent, mentions_vault, secret_names};
 use crate::vault::log::{self as key_log, AuditLog, Event, Outcome};
 use crate::vault::oauth::{Minter, TokenCache};
@@ -132,6 +134,7 @@ pub struct HttpClient {
     secret_safe: Agent,
     log: Box<dyn AuditLog>,
     tokens: TokenCache,
+    board: Rc<Link>,
 }
 
 #[derive(Debug)]
@@ -189,6 +192,11 @@ impl Outgoing {
     }
 }
 
+enum Prepared {
+    Filled(Pairs, Pairs),
+    Board,
+}
+
 const DROPPED_ON_REDIRECT: &[&str] = &["authorization", "cookie", "content-length"];
 
 impl HttpClient {
@@ -205,6 +213,7 @@ impl HttpClient {
             secret_safe: agent(None),
             log: keys.log,
             tokens: keys.tokens,
+            board: keys.board,
         }
     }
 
@@ -233,7 +242,7 @@ impl HttpClient {
             method: &outgoing.method,
             url: &outgoing.url,
         };
-        let (filled, confirmed) = match self.prepare(&injector, &outgoing) {
+        let (prepared, confirmed) = match self.prepare(&injector, &outgoing) {
             Ok(prepared) => prepared,
             Err(err) => {
                 let reason = format!("{err:#}");
@@ -243,8 +252,13 @@ impl HttpClient {
         };
         let timeout = outgoing.timeout;
         let redactor = self.vault.redactor();
-        let response = execute(&self.secret_safe, &outgoing.into_hop(Some(filled)), timeout)
-            .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))));
+        let response = match prepared {
+            Prepared::Filled(headers, query) => {
+                execute(&self.secret_safe, &outgoing.into_hop(Some((headers, query))), timeout)
+            }
+            Prepared::Board => self.send_through_board(&outgoing),
+        }
+        .map_err(|e| anyhow!(redactor.redact(&format!("{e:#}"))));
         let outcome = match &response {
             Ok(done) => Outcome::Status(done.status),
             Err(err) => Outcome::Failed(err.to_string()),
@@ -253,7 +267,30 @@ impl HttpClient {
         Ok(redact_response(&redactor, response?))
     }
 
-    fn prepare(&self, injector: &Injector, outgoing: &Outgoing) -> Result<((Pairs, Pairs), bool)> {
+    fn send_through_board(&self, outgoing: &Outgoing) -> Result<ResponseData> {
+        let connection = self
+            .board
+            .connection()
+            .ok_or_else(|| anyhow!("this key is held by the board, but this Mac is not paired with one"))?;
+        let body = (!outgoing.body.is_empty()).then(|| base64::engine::general_purpose::STANDARD.encode(&outgoing.body));
+        let wait = outgoing.timeout.unwrap_or(TIMEOUT);
+        let answer = connection.proxy(&ProxyRequest {
+            method: &outgoing.method,
+            url: outgoing.url.as_str(),
+            headers: &outgoing.headers,
+            query: &outgoing.query,
+            body,
+            timeout_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        })?;
+        Ok(ResponseData {
+            status: answer.status,
+            headers: answer.headers,
+            body: String::from_utf8_lossy(&answer.body).into_owned(),
+            json: None,
+        })
+    }
+
+    fn prepare(&self, injector: &Injector, outgoing: &Outgoing) -> Result<(Prepared, bool)> {
         scope::normalize_method(&outgoing.method)?;
         let names = injector.authorize_all(&outgoing.headers, &outgoing.query)?;
         refuse_method_override(injector.vault, &names, outgoing)?;
@@ -267,13 +304,22 @@ impl HttpClient {
                 )
             })?;
         }
+        let confirmed = !asks.is_empty();
+        let held = names.iter().filter(|name| injector.vault.get(name).is_some_and(|entry| entry.remote)).count();
+        if held > 0 {
+            anyhow::ensure!(
+                held == names.len(),
+                "one request can't use keys held by the board together with keys kept on this Mac. Move the local ones with `tb self vault push`, or send two requests"
+            );
+            return Ok((Prepared::Board, confirmed));
+        }
         let values = names
             .iter()
             .map(|name| Ok((name.clone(), self.value_for(name, injector.vault)?)))
             .collect::<Result<Values>>()?;
         let headers = injector.headers(&outgoing.headers, &values)?;
         let query = injector.query(&outgoing.query, &values)?;
-        Ok(((headers, query), !asks.is_empty()))
+        Ok((Prepared::Filled(headers, query), confirmed))
     }
 
     fn value_for(&self, name: &str, vault: &VaultData) -> Result<SecretValue> {
@@ -619,6 +665,7 @@ mod tests {
             store: Box::new(MemoryStore::new(VaultData::default())),
             log: Box::new(crate::vault::log::MemoryLog::new()),
             tokens: TokenCache { dir: std::env::temp_dir().join("toolbox-unused-token-cache") },
+            board: crate::vault::board::Link::none(),
         };
         HttpClient::new(&perms, caller, keys)
     }
@@ -859,7 +906,7 @@ mod tests {
         let perms = Permissions { http: vec!["127.0.0.1".into()], vault: vec!["mail".into()], ..Permissions::default() };
         let caller = Caller { name: "t".into(), declared: perms.vault.clone(), fingerprint: "t".into() };
         let tokens = TokenCache { dir: std::env::temp_dir().join("toolbox-unused-token-cache") };
-        HttpClient::new(&perms, caller, Keys { store: Box::new(Rc::clone(store)), log: Box::new(Rc::clone(log)), tokens })
+        HttpClient::new(&perms, caller, Keys { store: Box::new(Rc::clone(store)), log: Box::new(Rc::clone(log)), tokens, board: crate::vault::board::Link::none() })
     }
 
     fn with_key(method: &str, url: &str) -> RequestSpec {

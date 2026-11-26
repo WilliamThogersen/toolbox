@@ -143,10 +143,12 @@ fn run_user_command(registry: &Registry, name: &str, sub: Option<&str>, matches:
         .with_context(|| format!("{name} has no subcommand {:?}", sub.unwrap_or_default()))?;
     let label = entry.label();
     let args = collect_args(entry.args, matches)?;
+    let board = vault::board::Link::lazy();
     let keys = vault::Keys {
-        store: vault::default_store(),
+        store: vault::board_store(&board),
         log: Box::new(vault::log::default_log()?),
         tokens: vault::oauth::TokenCache::in_home()?,
+        board,
     };
     let output = runtime::run(def, sub, &args, keys).with_context(|| format!("command {label:?} failed"))?;
     print_json(&output)
